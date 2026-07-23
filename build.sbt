@@ -36,7 +36,10 @@ lazy val core =
     .crossType(CrossType.Full)
     .in(file("modules/core"))
     .settings(commonSettings)
-    .settings(name := "frame4s-core")
+    .settings(
+      name := "frame4s-core",
+      description := "Immutable, typed local dataframe library for Scala 3."
+    )
     .jsSettings(
       scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
       Test / jsEnv := new org.scalajs.jsenv.nodejs.NodeJSEnv()
@@ -50,6 +53,7 @@ lazy val fs2 =
     .settings(commonSettings)
     .settings(
       name := "frame4s-fs2",
+      description := "fs2 streaming integration for frame4s.",
       libraryDependencies ++= Seq(
         "org.typelevel" %%% "cats-effect" % "3.7.0",
         "co.fs2" %%% "fs2-core" % "3.13.0"
