@@ -1,0 +1,13 @@
+.bsp/
+.idea/
+.metals/
+.scala-build/
+.vscode/
+project/project/
+project/target/
+target/
+modules/*/js/target/
+modules/*/jvm/target/
+modules/*/shared/target/
+*.class
+*.log
