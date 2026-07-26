@@ -1,0 +1,13 @@
+[info] welcome to sbt 1.10.5 (Eclipse Adoptium Java 21.0.11)
+[info] loading settings for project frame4s-build from plugins.sbt ...
+[info] loading project definition from <workspace>/project
+[info] loading settings for project root from build.sbt ...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] running (fork) frame4s.fs2.examples.CsvFirstUse
+[info] typed schema: Schema(id: Int32, label: Utf8, score: Float64?)
+[info] rows: 3
+[info] id,label,score
+[info] 1,alpha,1.5
+[info] 2,"quoted,label",
+[info] 3,東京,NaN
+[success] Total time: 1 s, completed Jul 26, 2026, 8:45:27 a.m.

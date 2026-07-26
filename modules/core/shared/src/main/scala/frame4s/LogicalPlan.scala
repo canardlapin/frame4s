@@ -3,6 +3,17 @@ package frame4s
 enum JoinKind:
   case Inner
   case LeftOuter
+  case LeftSemi
+  case LeftAnti
+
+private[frame4s] enum JoinColumn:
+  case Left(index: Int)
+  case Right(index: Int)
+
+private[frame4s] object JoinColumn:
+  def all(leftSize: Int, rightSize: Int): Vector[JoinColumn] =
+    Vector.tabulate(leftSize)(JoinColumn.Left.apply) ++
+      Vector.tabulate(rightSize)(JoinColumn.Right.apply)
 
 enum SortDirection:
   case Ascending
@@ -49,7 +60,7 @@ object SourceRef:
     else if displayName.trim.isEmpty then Left(FrameError.InvalidSourceName(displayName))
     else Right(SourceRef(SourceId.unsafe(id), displayName, kind, order))
 
-private[frame4s] final case class SortExpression(
+final private[frame4s] case class SortExpression(
     expression: ResolvedExpr,
     direction: SortDirection,
     nulls: NullPlacement
@@ -62,7 +73,7 @@ sealed trait LogicalPlan:
   def order: OrderGuarantee
 
 object LogicalPlan:
-  private[frame4s] final case class Source(
+  final private[frame4s] case class Source(
       reference: SourceRef,
       output: Schema
   ) extends LogicalPlan:
@@ -70,7 +81,7 @@ object LogicalPlan:
     val nodeName = reference.kind.toString
     val order = reference.order
 
-  private[frame4s] final case class Project(
+  final private[frame4s] case class Project(
       input: LogicalPlan,
       expressions: Vector[NamedExpression],
       output: Schema
@@ -79,7 +90,7 @@ object LogicalPlan:
     val nodeName = "Project"
     val order = input.order
 
-  private[frame4s] final case class Filter(
+  final private[frame4s] case class Filter(
       input: LogicalPlan,
       predicate: ResolvedExpr,
       output: Schema
@@ -88,18 +99,32 @@ object LogicalPlan:
     val nodeName = "Filter"
     val order = input.order
 
-  private[frame4s] final case class Join(
+  final private[frame4s] case class Join(
       left: LogicalPlan,
       right: LogicalPlan,
       kind: JoinKind,
       condition: ResolvedExpr,
+      columns: Vector[JoinColumn],
       output: Schema
   ) extends LogicalPlan:
     val children = Vector(left, right)
     val nodeName = "Join"
-    val order = OrderGuarantee.Unspecified
+    val order = kind match
+      case JoinKind.LeftSemi | JoinKind.LeftAnti => left.order
+      case JoinKind.Inner | JoinKind.LeftOuter   => OrderGuarantee.Unspecified
 
-  private[frame4s] final case class Aggregate(
+  final private[frame4s] case class UnionAll(
+      left: LogicalPlan,
+      right: LogicalPlan,
+      output: Schema
+  ) extends LogicalPlan:
+    val children = Vector(left, right)
+    val nodeName = "UnionAll"
+    val order = (left.order, right.order) match
+      case (OrderGuarantee.Stable, OrderGuarantee.Stable) => OrderGuarantee.Stable
+      case _                                              => OrderGuarantee.Unspecified
+
+  final private[frame4s] case class Aggregate(
       input: LogicalPlan,
       keys: Vector[NamedExpression],
       aggregates: Vector[NamedAggregateExpression],
@@ -109,7 +134,7 @@ object LogicalPlan:
     val nodeName = "Aggregate"
     val order = OrderGuarantee.Unspecified
 
-  private[frame4s] final case class Sort(
+  final private[frame4s] case class Sort(
       input: LogicalPlan,
       sortExpressions: Vector[SortExpression],
       output: Schema
@@ -118,7 +143,7 @@ object LogicalPlan:
     val nodeName = "Sort"
     val order = OrderGuarantee.Sorted(sortExpressions.map(_.expression.id))
 
-  private[frame4s] final case class Limit(
+  final private[frame4s] case class Limit(
       input: LogicalPlan,
       count: Int,
       output: Schema
@@ -136,15 +161,23 @@ object LogicalPlan:
             s"${indent}${reference.kind}[${reference.displayName}; id=${reference.id.value}] ${schema.toString}\n"
           )
         case Project(input, expressions, schema) =>
+          val rendered =
+            expressions
+              .map(expression => s"${expression.name}=${expression.expression.id.value}")
+              .mkString(", ")
           builder.append(
-            s"${indent}Project[${expressions.map(_.name).mkString(", ")}] ${schema.toString}\n"
+            s"${indent}Project[$rendered] ${schema.toString}\n"
           )
           loop(input, depth + 1, builder)
         case Filter(input, predicate, schema) =>
           builder.append(s"${indent}Filter[${predicate.id.value}] ${schema.toString}\n")
           loop(input, depth + 1, builder)
-        case Join(left, right, kind, condition, schema) =>
+        case Join(left, right, kind, condition, _, schema) =>
           builder.append(s"${indent}Join[$kind; ${condition.id.value}] ${schema.toString}\n")
+          loop(left, depth + 1, builder)
+          loop(right, depth + 1, builder)
+        case UnionAll(left, right, schema) =>
+          builder.append(s"${indent}UnionAll[order=${current.order}] ${schema.toString}\n")
           loop(left, depth + 1, builder)
           loop(right, depth + 1, builder)
         case Aggregate(input, keys, aggregates, schema) =>

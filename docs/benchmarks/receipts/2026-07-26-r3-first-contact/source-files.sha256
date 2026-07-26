@@ -1,0 +1,7 @@
+0c00de4933b51cefc68b65c00839e3dbcc471653efd3d2ce74556287662bae4f  build.sbt
+32e5d730148042eadb0549757a692d7dbcadba6ea53cf44df656e00b9768154d  modules/core/shared/src/main/scala/frame4s/RowCodec.scala
+0d1619e837ac00f78e4224bb68ca8d053972c896a6a7ea317741b920a42d8472  modules/core/shared/src/main/scala/frame4s/Storage.scala
+84f93551c5f514a2cf2b92caa27693e9079adc24edff1b8ae996a6620bfd00b7  modules/fs2/shared/src/main/scala/frame4s/fs2/FrameIO.scala
+b6c0c5afbaa85db53ff796417967927c68a6605de69cd9ce2eadf43b387fa22f  modules/fs2/shared/src/main/scala/frame4s/fs2/FrameRuntime.scala
+d368061f0438a45c9f2cbe29c13d708bdb66498a17ee1c836d01ed27d1505637  modules/fs2/jvm/src/main/scala/frame4s/fs2/PathSources.scala
+8a3b1dc65245909f4e3538317448f45610683ca1d28c58c2a5e01e7a7bbf38d2  modules/first-contact/src/main/scala/example/FirstContact.scala

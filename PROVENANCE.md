@@ -23,4 +23,42 @@ Frame sources were authored for this extraction path. Benchmark outputs in
 environment recorded in those documents.
 
 The standalone project is licensed under Apache License 2.0. Dependency
-licenses must be reviewed as part of each release.
+licenses are reviewed as part of each release.
+
+## 0.1.0 dependency and copied-source review
+
+Reviewed: 2026-07-26
+
+The published `frame4s-core` artifact has no external runtime dependency beyond
+the Scala standard libraries. The published JVM and Scala.js `frame4s-fs2`
+artifacts directly depend on:
+
+| Dependency | Version | Declared license |
+| --- | --- | --- |
+| Cats Effect | 3.7.0 | Apache-2.0 |
+| FS2 core and FS2 IO | 3.13.0 | MIT |
+| Apache Arrow Java vector and unsafe memory, JVM only | 19.0.0 | Apache-2.0 |
+
+The resolved runtime graph also contains the expected transitive Typelevel
+libraries, scodec-bits, ip4s/idna4s, Jackson, FlatBuffers, commons-codec, and
+SLF4J. Their Maven metadata and upstream license files were reviewed; the graph
+contains permissive Apache-2.0, MIT, BSD-family, and similarly compatible
+licenses. The benchmark-only court additionally uses Saddle (MIT) and JMH
+(GPL-2.0 with Classpath Exception); neither benchmark dependency is published
+or appears in a frame4s runtime POM.
+
+MUnit (Apache-2.0) and ScalaCheck (BSD-3-Clause) are test-only. Build plugins,
+documentation tools, and test dependencies are not shipped in runtime
+artifacts.
+
+The local `vendor/` directory contains comparison checkouts of SimpleDF,
+Scautable, and Saddle used only for audit and benchmark design. No vendor source
+was copied into frame4s. The directory is ignored by Git, is not a build input,
+and the publication rehearsal rejects `vendor`, `.mote`, or `target` paths in
+every generated archive. SimpleDF did not contain a license file in the local
+audit checkout, which is an additional reason it must remain local audit
+material rather than a redistributed source dependency.
+
+The raw dependency tree and POM metadata must be regenerated and reviewed when
+a runtime dependency version changes. This record is not a claim about
+dependencies that are absent from the resolved `0.1.0` candidate graph.

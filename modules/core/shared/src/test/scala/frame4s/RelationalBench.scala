@@ -23,8 +23,12 @@ object RelationalBench:
   private def collect[S <: scala.NamedTuple.AnyNamedTuple](
       query: Frame[S],
       sources: ReferenceSources
-  )(using SchemaDescriptor[S]): Table[S] =
-    execution(ReferenceInterpreter.prepare(query.plan, sources).collect[S])
+  ): Table[S] =
+    execution(
+      ReferenceInterpreter
+        .prepare(query.plan, sources)
+        .collect[S](using query.descriptor)
+    )
 
   def main(arguments: Array[String]): Unit =
     val length = 100000
@@ -57,8 +61,12 @@ object RelationalBench:
             RecordBatch(
               groupsSchema,
               Vector(
-                storage(ColumnArray.utf8(Array.tabulate(10)(index => s"g$index"), tracker = tracker)),
-                storage(ColumnArray.utf8(Array.tabulate(10)(index => s"group-$index"), tracker = tracker))
+                storage(
+                  ColumnArray.utf8(Array.tabulate(10)(index => s"g$index"), tracker = tracker)
+                ),
+                storage(
+                  ColumnArray.utf8(Array.tabulate(10)(index => s"group-$index"), tracker = tracker)
+                )
               )
             )
         )
@@ -108,7 +116,9 @@ object RelationalBench:
         index += 1
       total
 
-    println(s"rows=$length scan_rows=$scanRows project_rows=$projectRows aggregate_rows=$aggregateRows join_rows=$joinRows")
+    println(
+      s"rows=$length scan_rows=$scanRows project_rows=$projectRows aggregate_rows=$aggregateRows join_rows=$joinRows"
+    )
     println(s"normalization_rules=${normalization.rules.mkString(",")}")
     println(s"utf8_checksum=$utf8Checksum")
     println(f"scan_ms=${scanNanos / 1000000.0}%.3f")

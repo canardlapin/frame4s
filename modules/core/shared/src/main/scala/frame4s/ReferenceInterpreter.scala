@@ -22,8 +22,8 @@ enum ExecutionError:
   case InvalidLiteral(value: LiteralValue)
 
   def message: String = this match
-    case Storage(error) => error.message
-    case MissingSource(id) => s"no reference source is bound for '${id.value}'"
+    case Storage(error)                 => error.message
+    case MissingSource(id)              => s"no reference source is bound for '${id.value}'"
     case SourceSchema(expected, actual) =>
       s"source schema $actual does not match resolved schema $expected"
     case InvalidColumnIndex(id, input, index, width) =>
@@ -36,7 +36,7 @@ enum ExecutionError:
       s"predicate ${id.value} evaluated to $actual instead of boolean or null"
     case IntegerOverflow(id, operator) =>
       s"integer overflow in ${operator.toString} for expression ${id.value}"
-    case DivisionByZero(id) => s"division by zero in expression ${id.value}"
+    case DivisionByZero(id)    => s"division by zero in expression ${id.value}"
     case UnsupportedNode(node) => s"reference interpreter does not implement $node"
     case InvalidLiteral(value) => s"literal $value is not valid"
 
@@ -47,7 +47,8 @@ trait ExecutionCursor:
 final case class ExecutionShape(
     streaming: Boolean,
     blockingNodes: Vector[String],
-    estimatedRows: Option[Long]
+    estimatedRows: Option[Long],
+    operators: Vector[String]
 )
 
 final class ReferenceSources private (
@@ -57,7 +58,9 @@ final class ReferenceSources private (
       reference: SourceRef,
       table: Table[S]
   ): ReferenceSources =
-    new ReferenceSources(entries.updated(reference.id.value, ReferenceSources.Entry(table.schema, table.batches)))
+    new ReferenceSources(
+      entries.updated(reference.id.value, ReferenceSources.Entry(table.schema, table.batches))
+    )
 
   private[frame4s] def open(
       reference: SourceRef,
@@ -74,7 +77,7 @@ final class ReferenceSources private (
         while index < entry.batches.length && error.isEmpty do
           entry.batches(index).slice(0, entry.batches(index).rowCount) match
             case Right(batch) => retained += batch
-            case Left(value) => error = Some(value)
+            case Left(value)  => error = Some(value)
           index += 1
         error match
           case Some(value) =>
@@ -101,8 +104,84 @@ final class ReferenceSources private (
                       retained(position).close()
                       position += 1
 
+  /** Open only the physical columns required by an admitted optimized kernel.
+    *
+    * Unlike the semantic interpreter's source cursor, this cursor retains each projected batch
+    * lazily. It is package-internal because column pruning is a physical concern, not a second
+    * public source API.
+    */
+  private[frame4s] def openProjected(
+      reference: SourceRef,
+      expected: Schema,
+      indices: Vector[Int]
+  ): Either[ExecutionError, ExecutionCursor] =
+    entries.get(reference.id.value) match
+      case None => Left(ExecutionError.MissingSource(reference.id))
+      case Some(entry) if entry.schema != expected =>
+        Left(ExecutionError.SourceSchema(expected, entry.schema))
+      case Some(entry) =>
+        indices.find(index => index < 0 || index >= expected.size) match
+          case Some(index) =>
+            Left(
+              ExecutionError.InvalidColumnIndex(
+                ExprId.derived(s"columnar-source:$index"),
+                InputRef.Current.qualifier,
+                index,
+                expected.size
+              )
+            )
+          case None =>
+            val projectedSchema = Schema.unsafe(indices.map(expected.fields))
+            Right:
+              new ExecutionCursor:
+                private var position = 0
+                private var closed = false
+
+                def nextBatch(): Either[ExecutionError, Option[RecordBatch]] = synchronized:
+                  if closed then Left(ExecutionError.Storage(StorageError.SourceClosed))
+                  else if position >= entry.batches.length then Right(None)
+                  else
+                    val source = entry.batches(position)
+                    position += 1
+                    val retained = ArrayBuffer.empty[ColumnArray]
+                    var index = 0
+                    var error: Option[StorageError] = None
+                    while index < indices.length && error.isEmpty do
+                      source.columns(indices(index)).slice(0, source.rowCount) match
+                        case Right(column) => retained += column
+                        case Left(value)   => error = Some(value)
+                      index += 1
+                    error match
+                      case Some(value) =>
+                        retained.foreach(_.close())
+                        Left(ExecutionError.Storage(value))
+                      case None =>
+                        RecordBatch(projectedSchema, retained.toVector) match
+                          case Right(batch) => Right(Some(batch))
+                          case Left(value)  =>
+                            retained.foreach(_.close())
+                            Left(ExecutionError.Storage(value))
+
+                def close(): Unit = synchronized:
+                  closed = true
+
+  /** Borrow the bound batches for one synchronous optimized-kernel invocation.
+    *
+    * Callers must copy every physical buffer they retain before returning and must never close the
+    * borrowed batches. The owning [[Table]] remains the lifetime authority.
+    */
+  private[frame4s] def borrowedBatches(
+      reference: SourceRef,
+      expected: Schema
+  ): Either[ExecutionError, Vector[RecordBatch]] =
+    entries.get(reference.id.value) match
+      case None => Left(ExecutionError.MissingSource(reference.id))
+      case Some(entry) if entry.schema != expected =>
+        Left(ExecutionError.SourceSchema(expected, entry.schema))
+      case Some(entry) => Right(entry.batches)
+
 object ReferenceSources:
-  private final case class Entry(schema: Schema, batches: Vector[RecordBatch])
+  final private case class Entry(schema: Schema, batches: Vector[RecordBatch])
 
   val empty: ReferenceSources = new ReferenceSources(Map.empty)
 
@@ -118,7 +197,10 @@ final class ReferenceExecution private[frame4s] (
     val blockers =
       if shape.blockingNodes.isEmpty then "none"
       else shape.blockingNodes.mkString(",")
-    s"ReferenceExecution(mode=$mode, blocking=$blockers, estimatedRows=${shape.estimatedRows.getOrElse("unknown")}, fallback=none)"
+    val operators =
+      if shape.operators.isEmpty then "none"
+      else shape.operators.mkString(">")
+    s"ReferenceExecution(mode=$mode, blocking=$blockers, operators=$operators, estimatedRows=${shape.estimatedRows.getOrElse("unknown")}, fallback=none)"
 
   def collect[S <: NamedTuple.AnyNamedTuple](using
       descriptor: SchemaDescriptor[S]
@@ -131,8 +213,8 @@ final class ReferenceExecution private[frame4s] (
         while !done && error.isEmpty do
           cursor.nextBatch() match
             case Right(Some(batch)) => batches += batch
-            case Right(None) => done = true
-            case Left(value) => error = Some(value)
+            case Right(None)        => done = true
+            case Left(value)        => error = Some(value)
         error match
           case Some(value) =>
             batches.foreach(_.close())
@@ -140,7 +222,7 @@ final class ReferenceExecution private[frame4s] (
           case None =>
             Table[S](batches.toVector) match
               case Right(table) => Right(table)
-              case Left(value) =>
+              case Left(value)  =>
                 batches.foreach(_.close())
                 Left(ExecutionError.Storage(value))
       finally cursor.close()
@@ -153,25 +235,31 @@ object ReferenceInterpreter:
     val blockers = blockingNodes(plan)
     new ReferenceExecution(
       plan,
-      ExecutionShape(blockers.isEmpty, blockers, estimatedRows(plan)),
+      ExecutionShape(blockers.isEmpty, blockers, estimatedRows(plan), physicalOperators(plan)),
       () => open(plan, sources)
     )
 
   private def blockingNodes(plan: LogicalPlan): Vector[String] = plan match
     case _: LogicalPlan.Aggregate => Vector("Aggregate") ++ plan.children.flatMap(blockingNodes)
-    case _: LogicalPlan.Join => Vector("Join") ++ plan.children.flatMap(blockingNodes)
-    case _: LogicalPlan.Sort => Vector("Sort") ++ plan.children.flatMap(blockingNodes)
-    case _ => plan.children.flatMap(blockingNodes)
+    case _: LogicalPlan.Join      => Vector("Join") ++ plan.children.flatMap(blockingNodes)
+    case _: LogicalPlan.Sort      => Vector("Sort") ++ plan.children.flatMap(blockingNodes)
+    case _                        => plan.children.flatMap(blockingNodes)
 
   private def estimatedRows(plan: LogicalPlan): Option[Long] = plan match
     case LogicalPlan.Limit(_, count, _) => Some(count.toLong)
-    case _ => None
+    case _                              => None
+
+  private def physicalOperators(plan: LogicalPlan): Vector[String] =
+    val current = plan match
+      case LogicalPlan.Join(_, _, kind, _, _, _) => s"Join:$kind"
+      case other                                 => other.nodeName
+    current +: plan.children.flatMap(physicalOperators)
 
   private def open(
       plan: LogicalPlan,
       sources: ReferenceSources
   ): Either[ExecutionError, ExecutionCursor] = plan match
-    case LogicalPlan.Source(reference, schema) => sources.open(reference, schema)
+    case LogicalPlan.Source(reference, schema)           => sources.open(reference, schema)
     case LogicalPlan.Project(input, expressions, schema) =>
       open(input, sources).map(new ProjectCursor(_, expressions, schema))
     case LogicalPlan.Filter(input, predicate, schema) =>
@@ -180,18 +268,29 @@ object ReferenceInterpreter:
       open(input, sources).map(new LimitCursor(_, count))
     case LogicalPlan.Aggregate(input, keys, aggregates, schema) =>
       open(input, sources).map(new AggregateCursor(_, keys, aggregates, schema))
-    case LogicalPlan.Join(left, right, kind, condition, schema) =>
+    case LogicalPlan.UnionAll(left, right, _) =>
+      open(left, sources).map(new UnionCursor(_, () => open(right, sources)))
+    case LogicalPlan.Join(left, right, kind, condition, columns, schema) =>
       open(left, sources).flatMap: leftCursor =>
         open(right, sources) match
           case Right(rightCursor) =>
-            Right(new JoinCursor(leftCursor, rightCursor, kind, condition, schema))
+            Right(
+              new JoinCursor(
+                leftCursor,
+                rightCursor,
+                kind,
+                condition,
+                columns,
+                schema
+              )
+            )
           case Left(error) =>
             leftCursor.close()
             Left(error)
     case LogicalPlan.Sort(input, order, schema) =>
       open(input, sources).map(new SortCursor(_, order, schema))
 
-  private final class ProjectCursor(
+  final private class ProjectCursor(
       input: ExecutionCursor,
       expressions: Vector[NamedExpression],
       schema: Schema
@@ -201,35 +300,37 @@ object ReferenceInterpreter:
     def nextBatch(): Either[ExecutionError, Option[RecordBatch]] =
       if closed then Left(ExecutionError.Storage(StorageError.SourceClosed))
       else
-        input.nextBatch().flatMap:
-          case None => Right(None)
-          case Some(batch) =>
-            val columns = expressions.map: expression =>
-              val values = new Array[ScalarValue](batch.rowCount)
-              var row = 0
-              var error: Option[ExecutionError] = None
-              while row < batch.rowCount && error.isEmpty do
-                evaluate(expression.expression, EvalContext.current(batch), row) match
-                  case Right(value) => values(row) = value
-                  case Left(value) => error = Some(value)
-                row += 1
-              error match
-                case Some(value) => Left(value)
-                case None => Right(values)
-            sequence(columns).flatMap(buildBatch(schema, _)) match
-              case Right(output) =>
-                batch.close()
-                Right(Some(output))
-              case Left(error) =>
-                batch.close()
-                Left(error)
+        input
+          .nextBatch()
+          .flatMap:
+            case None        => Right(None)
+            case Some(batch) =>
+              val columns = expressions.map: expression =>
+                val values = new Array[ScalarValue](batch.rowCount)
+                var row = 0
+                var error: Option[ExecutionError] = None
+                while row < batch.rowCount && error.isEmpty do
+                  evaluate(expression.expression, EvalContext.current(batch), row) match
+                    case Right(value) => values(row) = value
+                    case Left(value)  => error = Some(value)
+                  row += 1
+                error match
+                  case Some(value) => Left(value)
+                  case None        => Right(values)
+              sequence(columns).flatMap(buildBatch(schema, _)) match
+                case Right(output) =>
+                  batch.close()
+                  Right(Some(output))
+                case Left(error) =>
+                  batch.close()
+                  Left(error)
 
     def close(): Unit =
       if !closed then
         closed = true
         input.close()
 
-  private final class FilterCursor(
+  final private class FilterCursor(
       input: ExecutionCursor,
       predicate: ResolvedExpr,
       schema: Schema
@@ -239,44 +340,47 @@ object ReferenceInterpreter:
     def nextBatch(): Either[ExecutionError, Option[RecordBatch]] =
       if closed then Left(ExecutionError.Storage(StorageError.SourceClosed))
       else
-        input.nextBatch().flatMap:
-          case None => Right(None)
-          case Some(batch) =>
-            val retained = ArrayBuffer.empty[Int]
-            var row = 0
-            var error: Option[ExecutionError] = None
-            while row < batch.rowCount && error.isEmpty do
-              evaluate(predicate, EvalContext.current(batch), row) match
-                case Right(ScalarValue.Bool(true)) => retained += row
-                case Right(ScalarValue.Bool(false) | ScalarValue.Null) => ()
-                case Right(other) => error = Some(ExecutionError.PredicateType(predicate.id, other))
-                case Left(value) => error = Some(value)
-              row += 1
-            val result = error match
-              case Some(value) => Left(value)
-              case None =>
-                val columns = batch.columns.map: column =>
-                  val values = new Array[ScalarValue](retained.length)
-                  var outputRow = 0
-                  var columnError: Option[ExecutionError] = None
-                  while outputRow < retained.length && columnError.isEmpty do
-                    column.scalar(retained(outputRow)) match
-                      case Right(value) => values(outputRow) = value
-                      case Left(value) => columnError = Some(ExecutionError.Storage(value))
-                    outputRow += 1
-                  columnError match
-                    case Some(value) => Left(value)
-                    case None => Right(values)
-                sequence(columns).flatMap(buildBatch(schema, _)).map(Some(_))
-            batch.close()
-            result
+        input
+          .nextBatch()
+          .flatMap:
+            case None        => Right(None)
+            case Some(batch) =>
+              val retained = ArrayBuffer.empty[Int]
+              var row = 0
+              var error: Option[ExecutionError] = None
+              while row < batch.rowCount && error.isEmpty do
+                evaluate(predicate, EvalContext.current(batch), row) match
+                  case Right(ScalarValue.Bool(true))                     => retained += row
+                  case Right(ScalarValue.Bool(false) | ScalarValue.Null) => ()
+                  case Right(other)                                      =>
+                    error = Some(ExecutionError.PredicateType(predicate.id, other))
+                  case Left(value) => error = Some(value)
+                row += 1
+              val result = error match
+                case Some(value) => Left(value)
+                case None        =>
+                  val columns = batch.columns.map: column =>
+                    val values = new Array[ScalarValue](retained.length)
+                    var outputRow = 0
+                    var columnError: Option[ExecutionError] = None
+                    while outputRow < retained.length && columnError.isEmpty do
+                      column.scalar(retained(outputRow)) match
+                        case Right(value) => values(outputRow) = value
+                        case Left(value)  => columnError = Some(ExecutionError.Storage(value))
+                      outputRow += 1
+                    columnError match
+                      case Some(value) => Left(value)
+                      case None        => Right(values)
+                  sequence(columns).flatMap(buildBatch(schema, _)).map(Some(_))
+              batch.close()
+              result
 
     def close(): Unit =
       if !closed then
         closed = true
         input.close()
 
-  private final class LimitCursor(input: ExecutionCursor, requested: Int) extends ExecutionCursor:
+  final private class LimitCursor(input: ExecutionCursor, requested: Int) extends ExecutionCursor:
     private var remaining = requested
     private var closed = false
 
@@ -284,23 +388,57 @@ object ReferenceInterpreter:
       if closed then Left(ExecutionError.Storage(StorageError.SourceClosed))
       else if remaining == 0 then Right(None)
       else
-        input.nextBatch().flatMap:
-          case None => Right(None)
-          case Some(batch) if batch.rowCount <= remaining =>
-            remaining -= batch.rowCount
-            Right(Some(batch))
-          case Some(batch) =>
-            val result = batch.slice(0, remaining).left.map(ExecutionError.Storage.apply)
-            remaining = 0
-            batch.close()
-            result.map(Some(_))
+        input
+          .nextBatch()
+          .flatMap:
+            case None                                       => Right(None)
+            case Some(batch) if batch.rowCount <= remaining =>
+              remaining -= batch.rowCount
+              Right(Some(batch))
+            case Some(batch) =>
+              val result = batch.slice(0, remaining).left.map(ExecutionError.Storage.apply)
+              remaining = 0
+              batch.close()
+              result.map(Some(_))
 
     def close(): Unit =
       if !closed then
         closed = true
         input.close()
 
-  private final class AggregateCursor(
+  final private class UnionCursor(
+      left: ExecutionCursor,
+      openRight: () => Either[ExecutionError, ExecutionCursor]
+  ) extends ExecutionCursor:
+    private var readingLeft = true
+    private var right: Option[ExecutionCursor] = None
+    private var closed = false
+
+    def nextBatch(): Either[ExecutionError, Option[RecordBatch]] =
+      if closed then Left(ExecutionError.Storage(StorageError.SourceClosed))
+      else if readingLeft then
+        left
+          .nextBatch()
+          .flatMap:
+            case some @ Some(_) => Right(some)
+            case None           =>
+              left.close()
+              readingLeft = false
+              openRight().flatMap: cursor =>
+                right = Some(cursor)
+                nextBatch()
+      else
+        right match
+          case Some(cursor) => cursor.nextBatch()
+          case None         => Right(None)
+
+    def close(): Unit =
+      if !closed then
+        closed = true
+        left.close()
+        right.foreach(_.close())
+
+  final private class AggregateCursor(
       input: ExecutionCursor,
       keys: Vector[NamedExpression],
       aggregates: Vector[NamedAggregateExpression],
@@ -327,7 +465,7 @@ object ReferenceInterpreter:
               while keyIndex < keys.length && error.isEmpty do
                 evaluate(keys(keyIndex).expression, EvalContext.current(batch), row) match
                   case Right(value) => keyValues(keyIndex) = value
-                  case Left(value) => error = Some(value)
+                  case Left(value)  => error = Some(value)
                 keyIndex += 1
               if error.isEmpty then
                 val key = keyValues.toVector.map(KeyAtom.fromScalar)
@@ -338,9 +476,9 @@ object ReferenceInterpreter:
 
           val result = error match
             case Some(value) => Left(value)
-            case None =>
+            case None        =>
               if keys.isEmpty && groups.isEmpty then
-                groups.put(Vector.empty, GroupRows(Array.empty, ArrayBuffer.empty))
+                groups.update(Vector.empty, GroupRows(Array.empty, ArrayBuffer.empty))
               val outputRows = ArrayBuffer.empty[Array[ScalarValue]]
               val iterator = groups.valuesIterator
               while iterator.hasNext && error.isEmpty do
@@ -351,12 +489,12 @@ object ReferenceInterpreter:
                 while aggregateIndex < aggregates.length && error.isEmpty do
                   aggregateValue(aggregates(aggregateIndex).expression, group.rows.toVector) match
                     case Right(value) => output(keys.length + aggregateIndex) = value
-                    case Left(value) => error = Some(value)
+                    case Left(value)  => error = Some(value)
                   aggregateIndex += 1
                 outputRows += output
               error match
                 case Some(value) => Left(value)
-                case None => buildRows(schema, outputRows.toVector).map(Some(_))
+                case None        => buildRows(schema, outputRows.toVector).map(Some(_))
           batches.foreach(_.close())
           result
 
@@ -365,11 +503,12 @@ object ReferenceInterpreter:
         closed = true
         input.close()
 
-  private final class JoinCursor(
+  final private class JoinCursor(
       leftInput: ExecutionCursor,
       rightInput: ExecutionCursor,
       kind: JoinKind,
       condition: ResolvedExpr,
+      columns: Vector[JoinColumn],
       schema: Schema
   ) extends ExecutionCursor:
     private var emitted = false
@@ -394,32 +533,56 @@ object ReferenceInterpreter:
                 var leftRow = 0
                 while leftRow < leftBatch.rowCount && error.isEmpty do
                   var matched = false
+                  val existence =
+                    kind == JoinKind.LeftSemi || kind == JoinKind.LeftAnti
                   var rightBatchIndex = 0
-                  while rightBatchIndex < rightBatches.length && error.isEmpty do
+                  while rightBatchIndex < rightBatches.length &&
+                    error.isEmpty &&
+                    (!existence || !matched)
+                  do
                     val rightBatch = rightBatches(rightBatchIndex)
                     var rightRow = 0
-                    while rightRow < rightBatch.rowCount && error.isEmpty do
+                    while rightRow < rightBatch.rowCount &&
+                      error.isEmpty &&
+                      (!existence || !matched)
+                    do
                       evaluateJoin(condition, leftBatch, leftRow, rightBatch, rightRow) match
                         case Right(ScalarValue.Bool(true)) =>
                           matched = true
-                          joinedRow(leftBatch, leftRow, rightBatch, rightRow) match
-                            case Right(row) => outputRows += row
-                            case Left(value) => error = Some(value)
+                          if !existence then
+                            joinedRow(
+                              leftBatch,
+                              leftRow,
+                              rightBatch,
+                              rightRow,
+                              columns
+                            ) match
+                              case Right(row)  => outputRows += row
+                              case Left(value) => error = Some(value)
                         case Right(ScalarValue.Bool(false) | ScalarValue.Null) => ()
-                        case Right(other) => error = Some(ExecutionError.PredicateType(condition.id, other))
+                        case Right(other)                                      =>
+                          error = Some(ExecutionError.PredicateType(condition.id, other))
                         case Left(value) => error = Some(value)
                       rightRow += 1
                     rightBatchIndex += 1
                   if !matched && kind == JoinKind.LeftOuter && error.isEmpty then
-                    leftOnlyRow(leftBatch, leftRow, schema.size - leftBatch.columns.size) match
-                      case Right(row) => outputRows += row
+                    leftOnlyRow(leftBatch, leftRow, columns) match
+                      case Right(row)  => outputRows += row
+                      case Left(value) => error = Some(value)
+                  else if kind == JoinKind.LeftSemi && matched && error.isEmpty then
+                    readRow(leftBatch, leftRow) match
+                      case Right(row)  => outputRows += row
+                      case Left(value) => error = Some(value)
+                  else if kind == JoinKind.LeftAnti && !matched && error.isEmpty then
+                    readRow(leftBatch, leftRow) match
+                      case Right(row)  => outputRows += row
                       case Left(value) => error = Some(value)
                   leftRow += 1
                 leftBatchIndex += 1
 
               val result = error match
                 case Some(value) => Left(value)
-                case None => buildRows(schema, outputRows.toVector).map(Some(_))
+                case None        => buildRows(schema, outputRows.toVector).map(Some(_))
               leftBatches.foreach(_.close())
               rightBatches.foreach(_.close())
               result
@@ -430,7 +593,7 @@ object ReferenceInterpreter:
         leftInput.close()
         rightInput.close()
 
-  private final class SortCursor(
+  final private class SortCursor(
       input: ExecutionCursor,
       order: Vector[SortExpression],
       schema: Schema
@@ -457,7 +620,7 @@ object ReferenceInterpreter:
               while keyIndex < order.length && error.isEmpty do
                 evaluate(order(keyIndex).expression, EvalContext.current(batch), row) match
                   case Right(value) => keys(keyIndex) = value
-                  case Left(value) => error = Some(value)
+                  case Left(value)  => error = Some(value)
                 keyIndex += 1
               if error.isEmpty then rows += SortableRow(RowRef(batch, row, ordinal), keys)
               ordinal += 1
@@ -466,18 +629,19 @@ object ReferenceInterpreter:
 
           val result = error match
             case Some(value) => Left(value)
-            case None =>
+            case None        =>
               var comparisonError: Option[ExecutionError] = None
               val sorted = rows.toVector.sortWith: (left, right) =>
                 compareSortRows(left, right, order) match
                   case Right(value) => value < 0
-                  case Left(value) =>
+                  case Left(value)  =>
                     comparisonError = Some(value)
                     false
               comparisonError match
                 case Some(value) => Left(value)
-                case None =>
-                  val outputRows = sorted.map(row => readRow(row.reference.batch, row.reference.row))
+                case None        =>
+                  val outputRows =
+                    sorted.map(row => readRow(row.reference.batch, row.reference.row))
                   sequence(outputRows).flatMap(buildRows(schema, _)).map(Some(_))
           batches.foreach(_.close())
           result
@@ -487,9 +651,9 @@ object ReferenceInterpreter:
         closed = true
         input.close()
 
-  private final case class RowRef(batch: RecordBatch, row: Int, ordinal: Long)
-  private final case class GroupRows(keys: Array[ScalarValue], rows: ArrayBuffer[RowRef])
-  private final case class SortableRow(reference: RowRef, keys: Array[ScalarValue])
+  final private case class RowRef(batch: RecordBatch, row: Int, ordinal: Long)
+  final private case class GroupRows(keys: Array[ScalarValue], rows: ArrayBuffer[RowRef])
+  final private case class SortableRow(reference: RowRef, keys: Array[ScalarValue])
 
   private enum KeyAtom:
     case Null
@@ -503,17 +667,17 @@ object ReferenceInterpreter:
 
   private object KeyAtom:
     def fromScalar(value: ScalarValue): KeyAtom = value match
-      case ScalarValue.Null => KeyAtom.Null
-      case ScalarValue.Bool(actual) => KeyAtom.Bool(actual)
-      case ScalarValue.Int32(actual) => KeyAtom.Int32(actual)
-      case ScalarValue.Int64(actual) => KeyAtom.Int64(actual)
+      case ScalarValue.Null            => KeyAtom.Null
+      case ScalarValue.Bool(actual)    => KeyAtom.Bool(actual)
+      case ScalarValue.Int32(actual)   => KeyAtom.Int32(actual)
+      case ScalarValue.Int64(actual)   => KeyAtom.Int64(actual)
       case ScalarValue.Float32(actual) =>
         val normalized = if actual == 0.0f then 0.0f else actual
         KeyAtom.Float32(java.lang.Float.floatToIntBits(normalized))
       case ScalarValue.Float64(actual) =>
         val normalized = if actual == 0.0 then 0.0 else actual
         KeyAtom.Float64(java.lang.Double.doubleToLongBits(normalized))
-      case ScalarValue.Utf8(actual) => KeyAtom.Utf8(actual)
+      case ScalarValue.Utf8(actual)            => KeyAtom.Utf8(actual)
       case ScalarValue.Timestamp(actual, unit) => KeyAtom.Timestamp(actual, unit)
 
   private def drain(cursor: ExecutionCursor): Either[ExecutionError, Vector[RecordBatch]] =
@@ -523,8 +687,8 @@ object ReferenceInterpreter:
     while !done && error.isEmpty do
       cursor.nextBatch() match
         case Right(Some(batch)) => batches += batch
-        case Right(None) => done = true
-        case Left(value) => error = Some(value)
+        case Right(None)        => done = true
+        case Left(value)        => error = Some(value)
     cursor.close()
     error match
       case Some(value) =>
@@ -536,7 +700,7 @@ object ReferenceInterpreter:
       aggregate: ResolvedAggregate,
       rows: Vector[RowRef]
   ): Either[ExecutionError, ScalarValue] = aggregate.node match
-    case AggregateNode.Count => Right(ScalarValue.Int64(rows.length.toLong))
+    case AggregateNode.Count      => Right(ScalarValue.Int64(rows.length.toLong))
     case AggregateNode.Sum(input) =>
       var total: ScalarValue = ScalarValue.Null
       var index = 0
@@ -544,27 +708,54 @@ object ReferenceInterpreter:
       while index < rows.length && error.isEmpty do
         val row = rows(index)
         evaluate(input, EvalContext.current(row.batch), row.row) match
-          case Right(ScalarValue.Null) => ()
+          case Right(ScalarValue.Null)                   => ()
           case Right(value) if total == ScalarValue.Null => total = value
-          case Right(value) =>
+          case Right(value)                              =>
             arithmetic(input.id, ArithmeticOperation.Add, total, value) match
               case Right(result) => total = result
-              case Left(value) => error = Some(value)
+              case Left(value)   => error = Some(value)
           case Left(value) => error = Some(value)
         index += 1
       error.toLeft(total)
     case AggregateNode.Mean(input) =>
-      numericMoments(input, rows).map: moments =>
-        if moments.count == 0 then ScalarValue.Null
-        else ScalarValue.Float64(moments.mean)
-    case AggregateNode.Variance(input) =>
+      numericMean(input, rows)
+    case AggregateNode.VariancePop(input) =>
       numericMoments(input, rows).map: moments =>
         if moments.count == 0 then ScalarValue.Null
         else ScalarValue.Float64(moments.m2 / moments.count.toDouble)
+    case AggregateNode.StddevPop(input) =>
+      numericMoments(input, rows).map: moments =>
+        if moments.count == 0 then ScalarValue.Null
+        else ScalarValue.Float64(math.sqrt(moments.m2 / moments.count.toDouble))
     case AggregateNode.Min(input) => extremum(input, rows, minimum = true)
     case AggregateNode.Max(input) => extremum(input, rows, minimum = false)
 
-  private final case class Moments(count: Long, mean: Double, m2: Double)
+  final private case class Moments(count: Long, mean: Double, m2: Double)
+
+  private def numericMean(
+      input: ResolvedExpr,
+      rows: Vector[RowRef]
+  ): Either[ExecutionError, ScalarValue] =
+    var count = 0L
+    var total = 0.0
+    var index = 0
+    var error: Option[ExecutionError] = None
+    while index < rows.length && error.isEmpty do
+      val row = rows(index)
+      evaluate(input, EvalContext.current(row.batch), row.row) match
+        case Right(ScalarValue.Null) => ()
+        case Right(value)            =>
+          scalarDouble(input.id, value) match
+            case Right(number) =>
+              count += 1
+              total += number
+            case Left(value) => error = Some(value)
+        case Left(value) => error = Some(value)
+      index += 1
+    error match
+      case Some(value)        => Left(value)
+      case None if count == 0 => Right(ScalarValue.Null)
+      case None               => Right(ScalarValue.Float64(total / count.toDouble))
 
   private def numericMoments(
       input: ResolvedExpr,
@@ -579,7 +770,7 @@ object ReferenceInterpreter:
       val row = rows(index)
       evaluate(input, EvalContext.current(row.batch), row.row) match
         case Right(ScalarValue.Null) => ()
-        case Right(value) =>
+        case Right(value)            =>
           scalarDouble(input.id, value) match
             case Right(number) =>
               count += 1
@@ -591,14 +782,14 @@ object ReferenceInterpreter:
       index += 1
     error match
       case Some(value) => Left(value)
-      case None => Right(Moments(count, mean, m2))
+      case None        => Right(Moments(count, mean, m2))
 
   private def scalarDouble(
       id: ExprId,
       value: ScalarValue
   ): Either[ExecutionError, Double] = value match
-    case ScalarValue.Int32(actual) => Right(actual.toDouble)
-    case ScalarValue.Int64(actual) => Right(actual.toDouble)
+    case ScalarValue.Int32(actual)   => Right(actual.toDouble)
+    case ScalarValue.Int64(actual)   => Right(actual.toDouble)
     case ScalarValue.Float32(actual) => Right(actual.toDouble)
     case ScalarValue.Float64(actual) => Right(actual)
     case other => Left(ExecutionError.ExpressionType(id, DataType.Float64, other))
@@ -614,15 +805,15 @@ object ReferenceInterpreter:
     while index < rows.length && error.isEmpty do
       val row = rows(index)
       evaluate(input, EvalContext.current(row.batch), row.row) match
-        case Right(ScalarValue.Null) => ()
+        case Right(ScalarValue.Null)                      => ()
         case Right(value) if selected == ScalarValue.Null => selected = value
-        case Right(value) if isNaN(value) => selected = value
-        case Right(_) if isNaN(selected) => ()
-        case Right(value) =>
+        case Right(value) if isNaN(value)                 => selected = value
+        case Right(_) if isNaN(selected)                  => ()
+        case Right(value)                                 =>
           compareValues(input.id, value, selected) match
             case Right(comparison) if (minimum && comparison < 0) || (!minimum && comparison > 0) =>
               selected = value
-            case Right(_) => ()
+            case Right(_)    => ()
             case Left(value) => error = Some(value)
         case Left(value) => error = Some(value)
       index += 1
@@ -631,51 +822,51 @@ object ReferenceInterpreter:
   private def isNaN(value: ScalarValue): Boolean = value match
     case ScalarValue.Float32(actual) => actual.isNaN
     case ScalarValue.Float64(actual) => actual.isNaN
-    case _ => false
+    case _                           => false
 
   private def joinedRow(
       left: RecordBatch,
       leftRow: Int,
       right: RecordBatch,
-      rightRow: Int
+      rightRow: Int,
+      columns: Vector[JoinColumn]
   ): Either[ExecutionError, Array[ScalarValue]] =
-    val output = new Array[ScalarValue](left.columns.size + right.columns.size)
+    val output = new Array[ScalarValue](columns.size)
     var index = 0
     var error: Option[ExecutionError] = None
-    while index < left.columns.size && error.isEmpty do
-      left.columns(index).scalar(leftRow) match
+    while index < columns.size && error.isEmpty do
+      val value = columns(index) match
+        case JoinColumn.Left(sourceIndex) =>
+          left.columns(sourceIndex).scalar(leftRow)
+        case JoinColumn.Right(sourceIndex) =>
+          right.columns(sourceIndex).scalar(rightRow)
+      value match
         case Right(value) => output(index) = value
-        case Left(value) => error = Some(ExecutionError.Storage(value))
+        case Left(value)  => error = Some(ExecutionError.Storage(value))
       index += 1
-    var rightIndex = 0
-    while rightIndex < right.columns.size && error.isEmpty do
-      right.columns(rightIndex).scalar(rightRow) match
-        case Right(value) => output(left.columns.size + rightIndex) = value
-        case Left(value) => error = Some(ExecutionError.Storage(value))
-      rightIndex += 1
     error match
       case Some(value) => Left(value)
-      case None => Right(output)
+      case None        => Right(output)
 
   private def leftOnlyRow(
       left: RecordBatch,
       leftRow: Int,
-      rightColumns: Int
+      columns: Vector[JoinColumn]
   ): Either[ExecutionError, Array[ScalarValue]] =
-    val output = new Array[ScalarValue](left.columns.size + rightColumns)
+    val output = new Array[ScalarValue](columns.size)
     var index = 0
     var error: Option[ExecutionError] = None
-    while index < left.columns.size && error.isEmpty do
-      left.columns(index).scalar(leftRow) match
-        case Right(value) => output(index) = value
-        case Left(value) => error = Some(ExecutionError.Storage(value))
-      index += 1
-    while index < output.length do
-      output(index) = ScalarValue.Null
+    while index < columns.size && error.isEmpty do
+      columns(index) match
+        case JoinColumn.Left(sourceIndex) =>
+          left.columns(sourceIndex).scalar(leftRow) match
+            case Right(value) => output(index) = value
+            case Left(value)  => error = Some(ExecutionError.Storage(value))
+        case JoinColumn.Right(_) => output(index) = ScalarValue.Null
       index += 1
     error match
       case Some(value) => Left(value)
-      case None => Right(output)
+      case None        => Right(output)
 
   private def readRow(
       batch: RecordBatch,
@@ -687,24 +878,27 @@ object ReferenceInterpreter:
     while index < batch.columns.size && error.isEmpty do
       batch.columns(index).scalar(row) match
         case Right(value) => output(index) = value
-        case Left(value) => error = Some(ExecutionError.Storage(value))
+        case Left(value)  => error = Some(ExecutionError.Storage(value))
       index += 1
     error match
       case Some(value) => Left(value)
-      case None => Right(output)
+      case None        => Right(output)
 
   private def buildRows(
       schema: Schema,
       rows: Vector[Array[ScalarValue]]
   ): Either[ExecutionError, RecordBatch] =
-    val columns = Vector.tabulate(schema.size): column =>
-      val values = new Array[ScalarValue](rows.length)
-      var row = 0
-      while row < rows.length do
-        values(row) = rows(row)(column)
-        row += 1
-      values
-    buildBatch(schema, columns)
+    if schema.size == 0 then
+      RecordBatch.empty(schema, rows.length).left.map(ExecutionError.Storage.apply)
+    else
+      val columns = Vector.tabulate(schema.size): column =>
+        val values = new Array[ScalarValue](rows.length)
+        var row = 0
+        while row < rows.length do
+          values(row) = rows(row)(column)
+          row += 1
+        values
+      buildBatch(schema, columns)
 
   private def compareSortRows(
       left: SortableRow,
@@ -720,7 +914,7 @@ object ReferenceInterpreter:
       val item = order(index)
       val comparison = (leftValue, rightValue) match
         case (ScalarValue.Null, ScalarValue.Null) => Right(0)
-        case (ScalarValue.Null, _) =>
+        case (ScalarValue.Null, _)                =>
           Right(if item.nulls == NullPlacement.First then -1 else 1)
         case (_, ScalarValue.Null) =>
           Right(if item.nulls == NullPlacement.First then 1 else -1)
@@ -729,12 +923,12 @@ object ReferenceInterpreter:
             if item.direction == SortDirection.Ascending then value else -value
       comparison match
         case Right(value) => result = value
-        case Left(value) => error = Some(value)
+        case Left(value)  => error = Some(value)
       index += 1
     error match
-      case Some(value) => Left(value)
+      case Some(value)         => Left(value)
       case None if result != 0 => Right(result)
-      case None => Right(left.reference.ordinal.compare(right.reference.ordinal))
+      case None                => Right(left.reference.ordinal.compare(right.reference.ordinal))
 
   private def evaluateJoin(
       expression: ResolvedExpr,
@@ -743,15 +937,15 @@ object ReferenceInterpreter:
       right: RecordBatch,
       rightRow: Int
   ): Either[ExecutionError, ScalarValue] = expression.node match
-    case ExprNode.Column(InputRef.Left, _, _, index) =>
+    case ExprNode.Column(InputRef.Left, _, _, _, index) =>
       column(expression.id, InputRef.Left, left, index)
         .flatMap(_.scalar(leftRow).left.map(ExecutionError.Storage.apply))
-    case ExprNode.Column(InputRef.Right, _, _, index) =>
+    case ExprNode.Column(InputRef.Right, _, _, _, index) =>
       column(expression.id, InputRef.Right, right, index)
         .flatMap(_.scalar(rightRow).left.map(ExecutionError.Storage.apply))
-    case ExprNode.Column(InputRef.Current, _, _, _) =>
+    case ExprNode.Column(InputRef.Current, _, _, _, _) =>
       Left(ExecutionError.UnsupportedNode("current expression inside join"))
-    case ExprNode.Literal(value) => literal(value)
+    case ExprNode.Literal(value)         => literal(value)
     case ExprNode.Unary(operator, input) =>
       evaluateJoin(input, left, leftRow, right, rightRow)
         .flatMap(unary(expression.id, operator, _))
@@ -760,7 +954,7 @@ object ReferenceInterpreter:
         evaluateJoin(rhs, left, leftRow, right, rightRow)
           .flatMap(rightValue => binary(expression.id, operator, leftValue, rightValue))
 
-  private final case class EvalContext(
+  final private case class EvalContext(
       current: Option[RecordBatch],
       left: Option[RecordBatch],
       right: Option[RecordBatch]
@@ -774,17 +968,17 @@ object ReferenceInterpreter:
       context: EvalContext,
       row: Int
   ): Either[ExecutionError, ScalarValue] = expression.node match
-    case ExprNode.Column(input, _, _, index) =>
+    case ExprNode.Column(input, _, _, _, index) =>
       val batch = input match
         case InputRef.Current => context.current
-        case InputRef.Left => context.left
-        case InputRef.Right => context.right
+        case InputRef.Left    => context.left
+        case InputRef.Right   => context.right
       batch match
         case None => Left(ExecutionError.UnsupportedNode(s"${input.qualifier} expression scope"))
         case Some(value) =>
           column(expression.id, input, value, index)
             .flatMap(_.scalar(row).left.map(ExecutionError.Storage.apply))
-    case ExprNode.Literal(value) => literal(value)
+    case ExprNode.Literal(value)         => literal(value)
     case ExprNode.Unary(operator, input) =>
       evaluate(input, context, row).flatMap(unary(expression.id, operator, _))
     case ExprNode.Binary(operator, left, right) =>
@@ -809,13 +1003,13 @@ object ReferenceInterpreter:
       )
 
   private def literal(value: LiteralValue): Either[ExecutionError, ScalarValue] = value match
-    case LiteralValue.Null(_) => Right(ScalarValue.Null)
-    case LiteralValue.Bool(value) => Right(ScalarValue.Bool(value))
-    case LiteralValue.Int32(value) => Right(ScalarValue.Int32(value))
-    case LiteralValue.Int64(value) => Right(ScalarValue.Int64(value))
-    case LiteralValue.Float32(value) => Right(ScalarValue.Float32(value))
-    case LiteralValue.Float64(value) => Right(ScalarValue.Float64(value))
-    case LiteralValue.Utf8(value) => Right(ScalarValue.Utf8(value))
+    case LiteralValue.Null(_)                => Right(ScalarValue.Null)
+    case LiteralValue.Bool(value)            => Right(ScalarValue.Bool(value))
+    case LiteralValue.Int32(value)           => Right(ScalarValue.Int32(value))
+    case LiteralValue.Int64(value)           => Right(ScalarValue.Int64(value))
+    case LiteralValue.Float32(value)         => Right(ScalarValue.Float32(value))
+    case LiteralValue.Float64(value)         => Right(ScalarValue.Float64(value))
+    case LiteralValue.Utf8(value)            => Right(ScalarValue.Utf8(value))
     case LiteralValue.Timestamp(value, unit) => Right(ScalarValue.Timestamp(value, unit))
 
   private def unary(
@@ -825,17 +1019,25 @@ object ReferenceInterpreter:
   ): Either[ExecutionError, ScalarValue] = operator match
     case UnaryOperator.IsNull => Right(ScalarValue.Bool(input == ScalarValue.Null))
     case UnaryOperator.IsTrue => Right(ScalarValue.Bool(input == ScalarValue.Bool(true)))
-    case UnaryOperator.Negate => input match
-      case ScalarValue.Null => Right(ScalarValue.Null)
-      case ScalarValue.Int32(value) if value == Int.MinValue =>
-        Left(ExecutionError.IntegerOverflow(id, BinaryOperator.Subtract))
-      case ScalarValue.Int32(value) => Right(ScalarValue.Int32(-value))
-      case ScalarValue.Int64(value) if value == Long.MinValue =>
-        Left(ExecutionError.IntegerOverflow(id, BinaryOperator.Subtract))
-      case ScalarValue.Int64(value) => Right(ScalarValue.Int64(-value))
-      case ScalarValue.Float32(value) => Right(ScalarValue.Float32(-value))
-      case ScalarValue.Float64(value) => Right(ScalarValue.Float64(-value))
-      case other => Left(ExecutionError.ExpressionType(id, DataType.Float64, other))
+    case UnaryOperator.Negate =>
+      input match
+        case ScalarValue.Null                                  => Right(ScalarValue.Null)
+        case ScalarValue.Int32(value) if value == Int.MinValue =>
+          Left(ExecutionError.IntegerOverflow(id, BinaryOperator.Subtract))
+        case ScalarValue.Int32(value)                           => Right(ScalarValue.Int32(-value))
+        case ScalarValue.Int64(value) if value == Long.MinValue =>
+          Left(ExecutionError.IntegerOverflow(id, BinaryOperator.Subtract))
+        case ScalarValue.Int64(value)   => Right(ScalarValue.Int64(-value))
+        case ScalarValue.Float32(value) => Right(ScalarValue.Float32(-value))
+        case ScalarValue.Float64(value) => Right(ScalarValue.Float64(-value))
+        case other => Left(ExecutionError.ExpressionType(id, DataType.Float64, other))
+    case UnaryOperator.Sqrt =>
+      input match
+        case ScalarValue.Null           => Right(ScalarValue.Null)
+        case ScalarValue.Float32(value) =>
+          Right(ScalarValue.Float32(math.sqrt(value.toDouble).toFloat))
+        case ScalarValue.Float64(value) => Right(ScalarValue.Float64(math.sqrt(value)))
+        case other => Left(ExecutionError.ExpressionType(id, DataType.Float64, other))
 
   private def binary(
       id: ExprId,
@@ -844,7 +1046,7 @@ object ReferenceInterpreter:
       right: ScalarValue
   ): Either[ExecutionError, ScalarValue] = operator match
     case BinaryOperator.NullSafeEqual => Right(ScalarValue.Bool(nullSafeEqual(left, right)))
-    case BinaryOperator.And =>
+    case BinaryOperator.And           =>
       for
         lhs <- toTri(id, left)
         rhs <- toTri(id, right)
@@ -855,38 +1057,42 @@ object ReferenceInterpreter:
         rhs <- toTri(id, right)
       yield fromTri(or(lhs, rhs))
     case _ if left == ScalarValue.Null || right == ScalarValue.Null => Right(ScalarValue.Null)
-    case BinaryOperator.Equal => Right(ScalarValue.Bool(equalValues(left, right)))
+    case BinaryOperator.Equal    => Right(ScalarValue.Bool(equalValues(left, right)))
     case BinaryOperator.NotEqual => Right(ScalarValue.Bool(!equalValues(left, right)))
-    case BinaryOperator.LessThan => compareValues(id, left, right).map(value => ScalarValue.Bool(value < 0))
-    case BinaryOperator.LessThanOrEqual => compareValues(id, left, right).map(value => ScalarValue.Bool(value <= 0))
-    case BinaryOperator.GreaterThan => compareValues(id, left, right).map(value => ScalarValue.Bool(value > 0))
-    case BinaryOperator.GreaterThanOrEqual => compareValues(id, left, right).map(value => ScalarValue.Bool(value >= 0))
-    case BinaryOperator.Add => arithmetic(id, ArithmeticOperation.Add, left, right)
+    case BinaryOperator.LessThan =>
+      compareValues(id, left, right).map(value => ScalarValue.Bool(value < 0))
+    case BinaryOperator.LessThanOrEqual =>
+      compareValues(id, left, right).map(value => ScalarValue.Bool(value <= 0))
+    case BinaryOperator.GreaterThan =>
+      compareValues(id, left, right).map(value => ScalarValue.Bool(value > 0))
+    case BinaryOperator.GreaterThanOrEqual =>
+      compareValues(id, left, right).map(value => ScalarValue.Bool(value >= 0))
+    case BinaryOperator.Add      => arithmetic(id, ArithmeticOperation.Add, left, right)
     case BinaryOperator.Subtract => arithmetic(id, ArithmeticOperation.Subtract, left, right)
     case BinaryOperator.Multiply => arithmetic(id, ArithmeticOperation.Multiply, left, right)
-    case BinaryOperator.Divide => arithmetic(id, ArithmeticOperation.Divide, left, right)
+    case BinaryOperator.Divide   => arithmetic(id, ArithmeticOperation.Divide, left, right)
 
   private def toTri(id: ExprId, value: ScalarValue): Either[ExecutionError, TriBool] =
     value match
-      case ScalarValue.Bool(true) => Right(TriBool.True)
+      case ScalarValue.Bool(true)  => Right(TriBool.True)
       case ScalarValue.Bool(false) => Right(TriBool.False)
-      case ScalarValue.Null => Right(TriBool.Unknown)
-      case other => Left(ExecutionError.PredicateType(id, other))
+      case ScalarValue.Null        => Right(TriBool.Unknown)
+      case other                   => Left(ExecutionError.PredicateType(id, other))
 
   private def fromTri(value: TriBool): ScalarValue = value match
-    case TriBool.True => ScalarValue.Bool(true)
-    case TriBool.False => ScalarValue.Bool(false)
+    case TriBool.True    => ScalarValue.Bool(true)
+    case TriBool.False   => ScalarValue.Bool(false)
     case TriBool.Unknown => ScalarValue.Null
 
   private def and(left: TriBool, right: TriBool): TriBool = (left, right) match
     case (TriBool.False, _) | (_, TriBool.False) => TriBool.False
-    case (TriBool.True, TriBool.True) => TriBool.True
-    case _ => TriBool.Unknown
+    case (TriBool.True, TriBool.True)            => TriBool.True
+    case _                                       => TriBool.Unknown
 
   private def or(left: TriBool, right: TriBool): TriBool = (left, right) match
     case (TriBool.True, _) | (_, TriBool.True) => TriBool.True
-    case (TriBool.False, TriBool.False) => TriBool.False
-    case _ => TriBool.Unknown
+    case (TriBool.False, TriBool.False)        => TriBool.False
+    case _                                     => TriBool.Unknown
 
   private def nullSafeEqual(left: ScalarValue, right: ScalarValue): Boolean =
     if left == ScalarValue.Null then right == ScalarValue.Null
@@ -896,19 +1102,20 @@ object ReferenceInterpreter:
   private def equalValues(left: ScalarValue, right: ScalarValue): Boolean = (left, right) match
     case (ScalarValue.Float32(a), ScalarValue.Float32(b)) => !a.isNaN && !b.isNaN && a == b
     case (ScalarValue.Float64(a), ScalarValue.Float64(b)) => !a.isNaN && !b.isNaN && a == b
-    case _ => left == right
+    case _                                                => left == right
 
   private def compareValues(
       id: ExprId,
       left: ScalarValue,
       right: ScalarValue
   ): Either[ExecutionError, Int] = (left, right) match
-    case (ScalarValue.Bool(a), ScalarValue.Bool(b)) => Right(a.compare(b))
-    case (ScalarValue.Int32(a), ScalarValue.Int32(b)) => Right(a.compare(b))
-    case (ScalarValue.Int64(a), ScalarValue.Int64(b)) => Right(a.compare(b))
-    case (ScalarValue.Float32(a), ScalarValue.Float32(b)) => Right(compareFloat(a.toDouble, b.toDouble))
+    case (ScalarValue.Bool(a), ScalarValue.Bool(b))       => Right(a.compare(b))
+    case (ScalarValue.Int32(a), ScalarValue.Int32(b))     => Right(a.compare(b))
+    case (ScalarValue.Int64(a), ScalarValue.Int64(b))     => Right(a.compare(b))
+    case (ScalarValue.Float32(a), ScalarValue.Float32(b)) =>
+      Right(compareFloat(a.toDouble, b.toDouble))
     case (ScalarValue.Float64(a), ScalarValue.Float64(b)) => Right(compareFloat(a, b))
-    case (ScalarValue.Utf8(a), ScalarValue.Utf8(b)) => Right(compareUtf8(a, b))
+    case (ScalarValue.Utf8(a), ScalarValue.Utf8(b))       => Right(compareUtf8(a, b))
     case (ScalarValue.Timestamp(a, unitA), ScalarValue.Timestamp(b, unitB)) if unitA == unitB =>
       Right(a.compare(b))
     case _ => Left(ExecutionError.IncompatibleValues(id, left, right))
@@ -940,24 +1147,22 @@ object ReferenceInterpreter:
         Left(ExecutionError.DivisionByZero(id))
       else
         val result = operator match
-          case ArithmeticOperation.Add => BigInt(a) + BigInt(b)
+          case ArithmeticOperation.Add      => BigInt(a) + BigInt(b)
           case ArithmeticOperation.Subtract => BigInt(a) - BigInt(b)
           case ArithmeticOperation.Multiply => BigInt(a) * BigInt(b)
-          case ArithmeticOperation.Divide => BigInt(a) / BigInt(b)
-        if !result.isValidInt then
-          Left(ExecutionError.IntegerOverflow(id, operator.binary))
+          case ArithmeticOperation.Divide   => BigInt(a) / BigInt(b)
+        if !result.isValidInt then Left(ExecutionError.IntegerOverflow(id, operator.binary))
         else Right(ScalarValue.Int32(result.toInt))
     case (ScalarValue.Int64(a), ScalarValue.Int64(b)) =>
       if operator == ArithmeticOperation.Divide && b == 0L then
         Left(ExecutionError.DivisionByZero(id))
       else
         val result = operator match
-          case ArithmeticOperation.Add => BigInt(a) + BigInt(b)
+          case ArithmeticOperation.Add      => BigInt(a) + BigInt(b)
           case ArithmeticOperation.Subtract => BigInt(a) - BigInt(b)
           case ArithmeticOperation.Multiply => BigInt(a) * BigInt(b)
-          case ArithmeticOperation.Divide => BigInt(a) / BigInt(b)
-        if !result.isValidLong then
-          Left(ExecutionError.IntegerOverflow(id, operator.binary))
+          case ArithmeticOperation.Divide   => BigInt(a) / BigInt(b)
+        if !result.isValidLong then Left(ExecutionError.IntegerOverflow(id, operator.binary))
         else Right(ScalarValue.Int64(result.toLong))
     case (ScalarValue.Float32(a), ScalarValue.Float32(b)) =>
       Right(ScalarValue.Float32(floatOperation(operator, a.toDouble, b.toDouble).toFloat))
@@ -970,10 +1175,10 @@ object ReferenceInterpreter:
       left: Double,
       right: Double
   ): Double = operator match
-    case ArithmeticOperation.Add => left + right
+    case ArithmeticOperation.Add      => left + right
     case ArithmeticOperation.Subtract => left - right
     case ArithmeticOperation.Multiply => left * right
-    case ArithmeticOperation.Divide => left / right
+    case ArithmeticOperation.Divide   => left / right
 
   private enum ArithmeticOperation:
     case Add
@@ -982,10 +1187,10 @@ object ReferenceInterpreter:
     case Divide
 
     def binary: BinaryOperator = this match
-      case Add => BinaryOperator.Add
+      case Add      => BinaryOperator.Add
       case Subtract => BinaryOperator.Subtract
       case Multiply => BinaryOperator.Multiply
-      case Divide => BinaryOperator.Divide
+      case Divide   => BinaryOperator.Divide
 
   private def sequence[A](
       values: Vector[Either[ExecutionError, A]]
@@ -996,11 +1201,11 @@ object ReferenceInterpreter:
     while index < values.length && error.isEmpty do
       values(index) match
         case Right(value) => output += value
-        case Left(value) => error = Some(value)
+        case Left(value)  => error = Some(value)
       index += 1
     error match
       case Some(value) => Left(value)
-      case None => Right(output.toVector)
+      case None        => Right(output.toVector)
 
   private def buildBatch(
       schema: Schema,
@@ -1012,7 +1217,7 @@ object ReferenceInterpreter:
     while index < schema.fields.length && error.isEmpty do
       buildColumn(schema.fields(index), columns(index)) match
         case Right(column) => built += column
-        case Left(value) => error = Some(value)
+        case Left(value)   => error = Some(value)
       index += 1
     error match
       case Some(value) =>
@@ -1035,8 +1240,8 @@ object ReferenceInterpreter:
         while index < values.length do
           values(index) match
             case ScalarValue.Bool(value) => output(index) = value
-            case ScalarValue.Null => ()
-            case other => return mismatch(other)
+            case ScalarValue.Null        => ()
+            case other                   => return mismatch(other)
           index += 1
         ColumnArray.bool(output, valid).left.map(ExecutionError.Storage.apply)
       case DataType.Int32 =>
@@ -1045,8 +1250,8 @@ object ReferenceInterpreter:
         while index < values.length do
           values(index) match
             case ScalarValue.Int32(value) => output(index) = value
-            case ScalarValue.Null => ()
-            case other => return mismatch(other)
+            case ScalarValue.Null         => ()
+            case other                    => return mismatch(other)
           index += 1
         ColumnArray.int32(output, valid).left.map(ExecutionError.Storage.apply)
       case DataType.Int64 =>
@@ -1055,8 +1260,8 @@ object ReferenceInterpreter:
         while index < values.length do
           values(index) match
             case ScalarValue.Int64(value) => output(index) = value
-            case ScalarValue.Null => ()
-            case other => return mismatch(other)
+            case ScalarValue.Null         => ()
+            case other                    => return mismatch(other)
           index += 1
         ColumnArray.int64(output, valid).left.map(ExecutionError.Storage.apply)
       case DataType.Float32 =>
@@ -1065,8 +1270,8 @@ object ReferenceInterpreter:
         while index < values.length do
           values(index) match
             case ScalarValue.Float32(value) => output(index) = value
-            case ScalarValue.Null => ()
-            case other => return mismatch(other)
+            case ScalarValue.Null           => ()
+            case other                      => return mismatch(other)
           index += 1
         ColumnArray.float32(output, valid).left.map(ExecutionError.Storage.apply)
       case DataType.Float64 =>
@@ -1075,8 +1280,8 @@ object ReferenceInterpreter:
         while index < values.length do
           values(index) match
             case ScalarValue.Float64(value) => output(index) = value
-            case ScalarValue.Null => ()
-            case other => return mismatch(other)
+            case ScalarValue.Null           => ()
+            case other                      => return mismatch(other)
           index += 1
         ColumnArray.float64(output, valid).left.map(ExecutionError.Storage.apply)
       case DataType.Utf8 =>
@@ -1085,8 +1290,8 @@ object ReferenceInterpreter:
         while index < values.length do
           values(index) match
             case ScalarValue.Utf8(value) => output(index) = value
-            case ScalarValue.Null => output(index) = ""
-            case other => return mismatch(other)
+            case ScalarValue.Null        => output(index) = ""
+            case other                   => return mismatch(other)
           index += 1
         ColumnArray.utf8(output, valid).left.map(ExecutionError.Storage.apply)
       case DataType.Timestamp(unit) =>
@@ -1094,8 +1299,9 @@ object ReferenceInterpreter:
         var index = 0
         while index < values.length do
           values(index) match
-            case ScalarValue.Timestamp(value, actualUnit) if actualUnit == unit => output(index) = value
+            case ScalarValue.Timestamp(value, actualUnit) if actualUnit == unit =>
+              output(index) = value
             case ScalarValue.Null => ()
-            case other => return mismatch(other)
+            case other            => return mismatch(other)
           index += 1
         ColumnArray.timestamp(output, unit, valid).left.map(ExecutionError.Storage.apply)

@@ -5,10 +5,12 @@ class StorageSuite extends munit.FunSuite:
     result.fold(error => fail(error.message), identity)
 
   test("Int32 uses Arrow little-endian values and LSB-first validity bits"):
-    val array = value(ColumnArray.int32(
-      Array(1, 0x02030405, -1, 4),
-      Array(true, false, true, false)
-    ))
+    val array = value(
+      ColumnArray.int32(
+        Array(1, 0x02030405, -1, 4),
+        Array(true, false, true, false)
+      )
+    )
     val buffers = value(array.copyPhysicalBuffers)
 
     assertEquals(array.layout.buffers.map(_.role), Vector(BufferRole.Validity, BufferRole.Values))
@@ -23,10 +25,12 @@ class StorageSuite extends munit.FunSuite:
     array.close()
 
   test("booleans pack values and validity independently"):
-    val array = value(ColumnArray.bool(
-      Array(true, false, true, true),
-      Array(true, true, false, true)
-    ))
+    val array = value(
+      ColumnArray.bool(
+        Array(true, false, true, true),
+        Array(true, true, false, true)
+      )
+    )
     val buffers = value(array.copyPhysicalBuffers)
 
     assertEquals(buffers(0).toVector, Vector(0x0b.toByte))
@@ -65,7 +69,7 @@ class StorageSuite extends munit.FunSuite:
     val preciseSlice: Either[StorageError, Int32Array] = indices.slice(0, 1)
     value(preciseSlice).close()
     val dictionaryValues = value(ColumnArray.utf8(Array("red", "blue")))
-    val dictionary = ColumnArray.dictionary(indices, dictionaryValues)
+    val dictionary = value(ColumnArray.dictionary(indices, dictionaryValues))
     assertEquals(
       dictionary.encoding,
       PhysicalEncoding.Dictionary(DataType.Int32, DataType.Utf8)
@@ -80,21 +84,29 @@ class StorageSuite extends munit.FunSuite:
 
   test("retained slices keep buffers alive until the final deterministic close"):
     val tracker = new BufferTracker
-    val array = value(ColumnArray.int32(
-      Array(10, 20, 30, 40),
-      Array(true, false, true, true),
-      tracker
-    ))
+    val array = value(
+      ColumnArray.int32(
+        Array(10, 20, 30, 40),
+        Array(true, false, true, true),
+        tracker
+      )
+    )
     val slice = value(array.slice(1, 2))
 
-    assertEquals(tracker.snapshot, BufferSnapshot(activeOwners = 2, activeViews = 4, releasedOwners = 0))
+    assertEquals(
+      tracker.snapshot,
+      BufferSnapshot(activeOwners = 2, activeViews = 4, releasedOwners = 0)
+    )
     array.close()
     assertEquals(slice.scalar(0), Right(ScalarValue.Null))
     assertEquals(slice.scalar(1), Right(ScalarValue.Int32(30)))
     assertEquals(tracker.snapshot.activeOwners, 2)
 
     slice.close()
-    assertEquals(tracker.snapshot, BufferSnapshot(activeOwners = 0, activeViews = 0, releasedOwners = 2))
+    assertEquals(
+      tracker.snapshot,
+      BufferSnapshot(activeOwners = 0, activeViews = 0, releasedOwners = 2)
+    )
     assertEquals(slice.scalar(1), Left(StorageError.BufferClosed))
 
   test("borrowed buffers release their external lease exactly once"):

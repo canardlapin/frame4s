@@ -1,0 +1,10 @@
+[info] welcome to sbt 1.10.5 (Eclipse Adoptium Java 21.0.11)
+[info] loading settings for project frame4s-build from plugins.sbt ...
+[info] loading project definition from <workspace>/project
+[info] loading settings for project root from build.sbt ...
+[info] set current project to frame4s (in build file:<workspace>/)
+Test run frame4s.fs2.FrameIOSuite started
+frame4s.fs2.FrameIOSuite: finished 0.679s
+Test run frame4s.fs2.FrameIOSuite finished: 0 failed, 0 ignored, 10 total 0.684s
+[info] Passed: Total 10, Failed 0, Errors 0, Passed 10
+[success] Total time: 1 s, completed Jul 26, 2026, 9:29:42 a.m.

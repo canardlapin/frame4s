@@ -1,0 +1,11 @@
+[info] welcome to sbt 1.10.5 (Eclipse Adoptium Java 21.0.11)
+[info] loading settings for project frame4s-build from plugins.sbt ...
+[info] loading project definition from <workspace>/project
+[info] loading settings for project root from build.sbt ...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] running (fork) example.FirstContact
+[info] |label       |score|
+[info] |------------|-----|
+[info] |quoted,label|null |
+[info] |東京          |NaN  |
+[success] Total time: 1 s, completed Jul 26, 2026, 9:29:38 a.m.

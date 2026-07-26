@@ -4,15 +4,15 @@ import scala.compiletime.testing.typeCheckErrors
 
 class FrameApiSuite extends munit.FunSuite:
   type People = (
-    id: Int,
-    name: String,
-    score: Option[Double],
-    active: Option[Boolean]
+      id: Int,
+      name: String,
+      score: Option[Double],
+      active: Option[Boolean]
   )
 
   type Departments = (
-    departmentId: Int,
-    departmentName: String
+      departmentId: Int,
+      departmentName: String
   )
 
   private def people: Frame[People] =
@@ -42,7 +42,9 @@ class FrameApiSuite extends munit.FunSuite:
         row.col("id") + Expr.literal(1)
 
     assertEquals(extended.schema.fields.map(_.name), Vector("id", "name", "nextId"))
-    assert(extended.explain.startsWith("Project[id, name, nextId]"))
+    assert(extended.explain.startsWith("Project[id="))
+    assert(extended.explain.contains(", name="))
+    assert(extended.explain.contains(", nextId="))
 
   test("filter requires a total boolean while nullable booleans are explicit"):
     val filtered = people.filter: row =>
@@ -53,11 +55,30 @@ class FrameApiSuite extends munit.FunSuite:
 
   test("nullable comparisons remain nullable until explicitly made total"):
     val filtered = people.filter: row =>
-      val comparison: Expr[Option[Boolean]] =
-        row.col("score") === Expr.literal(Option(1.0))
-      comparison.isTrue
+      (row.col("score") === Expr.literal(Option(1.0))).isTrue
 
     assert(filtered.explain.startsWith("Filter"))
+
+  test("literals and origin-polymorphic helpers remain reusable"):
+    def positive[Origin](
+        row: Scope[People, Origin]
+    ): ScopedExpr[Boolean, Origin] =
+      row.col("id") > Expr.literal(0)
+
+    def sameId[LeftOrigin, RightOrigin](
+        person: Scope[People, LeftOrigin],
+        department: Scope[Departments, RightOrigin]
+    ): ScopedExpr[Boolean, LeftOrigin | RightOrigin] =
+      person.col("id") === department.col("departmentId")
+
+    val zero = Expr.literal(0)
+    val fromLiteral = people.filter(row => row.col("id") > zero)
+    val fromHelper = people.filter(positive)
+    val joined = people.innerJoin(departments)(sameId)
+
+    assert(fromLiteral.explain.startsWith("Filter"))
+    assertEquals(fromHelper.explain, fromLiteral.explain)
+    assert(joined.explain.startsWith("Join"))
 
   test("grouping and core aggregates compute their result schema"):
     val grouped: Frame[(name: String, n: Long, maxId: Int)] =
@@ -74,24 +95,28 @@ class FrameApiSuite extends munit.FunSuite:
     assert(grouped.explain.startsWith("Aggregate[name, n, maxId]"))
 
   test("inner and left joins preserve typed field ownership and outer nullability"):
-    val inner: Frame[(
-      id: Int,
-      name: String,
-      score: Option[Double],
-      active: Option[Boolean],
-      departmentId: Int,
-      departmentName: String
-    )] = people.innerJoin(departments): (person, department) =>
+    val inner: Frame[
+      (
+          id: Int,
+          name: String,
+          score: Option[Double],
+          active: Option[Boolean],
+          departmentId: Int,
+          departmentName: String
+      )
+    ] = people.innerJoin(departments): (person, department) =>
       person.col("id") === department.col("departmentId")
 
-    val left: Frame[(
-      id: Int,
-      name: String,
-      score: Option[Double],
-      active: Option[Boolean],
-      departmentId: Option[Int],
-      departmentName: Option[String]
-    )] = people.leftJoin(departments): (person, department) =>
+    val left: Frame[
+      (
+          id: Int,
+          name: String,
+          score: Option[Double],
+          active: Option[Boolean],
+          departmentId: Option[Int],
+          departmentName: Option[String]
+      )
+    ] = people.leftJoin(departments): (person, department) =>
       person.col("id") === department.col("departmentId")
 
     assertEquals(inner.schema.fields.last.nullable, false)
@@ -115,6 +140,8 @@ class FrameApiSuite extends munit.FunSuite:
     assertEquals(left.schema.fields.map(_.nullable), Vector(false, false, true))
     assertEquals(dynamic.schema, typed.schema)
     assertEquals(dynamic.explain, typed.explain)
+    assertEquals(typed.plan.nodeName, "Join")
+    assertEquals(left.plan.nodeName, "Join")
 
   test("dynamic frames promote only after exact typed schema binding"):
     val dynamic = DynamicFrame
@@ -148,12 +175,82 @@ class FrameApiSuite extends munit.FunSuite:
 
     val total = active.isTrue.fold(error => fail(error.message), identity)
     val filtered = dynamic.filter(total).fold(error => fail(error.message), identity)
+    filtered.select("capturedId" -> id) match
+      case Left(FrameError.InvalidExpressionScope(_)) => ()
+      case other => fail(s"expected captured expression rejection, found $other")
+
+    val filteredId = filtered.col("id").fold(error => fail(error.message), identity)
+    val filteredName = filtered.col("name").fold(error => fail(error.message), identity)
     val selected = filtered
-      .select("personId" -> id, "personName" -> name)
+      .select("personId" -> filteredId, "personName" -> filteredName)
       .fold(error => fail(error.message), identity)
 
     assertEquals(selected.schema.fields.map(_.name), Vector("personId", "personName"))
-    assert(selected.explain.startsWith("Project[personId, personName]"))
+    assert(selected.explain.startsWith("Project[personId="))
+    assert(selected.explain.contains(", personName="))
+
+  test("dynamic output collisions report every conflicting name"):
+    val dynamic = people.dynamic
+    val id = dynamic.col("id").fold(error => fail(error.message), identity)
+    val name = dynamic.col("name").fold(error => fail(error.message), identity)
+
+    assertEquals(
+      dynamic.select("x" -> id, "x" -> id, "y" -> name, "y" -> name),
+      Left(FrameError.DuplicateOutputNames(Vector("x", "y")))
+    )
+    assertEquals(
+      dynamic.groupBy("x" -> id, "x" -> id),
+      Left(FrameError.DuplicateOutputNames(Vector("x")))
+    )
+
+    val grouped = dynamic
+      .groupBy("x" -> id)
+      .fold(error => fail(error.message), identity)
+    assertEquals(
+      grouped.aggregate(
+        "x" -> DynamicAggregate.count,
+        "y" -> DynamicAggregate.count,
+        "y" -> DynamicAggregate.count
+      ),
+      Left(FrameError.DuplicateOutputNames(Vector("x", "y")))
+    )
+
+  test("dynamic provenance distinguishes same-shaped frames and field order"):
+    val first = DynamicFrame
+      .source(
+        "first",
+        Vector(
+          DynamicFrame.field("p", DataType.Int32),
+          DynamicFrame.field("q", DataType.Int32)
+        )
+      )
+      .fold(error => fail(error.message), identity)
+    val second = DynamicFrame
+      .source(
+        "second",
+        Vector(
+          DynamicFrame.field("q", DataType.Int32),
+          DynamicFrame.field("p", DataType.Int32)
+        )
+      )
+      .fold(error => fail(error.message), identity)
+    val samePlan = DynamicFrame
+      .source(
+        "first",
+        Vector(
+          DynamicFrame.field("p", DataType.Int32),
+          DynamicFrame.field("q", DataType.Int32)
+        )
+      )
+      .fold(error => fail(error.message), identity)
+    val stolen = first.col("p").fold(error => fail(error.message), identity)
+
+    second.select("p" -> stolen) match
+      case Left(FrameError.InvalidExpressionScope(_)) => ()
+      case other => fail(s"expected cross-frame rejection, found $other")
+    samePlan.select("p" -> stolen) match
+      case Left(FrameError.InvalidExpressionScope(_)) => ()
+      case other => fail(s"expected same-plan frame rejection, found $other")
 
   test("typed erasure and promotion preserve the exact resolved plan without execution"):
     val typed = people.filter(row => row.col("id") > Expr.literal(0))
@@ -181,12 +278,15 @@ class FrameApiSuite extends munit.FunSuite:
       .fold(error => fail(error.message), identity)
       .filter(row => row.col("id") > Expr.literal(0))
 
-    assertEquals(first.schema.fields.map(_.id.value), Vector(
-      "column:id",
-      "column:name",
-      "column:score",
-      "column:active"
-    ))
+    assertEquals(
+      first.schema.fields.map(_.id.value),
+      Vector(
+        "column:id",
+        "column:name",
+        "column:score",
+        "column:active"
+      )
+    )
     assertEquals(first.explain, second.explain)
     assertEquals(
       first.explain,
@@ -286,14 +386,38 @@ class FrameApiSuite extends munit.FunSuite:
 
   test("a wide named-tuple schema derives and resolves its final column"):
     type Wide = (
-      f01: Int, f02: Int, f03: Int, f04: Int,
-      f05: Int, f06: Int, f07: Int, f08: Int,
-      f09: Int, f10: Int, f11: Int, f12: Int,
-      f13: Int, f14: Int, f15: Int, f16: Int,
-      f17: Int, f18: Int, f19: Int, f20: Int,
-      f21: Int, f22: Int, f23: Int, f24: Int,
-      f25: Int, f26: Int, f27: Int, f28: Int,
-      f29: Int, f30: Int, f31: Int, f32: Int
+        f01: Int,
+        f02: Int,
+        f03: Int,
+        f04: Int,
+        f05: Int,
+        f06: Int,
+        f07: Int,
+        f08: Int,
+        f09: Int,
+        f10: Int,
+        f11: Int,
+        f12: Int,
+        f13: Int,
+        f14: Int,
+        f15: Int,
+        f16: Int,
+        f17: Int,
+        f18: Int,
+        f19: Int,
+        f20: Int,
+        f21: Int,
+        f22: Int,
+        f23: Int,
+        f24: Int,
+        f25: Int,
+        f26: Int,
+        f27: Int,
+        f28: Int,
+        f29: Int,
+        f30: Int,
+        f31: Int,
+        f32: Int
     )
     val wide = Frame.source[Wide]("wide").fold(error => fail(error.message), identity)
     val finalColumn: Frame[(f32: Int)] = wide.select: row =>

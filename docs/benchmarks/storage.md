@@ -1,5 +1,9 @@
 # Frame storage benchmark receipt
 
+This historical smoke receipt is superseded for performance claims by the
+[JMH measurement court](court.md) and its versioned raw receipts. It remains
+useful as the original storage-ownership checksum.
+
 This is an implementation receipt for the semantic storage core, not a
 production-engine benchmark or a zero-copy claim.
 

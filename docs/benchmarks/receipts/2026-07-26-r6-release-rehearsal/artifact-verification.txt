@@ -1,0 +1,44 @@
+            <name>Apache-2.0</name>
+    <name>frame4s-core</name>
+        <name>io.github.canardlapin</name>
+            <name>canardlapin</name>
+    <description>Immutable, typed local dataframe library for Scala 3.</description>
+    <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+    <licenses>
+    <developers>
+    <scm>
+            <name>Apache-2.0</name>
+    <name>frame4s-core</name>
+        <name>io.github.canardlapin</name>
+            <name>canardlapin</name>
+    <description>Immutable, typed local dataframe library for Scala 3.</description>
+    <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+    <licenses>
+    <developers>
+    <scm>
+            <name>Apache-2.0</name>
+    <name>frame4s-fs2</name>
+        <name>io.github.canardlapin</name>
+            <name>canardlapin</name>
+    <description>fs2 streaming integration for frame4s.</description>
+    <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+    <licenses>
+    <developers>
+    <scm>
+            <name>Apache-2.0</name>
+    <name>frame4s-fs2</name>
+        <name>io.github.canardlapin</name>
+            <name>canardlapin</name>
+    <description>fs2 streaming integration for frame4s.</description>
+    <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+        <url>https://github.com/canardlapin/frame4s</url>
+    <licenses>
+    <developers>
+    <scm>

@@ -24,7 +24,7 @@ object StorageBench:
       while index < length do
         array.scalar(index) match
           case Right(ScalarValue.Int32(value)) => total += value.toLong
-          case Right(ScalarValue.Null) => ()
+          case Right(ScalarValue.Null)         => ()
           case other => throw new IllegalStateException(s"unexpected scalar $other")
         index += 1
       total
@@ -33,7 +33,7 @@ object StorageBench:
       var index = 0
       while index < 10000 do
         val slice = requireValue(array.slice(index % (length - 128), 128))
-        requireValue(slice.scalar(127))
+        val _ = requireValue(slice.scalar(127))
         slice.close()
         index += 1
 

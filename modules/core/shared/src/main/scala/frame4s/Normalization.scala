@@ -31,7 +31,7 @@ object PlanNormalizer:
 
   private def loop(plan: LogicalPlan): (LogicalPlan, Vector[NormalizationRule]) =
     val (childrenNormalized, childRules) = plan match
-      case source: LogicalPlan.Source => (source, Vector.empty)
+      case source: LogicalPlan.Source                      => (source, Vector.empty)
       case LogicalPlan.Project(input, expressions, output) =>
         val (normalized, rules) = loop(input)
         (LogicalPlan.Project(normalized, expressions, output), rules)
@@ -47,11 +47,25 @@ object PlanNormalizer:
       case LogicalPlan.Sort(input, order, output) =>
         val (normalized, rules) = loop(input)
         (LogicalPlan.Sort(normalized, order, output), rules)
-      case LogicalPlan.Join(left, right, kind, condition, output) =>
+      case LogicalPlan.Join(left, right, kind, condition, columns, output) =>
         val (normalizedLeft, leftRules) = loop(left)
         val (normalizedRight, rightRules) = loop(right)
         (
-          LogicalPlan.Join(normalizedLeft, normalizedRight, kind, condition, output),
+          LogicalPlan.Join(
+            normalizedLeft,
+            normalizedRight,
+            kind,
+            condition,
+            columns,
+            output
+          ),
+          leftRules ++ rightRules
+        )
+      case LogicalPlan.UnionAll(left, right, output) =>
+        val (normalizedLeft, leftRules) = loop(left)
+        val (normalizedRight, rightRules) = loop(right)
+        (
+          LogicalPlan.UnionAll(normalizedLeft, normalizedRight, output),
           leftRules ++ rightRules
         )
 
@@ -69,10 +83,12 @@ object PlanNormalizer:
           second,
           output
         ) if isTotal(second) =>
-      Some((
-        LogicalPlan.Filter(input, and(first, second), output),
-        NormalizationRule.FuseFilters
-      ))
+      Some(
+        (
+          LogicalPlan.Filter(input, and(first, second), output),
+          NormalizationRule.FuseFilters
+        )
+      )
     case LogicalPlan.Project(input, expressions, output)
         if isIdentity(input.output, expressions, output) =>
       Some((input, NormalizationRule.RemoveIdentityProject))
@@ -98,23 +114,27 @@ object PlanNormalizer:
           NormalizationRule.PushFilterThroughProject
         )
     case LogicalPlan.Limit(LogicalPlan.Limit(input, first, _), second, output) =>
-      Some((
-        LogicalPlan.Limit(input, math.min(first, second), output),
-        NormalizationRule.CollapseLimits
-      ))
+      Some(
+        (
+          LogicalPlan.Limit(input, math.min(first, second), output),
+          NormalizationRule.CollapseLimits
+        )
+      )
     case LogicalPlan.Limit(
           LogicalPlan.Project(input, expressions, projectOutput),
           count,
           output
         ) if expressions.forall(named => isTotal(named.expression)) =>
-      Some((
-        LogicalPlan.Project(
-          LogicalPlan.Limit(input, count, input.output),
-          expressions,
-          projectOutput
-        ),
-        NormalizationRule.PushLimitThroughProject
-      ))
+      Some(
+        (
+          LogicalPlan.Project(
+            LogicalPlan.Limit(input, count, input.output),
+            expressions,
+            projectOutput
+          ),
+          NormalizationRule.PushLimitThroughProject
+        )
+      )
     case _ => None
 
   private def and(left: ResolvedExpr, right: ResolvedExpr): ResolvedExpr =
@@ -126,27 +146,27 @@ object PlanNormalizer:
     )
 
   private def isTotal(expression: ResolvedExpr): Boolean = expression.node match
-    case ExprNode.Column(_, _, _, _) | ExprNode.Literal(_) => true
+    case ExprNode.Column(_, _, _, _, _) | ExprNode.Literal(_)               => true
     case ExprNode.Unary(UnaryOperator.IsNull | UnaryOperator.IsTrue, input) =>
       isTotal(input)
     case ExprNode.Unary(UnaryOperator.Negate, input) =>
       isFloating(input.dataType) && isTotal(input)
+    case ExprNode.Unary(UnaryOperator.Sqrt, input) =>
+      isFloating(input.dataType) && isTotal(input)
     case ExprNode.Binary(operator, left, right) =>
       val operatorIsTotal = operator match
-        case BinaryOperator.Add | BinaryOperator.Subtract |
-            BinaryOperator.Multiply | BinaryOperator.Divide =>
+        case BinaryOperator.Add | BinaryOperator.Subtract | BinaryOperator.Multiply |
+            BinaryOperator.Divide =>
           isFloating(left.dataType) && left.dataType == right.dataType
-        case BinaryOperator.Equal | BinaryOperator.NullSafeEqual |
-            BinaryOperator.NotEqual | BinaryOperator.LessThan |
-            BinaryOperator.LessThanOrEqual | BinaryOperator.GreaterThan |
-            BinaryOperator.GreaterThanOrEqual | BinaryOperator.And |
-            BinaryOperator.Or =>
+        case BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+            BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual | BinaryOperator.GreaterThan |
+            BinaryOperator.GreaterThanOrEqual | BinaryOperator.And | BinaryOperator.Or =>
           true
       operatorIsTotal && isTotal(left) && isTotal(right)
 
   private def isFloating(dataType: DataType): Boolean = dataType match
     case DataType.Float32 | DataType.Float64 => true
-    case _ => false
+    case _                                   => false
 
   private def isIdentity(
       input: Schema,
@@ -158,10 +178,10 @@ object PlanNormalizer:
       expressions.zipWithIndex.forall: (named, index) =>
         named.name == input.fields(index).name &&
           (named.expression.node match
-            case ExprNode.Column(InputRef.Current, id, name, actualIndex) =>
+            case ExprNode.Column(InputRef.Current, _, id, name, actualIndex) =>
               id == input.fields(index).id &&
-                name == input.fields(index).name &&
-                actualIndex == index
+              name == input.fields(index).name &&
+              actualIndex == index
             case _ => false)
 
   private def substituteAll(
@@ -177,9 +197,10 @@ object PlanNormalizer:
       expression: ResolvedExpr,
       inputs: Vector[NamedExpression]
   ): Option[ResolvedExpr] = expression.node match
-    case ExprNode.Column(InputRef.Current, _, _, index) => inputs.lift(index).map(_.expression)
-    case ExprNode.Column(_, _, _, _) => None
-    case ExprNode.Literal(_) => Some(expression)
+    case ExprNode.Column(InputRef.Current, _, _, _, index) =>
+      inputs.lift(index).map(_.expression)
+    case ExprNode.Column(_, _, _, _, _)  => None
+    case ExprNode.Literal(_)             => Some(expression)
     case ExprNode.Unary(operator, input) =>
       substitute(input, inputs).map: rewritten =>
         expression.copy(

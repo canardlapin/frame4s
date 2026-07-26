@@ -16,6 +16,14 @@ Typelevel project status are claimed; the intended path is an affiliate-first
 proposal after the API, laws, maintenance model, and production evidence are
 credible.
 
+The accepted `0.1` scope and support contract are recorded in
+[`../release-readiness-plan.md`](../release-readiness-plan.md) and
+[`../release-policy.md`](../release-policy.md). The effectful execution boundary
+is fixed by
+[`adr-0001-execution-boundary.md`](adr-0001-execution-boundary.md), and typed
+expression ownership is fixed by
+[`adr-0002-expression-provenance.md`](adr-0002-expression-provenance.md).
+
 ## Thesis
 
 The central value is:
@@ -67,7 +75,7 @@ handles must expose a `Resource`; a `Table` obtained through `collect` is valid
 only within that resource scope. The reference backend may implement collection
 with `Resource.pure`, but the public API does not weaken the lifetime contract.
 
-Format- and engine-specific integrations remain optional adapters. CSV,
+Format- and engine-specific integrations remain optional adapters. CSV, TSV,
 Arrow, Parquet, Polars, and SQL engines must not leak their types into the core
 algebra. Polars is a gated candidate backend or collaboration, not the assumed
 execution engine. DuckDB, Parquet, and Gale integrations remain separate
@@ -100,9 +108,16 @@ surface. A nullable boolean cannot be used as a filter predicate until it is
 made total, for example with `isTrue`. A left outer join maps every right-side
 field to `Option`, without nesting an already optional field.
 
-Projection and aggregation derive new named-tuple schemas. `withColumn` in 0.1
-adds a fresh field and rejects accidental replacement; an explicit replacement
-operation can be added later with its own type-level contract. Joins require
+Each frame value has a path-dependent expression origin. Column expressions
+created by its callback scope carry that origin, literals are origin-free, and
+join expressions may carry only the union of the selected left and right
+origins. The dynamic surface enforces the same ownership rule with private
+per-frame tokens and returns `InvalidExpressionScope` before constructing a
+plan. Provenance does not appear in expression IDs, schemas, or explain output.
+
+Projection and aggregation derive new named-tuple schemas. `withColumn` adds a
+fresh field and rejects accidental replacement; `replace` is the explicit
+type-computing replacement operation. Joins require
 disjoint output names in 0.1 so ownership is never resolved by implicit suffixes.
 
 The compile contract is tested with both narrow and 32-column schemas. This is
@@ -116,8 +131,11 @@ universal zero-copy claim.
 
 ## Logical plan and errors
 
-The closed 0.1 logical plan contains source, project, filter, inner/left join,
-aggregate, sort, and limit nodes. Convenience operations lower to these nodes.
+The closed 0.1 logical plan contains source, project, filter, join (inner,
+left-outer, left-semi, and left-anti kinds), union-all, aggregate, sort, and
+limit nodes. Right join lowers through left-outer join plus project; distinct
+lowers through key-only aggregate. Convenience operations introduce no second
+operation algebra.
 Each node carries its validated output schema, making an invalid internal plan
 unconstructable through the public typed API.
 
@@ -171,6 +189,60 @@ The reference interpreter defines semantics independently of optional engines:
   their input guarantee; aggregate and join do not; sort establishes an explicit
   key guarantee and is stable for equal keys.
 
+### R4 grouping and distinct equivalence
+
+Grouping compares decoded logical values, not physical encodings. Nulls form
+one key class. All NaN payloads of the same floating width form one key class;
+positive and negative zero form one key class. Non-NaN floating keys otherwise
+use their IEEE bits. Timestamps require equal signed values and equal units.
+UTF-8 keys require identical decoded strings. Dictionary indices and dictionary
+identity never participate in equivalence. `distinct` is grouping by every
+input field with no aggregate expressions, so it inherits exactly these rules
+and declares `OrderGuarantee.Unspecified`.
+
+### R4 union semantics
+
+`UnionAll(left, right)` requires exactly equal ordered schemas, including field
+names, data types, and nullability. It emits every left row followed by every
+right row and preserves duplicates. The left branch is opened and evaluated
+first; the right branch is not opened until the left is exhausted successfully.
+A left failure suppresses right evaluation, and normalization never swaps the
+branches. If both inputs guarantee stable order, concatenation is stable;
+otherwise union order is unspecified. The reference cursor streams branch
+batches without materializing both branches and closes the active branch plus
+any opened successor on completion, failure, early termination, or
+cancellation.
+
+### R4 semi and anti join semantics
+
+Left semi and left anti are explicit `JoinKind` values with exactly the left
+schema. For each left row, the right side is examined in its logical order.
+Semi emits the left row once when the first predicate result is true. Anti emits
+the left row once only if no predicate result is true. False and null are both
+non-matches; a predicate error before a true match is returned, while evaluation
+short-circuits after the first true match. Right-side duplicates never multiply
+an emitted left row, while duplicate left rows remain distinct input rows.
+Empty-right semi is empty and empty-right anti returns every left row. Both
+preserve the left input's order guarantee. There is no sentinel,
+join-plus-distinct lowering, or implicit null test.
+
+### R4 floating and population-statistic semantics
+
+`sqrt` is available only for `Float`, `Double`, and their optional forms. It
+preserves floating width and nullability, propagates null, and follows the JVM
+and ECMAScript IEEE square-root result for signed zero, negative finite values,
+NaN, and infinities. It is total: negative inputs produce NaN rather than a
+structured domain failure, so error-preserving normalization may move or fuse
+it when its input is total.
+
+Population variance is named `variancePop`; no ambiguous `variance` alias is
+part of the first compatibility baseline. `stddevPop` returns the square root
+of the population variance result. Both ignore null observations, return null
+for empty/all-null input under the existing aggregate policy, use denominator
+`N`, and return `Double` or `Option[Double]` according to input nullability.
+Sample variance and sample standard deviation are different future operations
+and are never implied by these names.
+
 `ReferenceInterpreter` is the always-available semantic oracle. Project,
 withColumn/project lowering, filter, and limit transform record batches
 incrementally. `ReferenceExecution.physicalExplain` is separate from pure
@@ -178,13 +250,42 @@ logical explain and reports streaming/blocking nodes, row estimates, and
 `fallback=none`. It is deliberately not a production optimizer, spill engine,
 SIMD framework, or performance competitor.
 
-`frame4s-fs2` brackets the execution cursor and each emitted batch.
-`FrameRuntime.stream` releases both on completion, failure, early termination,
-or cancellation. `FrameRuntime.collect` retains output batches into a
+`ColumnarInterpreter` is a package-internal optimized-kernel court, physically
+separate from the oracle. It specializes admitted scan/projection,
+filter/fusion, aggregation, join, distinct, and union shapes; unsupported
+shapes use one explicit whole-plan reference fallback with a receipt. Its
+detached results obey a close protocol, and reusable JVM/Scala.js differential
+laws compare schemas, values, failures, and ordering with the oracle. It is not
+selected by the public 0.1.0 runtime; public backend packaging remains a
+separate design and ownership decision.
+
+`frame4s-fs2` binds immutable typed `SourceBinding` descriptions through one
+invocation-scoped `FrameRuntime.resource`. All acquired sources are inspected
+against their exact ordered typed schemas before a reference execution cursor
+opens. Multi-source bindings support joins without a user-managed
+`ReferenceSources`; that type remains an oracle-fixture boundary only.
+
+`FrameRuntime.stream` releases its source materializations, execution cursor,
+and each emitted batch on completion, failure, early termination, or
+cancellation. `FrameRuntime.collect` retains output batches into a
 `Resource[F, Table[Schema]]`; failed or canceled acquisition closes every
 retained batch, and the resource finalizer closes the materialized table.
-Owning CSV and Arrow IPC sources are also acquired through `Resource`; their
-decoded or native buffers cannot escape an unbracketed source lifetime.
+`streamWithReceipt` and `collectWithReceipt` expose requested, accepted, and
+residual source pushdown. Unsupported work stays in the logical reference
+path.
+
+CSV and TSV byte/character sources parse incrementally into bounded batches;
+UTF-8 decoding and quoted records may cross arbitrary input chunks. JVM path
+adapters use FS2 file resources, while Scala.js exposes only the portable
+stream/string surface. Owning CSV, TSV, and Arrow IPC sources are acquired
+through `Resource`; decoded or native buffers cannot escape an unbracketed
+source lifetime.
+
+`Table[S]` is a materialized read view, not another dataframe algebra. It can
+decode detached named-tuple rows, exact typed cells/columns, and matching
+`NamedTuple.From` products; construct an owned table from rows; and render
+bounded rows/schema. It has no filter, project, sort, join, or arithmetic
+transformation methods.
 
 Normalization is observationally error-preserving as well as value-preserving.
 Rewrites that reorder expression evaluation, including filter fusion and
@@ -194,20 +295,27 @@ or stop failing, merely because a plan was normalized.
 
 ## 0.1 delivery boundary
 
-The first usable release includes:
+The accepted release plan is authoritative. The first usable release includes:
 
 - immutable Arrow-compatible column storage and one semantic reference backend;
-- typed `select`, fresh-field `withColumn`, and `filter`;
-- inner and left outer joins;
+- typed projection, fresh-field `withColumn`, replacement, and filtering;
+- inner, left, right, semi, and anti joins;
 - group-by with count, sum, mean, population variance, min, and max;
+- rename, drop, distinct, and `unionAll`;
 - sort and limit;
+- floating `sqrt` and population standard deviation;
 - explicit missing-value semantics;
-- FS2 streaming scan and resource-safe collection;
-- in-memory and CSV sources/sinks on JVM and Scala.js;
+- one explicit FS2 source-binding/execution boundary with resource-safe
+  streaming and collection;
+- incremental in-memory, CSV, and TSV sources/sinks on JVM and Scala.js, plus a
+  scoped JVM path entry point;
+- typed materialized reading, row/case-class codecs, construction from rows,
+  and bounded rendering without a second eager transformation algebra;
 - Apache Arrow IPC stream ingestion/writing through the JVM adapter;
-- pure plan display and normalization.
+- pure plan display and normalization;
+- reusable semantic/backend laws and honest JVM/Scala.js performance receipts.
 
-Right/full joins, union, distinct, windows, user-defined aggregate functions,
-Parquet, distributed execution, and a pandas-sized convenience surface are
-later work.
+Full outer joins, windows, reshape, generic first/last aggregates, ambient
+runtime schema inference, Parquet, distributed execution, and a pandas-sized
+convenience surface are later work.
 Most importantly, 0.1 does not build a production columnar execution engine.

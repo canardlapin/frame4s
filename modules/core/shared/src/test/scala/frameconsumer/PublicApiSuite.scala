@@ -16,6 +16,17 @@ class PublicApiSuite extends munit.FunSuite:
 
     assertEquals(query.schema.fields.map(_.name), Vector("label", "nextId"))
 
+  test("SchemaDescriptor cannot be implemented outside frame4s"):
+    val errors = typeCheckErrors("""
+      import frame4s.*
+      new SchemaDescriptor[(x: Int)]:
+        def schema = summon[SchemaDescriptor[(z: String)]].schema
+    """)
+    assert(
+      errors.nonEmpty,
+      "a forged SchemaDescriptor compiles, so Frame[S] can carry an unrelated runtime schema"
+    )
+
   test("resolved plan node constructors are not part of the public API"):
     val errors = typeCheckErrors("""
       import frame4s.*

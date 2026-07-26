@@ -1,0 +1,109 @@
+[info] welcome to sbt 1.10.5 (Eclipse Adoptium Java 21.0.11)
+[info] loading settings for project frame4s-build from plugins.sbt ...
+[info] loading project definition from <workspace>/project
+[info] loading settings for project root from build.sbt ...
+[info] set current project to frame4s (in build file:<workspace>/)
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:32 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:32 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:32 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:32 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:32 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:32 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:33 a.m.
+Test run frame4s.NullSoundnessSuite started
+frame4s.NullSoundnessSuite: finished 0.022s
+Test run frameconsumer.PublicApiSuite started
+frameconsumer.PublicApiSuite: finished 0.022s
+Test run frameconsumer.PublicApiSuite finished: 0 failed, 0 ignored, 3 total 0.033s
+Test run frame4s.NullSoundnessSuite finished: 0 failed, 0 ignored, 3 total 0.033s
+Test run frame4s.TypeDisciplineRegressionSuite started
+frame4s.TypeDisciplineRegressionSuite: finished 0.038s
+Test run frame4s.TypeDisciplineRegressionSuite finished: 0 failed, 0 ignored, 6 total 0.046s
+Test run frame4s.StorageSuite started
+frame4s.StorageSuite: finished 0.039s
+Test run frame4s.StorageSuite finished: 0 failed, 0 ignored, 11 total 0.047s
+Test run frame4s.FrameApiSuite started
+frame4s.FrameApiSuite: finished 0.051s
+Test run frame4s.FrameApiSuite finished: 0 failed, 0 ignored, 19 total 0.059s
+Test run frame4s.TableReadSuite started
+frame4s.TableReadSuite: finished 0.055s
+Test run frame4s.TableReadSuite finished: 0 failed, 0 ignored, 12 total 0.063s
+Test run frame4s.SmallAlgebraSuite started
+frame4s.SmallAlgebraSuite: finished 0.069s
+Test run frame4s.SmallAlgebraSuite finished: 0 failed, 0 ignored, 19 total 0.078s
+Test run frame4s.ReferenceInterpreterSuite started
+frame4s.ReferenceInterpreterSuite: finished 0.072s
+Test run frame4s.ReferenceInterpreterSuite finished: 0 failed, 0 ignored, 16 total 0.08s
+[info] Passed: Total 89, Failed 0, Errors 0, Passed 89
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:33 a.m.
+[info] compiling 1 Scala source to <workspace>/modules/core/js/target/scala-3.7.4/test-classes ...
+[info] done compiling
+[info] Fast optimizing <workspace>/modules/core/js/target/scala-3.7.4/frame4s-core-test-fastopt
+Test run frame4s.TypeDisciplineRegressionSuite started
+Test run frame4s.NullSoundnessSuite started
+frame4s.NullSoundnessSuite: finished 0.007s
+Test run frame4s.NullSoundnessSuite finished: 0 failed, 0 ignored, 3 total 0.007s
+frame4s.TypeDisciplineRegressionSuite: finished 0.010s
+Test run frame4s.TypeDisciplineRegressionSuite finished: 0 failed, 0 ignored, 6 total 0.010s
+Test run frame4s.TableReadSuite started
+Test run frameconsumer.PublicApiSuite started
+frameconsumer.PublicApiSuite: finished 0.008s
+Test run frameconsumer.PublicApiSuite finished: 0 failed, 0 ignored, 3 total 0.008s
+frame4s.TableReadSuite: finished 0.033s
+Test run frame4s.TableReadSuite finished: 0 failed, 0 ignored, 12 total 0.033s
+Test run frame4s.StorageSuite started
+Test run frame4s.FrameApiSuite started
+frame4s.StorageSuite: finished 0.011s
+Test run frame4s.StorageSuite finished: 0 failed, 0 ignored, 11 total 0.011s
+Test run frame4s.ReferenceInterpreterSuite started
+frame4s.FrameApiSuite: finished 0.014s
+Test run frame4s.FrameApiSuite finished: 0 failed, 0 ignored, 19 total 0.014s
+Test run frame4s.SmallAlgebraSuite started
+frame4s.ReferenceInterpreterSuite: finished 0.029s
+Test run frame4s.ReferenceInterpreterSuite finished: 0 failed, 0 ignored, 16 total 0.029s
+frame4s.SmallAlgebraSuite: finished 0.027s
+Test run frame4s.SmallAlgebraSuite finished: 0 failed, 0 ignored, 19 total 0.027s
+[info] Passed: Total 89, Failed 0, Errors 0, Passed 89
+[success] Total time: 12 s, completed Jul 26, 2026, 10:06:45 a.m.
+Test run frame4s.testkit.CompileTimeCourtSuite started
+frame4s.testkit.CompileTimeCourtSuite: finished 0.037s
+Test run frame4s.testkit.CompileTimeCourtSuite finished: 0 failed, 0 ignored, 4 total 0.038s
+Test run frame4s.testkit.ConformanceLawsSuite started
+frame4s.testkit.ConformanceLawsSuite: finished 0.58s
+Test run frame4s.testkit.ConformanceLawsSuite finished: 0 failed, 0 ignored, 15 total 0.581s
+[info] Passed: Total 19, Failed 0, Errors 0, Passed 19
+[success] Total time: 1 s, completed Jul 26, 2026, 10:06:46 a.m.
+Test run frame4s.testkit.ConformanceLawsSuite started
+Test run frame4s.testkit.CompileTimeCourtSuite started
+frame4s.testkit.CompileTimeCourtSuite: finished 0.008s
+Test run frame4s.testkit.CompileTimeCourtSuite finished: 0 failed, 0 ignored, 4 total 0.008s
+frame4s.testkit.ConformanceLawsSuite: finished 0.495s
+Test run frame4s.testkit.ConformanceLawsSuite finished: 0 failed, 0 ignored, 15 total 0.495s
+[info] Passed: Total 19, Failed 0, Errors 0, Passed 19
+[success] Total time: 1 s, completed Jul 26, 2026, 10:06:46 a.m.
+SLF4J(W): No SLF4J providers were found.
+SLF4J(W): Defaulting to no-operation (NOP) logger implementation
+SLF4J(W): See https://www.slf4j.org/codes.html#noProviders for further details.
+Test run frame4s.fs2.ArrowIpcSuite started
+frame4s.fs2.ArrowIpcSuite: finished 0.59s
+Test run frame4s.fs2.ArrowIpcSuite finished: 0 failed, 0 ignored, 2 total 0.598s
+Test run frame4s.fs2.FrameIOSuite started
+frame4s.fs2.FrameIOSuite: finished 0.542s
+Test run frame4s.fs2.FrameIOSuite finished: 0 failed, 0 ignored, 10 total 0.543s
+Test run frame4s.fs2.PathSourcesSuite started
+frame4s.fs2.PathSourcesSuite: finished 0.055s
+Test run frame4s.fs2.PathSourcesSuite finished: 0 failed, 0 ignored, 2 total 0.055s
+Test run frame4s.fs2.FrameRuntimeSuite started
+frame4s.fs2.FrameRuntimeSuite: finished 0.031s
+Test run frame4s.fs2.FrameRuntimeSuite finished: 0 failed, 0 ignored, 11 total 0.031s
+[info] Passed: Total 25, Failed 0, Errors 0, Passed 25
+[success] Total time: 2 s, completed Jul 26, 2026, 10:06:48 a.m.
+Test run frame4s.fs2.FrameIOSuite started
+Test run frame4s.fs2.FrameRuntimeSuite started
+frame4s.fs2.FrameRuntimeSuite: finished 0.066s
+Test run frame4s.fs2.FrameRuntimeSuite finished: 0 failed, 0 ignored, 11 total 0.066s
+frame4s.fs2.FrameIOSuite: finished 1.897s
+Test run frame4s.fs2.FrameIOSuite finished: 0 failed, 0 ignored, 10 total 1.897s
+[info] Passed: Total 21, Failed 0, Errors 0, Passed 21
+[success] Total time: 2 s, completed Jul 26, 2026, 10:06:50 a.m.
+[success] Total time: 0 s, completed Jul 26, 2026, 10:06:50 a.m.

@@ -1,0 +1,8 @@
+Constraint-escape audit
+
+Suppression/failure markers (expected: none):
+
+Runtime casts (expected: one documented named-tuple representation cast):
+modules/core/shared/src/main/scala/frame4s/RowCodec.scala:242:  def retype[A, B](value: A): B = value.asInstanceOf[B]
+
+Ambiguous population aggregate entry points (expected: none):

@@ -2,10 +2,10 @@ package frame4s
 
 class ReferenceInterpreterSuite extends munit.FunSuite:
   type Input = (
-    id: Int,
-    value: Option[Double],
-    flag: Option[Boolean],
-    label: String
+      id: Int,
+      value: Option[Double],
+      flag: Option[Boolean],
+      label: String
   )
   type People = (id: Int, team: String, score: Option[Double])
   type Teams = (team: String, region: String)
@@ -81,9 +81,13 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
   private def collect[S <: scala.NamedTuple.AnyNamedTuple](
       frame: Frame[S],
       table: Table[Input]
-  )(using SchemaDescriptor[S]): Table[S] =
+  ): Table[S] =
     val sources = ReferenceSources.empty.bind(reference, table)
-    execution(ReferenceInterpreter.prepare(frame.plan, sources).collect[S])
+    execution(
+      ReferenceInterpreter
+        .prepare(frame.plan, sources)
+        .collect[S](using frame.descriptor)
+    )
 
   private def scalars(table: Table[?], column: String): Vector[ScalarValue] =
     table.batches.flatMap: batch =>
@@ -142,7 +146,9 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
     val sources = ReferenceSources.empty
       .bind(peopleRef, peopleInput)
       .bind(teamsRef, teamsInput)
-    val output = execution(ReferenceInterpreter.prepare(query.normalized._1.plan, sources).collect[WorkflowResult])
+    val output = execution(
+      ReferenceInterpreter.prepare(query.normalized._1.plan, sources).collect[WorkflowResult]
+    )
 
     assertEquals(
       scalars(output, "region"),
@@ -167,13 +173,17 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
       .limit(1)
       .fold(error => fail(error.message), identity)
 
-    val physical = ReferenceInterpreter.prepare(query.plan, ReferenceSources.empty.bind(reference, input))
+    val physical =
+      ReferenceInterpreter.prepare(query.plan, ReferenceSources.empty.bind(reference, input))
     val output = execution(physical.collect[(label: String, nextId: Int)])
 
     assertEquals(scalars(output, "label"), Vector(ScalarValue.Utf8("a")))
     assertEquals(scalars(output, "nextId"), Vector(ScalarValue.Int32(2)))
     assertEquals(physical.shape.streaming, true)
-    assertEquals(physical.physicalExplain, "ReferenceExecution(mode=streaming, blocking=none, estimatedRows=1, fallback=none)")
+    assertEquals(
+      physical.physicalExplain,
+      "ReferenceExecution(mode=streaming, blocking=none, operators=Limit>Project>Project>Filter>Values, estimatedRows=1, fallback=none)"
+    )
 
     output.close()
     input.close()
@@ -225,9 +235,12 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
 
     assertEquals(scalars(composedOutput, "id"), scalars(fusedOutput, "id"))
     assertEquals(scalars(projectedOutput, "id"), Vector(1, 2, 3, 4).map(ScalarValue.Int32.apply))
-    scalars(projectedOutput, "value").zip(scalars(input, "value")).foreach:
-      case (ScalarValue.Float64(left), ScalarValue.Float64(right)) if left.isNaN && right.isNaN => ()
-      case (left, right) => assertEquals(left, right)
+    scalars(projectedOutput, "value")
+      .zip(scalars(input, "value"))
+      .foreach:
+        case (ScalarValue.Float64(left), ScalarValue.Float64(right)) if left.isNaN && right.isNaN =>
+          ()
+        case (left, right) => assertEquals(left, right)
 
     composedOutput.close()
     fusedOutput.close()
@@ -266,13 +279,15 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
     val query = source.withColumn("overflow")(row => row.col("id") + Expr.literal(1))
     val result = ReferenceInterpreter
       .prepare(query.plan, ReferenceSources.empty.bind(reference, input))
-      .collect[(
-        id: Int,
-        value: Option[Double],
-        flag: Option[Boolean],
-        label: String,
-        overflow: Int
-      )]
+      .collect[
+        (
+            id: Int,
+            value: Option[Double],
+            flag: Option[Boolean],
+            label: String,
+            overflow: Int
+        )
+      ]
 
     result match
       case Left(ExecutionError.IntegerOverflow(_, BinaryOperator.Add)) => ()
@@ -293,13 +308,13 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
   test("grouped aggregates define null, empty, and floating reduction policies"):
     type Sales = (group: Option[String], amount: Option[Double], item: Int)
     type Result = (
-      group: Option[String],
-      n: Long,
-      total: Option[Double],
-      mean: Option[Double],
-      variance: Option[Double],
-      minimum: Option[Double],
-      maximum: Option[Double]
+        group: Option[String],
+        n: Long,
+        total: Option[Double],
+        mean: Option[Double],
+        variance: Option[Double],
+        minimum: Option[Double],
+        maximum: Option[Double]
     )
     val salesSchema = summon[SchemaDescriptor[Sales]].schema
     val salesRef = SourceRef.values("sales", "sales").toOption.get
@@ -307,14 +322,18 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
       RecordBatch(
         salesSchema,
         Vector(
-          storage(ColumnArray.utf8(
-            Array("a", "", "a", "", "a"),
-            Array(true, false, true, false, true)
-          )),
-          storage(ColumnArray.float64(
-            Array(1.0, 5.0, 0.0, 7.0, 3.0),
-            Array(true, true, false, true, true)
-          )),
+          storage(
+            ColumnArray.utf8(
+              Array("a", "", "a", "", "a"),
+              Array(true, false, true, false, true)
+            )
+          ),
+          storage(
+            ColumnArray.float64(
+              Array(1.0, 5.0, 0.0, 7.0, 3.0),
+              Array(true, true, false, true, true)
+            )
+          ),
           storage(ColumnArray.int32(Array(1, 2, 3, 4, 5)))
         )
       )
@@ -327,7 +346,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           Aggregate.count.as("n"),
           Aggregate.sum(row.col("amount")).as("total"),
           Aggregate.mean(row.col("amount")).as("mean"),
-          Aggregate.variance(row.col("amount")).as("variance"),
+          Aggregate.variancePop(row.col("amount")).as("variance"),
           Aggregate.min(row.col("amount")).as("minimum"),
           Aggregate.max(row.col("amount")).as("maximum")
         )
@@ -339,11 +358,26 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
 
     assertEquals(scalars(output, "group"), Vector(ScalarValue.Utf8("a"), ScalarValue.Null))
     assertEquals(scalars(output, "n"), Vector(ScalarValue.Int64(3), ScalarValue.Int64(2)))
-    assertEquals(scalars(output, "total"), Vector(ScalarValue.Float64(4.0), ScalarValue.Float64(12.0)))
-    assertEquals(scalars(output, "mean"), Vector(ScalarValue.Float64(2.0), ScalarValue.Float64(6.0)))
-    assertEquals(scalars(output, "variance"), Vector(ScalarValue.Float64(1.0), ScalarValue.Float64(1.0)))
-    assertEquals(scalars(output, "minimum"), Vector(ScalarValue.Float64(1.0), ScalarValue.Float64(5.0)))
-    assertEquals(scalars(output, "maximum"), Vector(ScalarValue.Float64(3.0), ScalarValue.Float64(7.0)))
+    assertEquals(
+      scalars(output, "total"),
+      Vector(ScalarValue.Float64(4.0), ScalarValue.Float64(12.0))
+    )
+    assertEquals(
+      scalars(output, "mean"),
+      Vector(ScalarValue.Float64(2.0), ScalarValue.Float64(6.0))
+    )
+    assertEquals(
+      scalars(output, "variance"),
+      Vector(ScalarValue.Float64(1.0), ScalarValue.Float64(1.0))
+    )
+    assertEquals(
+      scalars(output, "minimum"),
+      Vector(ScalarValue.Float64(1.0), ScalarValue.Float64(5.0))
+    )
+    assertEquals(
+      scalars(output, "maximum"),
+      Vector(ScalarValue.Float64(3.0), ScalarValue.Float64(7.0))
+    )
     output.close()
     salesTable.close()
 
@@ -372,6 +406,122 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
     assertEquals(scalars(output, "mean"), Vector(ScalarValue.Null))
     output.close()
     empty.close()
+
+  test("mean follows sequential IEEE arithmetic across chunk boundaries"):
+    type Means = (group: String, value: Option[Double])
+    type Result = (group: String, mean: Option[Double])
+    val meansSchema = summon[SchemaDescriptor[Means]].schema
+    val meansRef = SourceRef.values("ieee-means", "ieee-means").toOption.get
+
+    def batch(
+        groups: Array[String],
+        values: Array[Double],
+        validity: Array[Boolean]
+    ): RecordBatch =
+      storage:
+        RecordBatch(
+          meansSchema,
+          Vector(
+            storage(ColumnArray.utf8(groups)),
+            storage(ColumnArray.float64(values, validity))
+          )
+        )
+
+    val oneBatch = storage:
+      Table[Means](
+        Vector(
+          batch(
+            Array(
+              "positive",
+              "positive",
+              "negative",
+              "negative",
+              "opposite",
+              "opposite",
+              "nan",
+              "nan",
+              "all-null",
+              "all-null"
+            ),
+            Array(
+              Double.PositiveInfinity,
+              1.0,
+              Double.NegativeInfinity,
+              1.0,
+              Double.PositiveInfinity,
+              Double.NegativeInfinity,
+              Double.NaN,
+              1.0,
+              0.0,
+              0.0
+            ),
+            Array(true, true, true, true, true, true, true, true, false, false)
+          )
+        )
+      )
+    val twoBatches = storage:
+      Table[Means](
+        Vector(
+          batch(
+            Array("positive", "negative", "opposite", "nan", "all-null"),
+            Array(
+              Double.PositiveInfinity,
+              Double.NegativeInfinity,
+              Double.PositiveInfinity,
+              Double.NaN,
+              0.0
+            ),
+            Array(true, true, true, true, false)
+          ),
+          batch(
+            Array("positive", "negative", "opposite", "nan", "all-null"),
+            Array(1.0, 1.0, Double.NegativeInfinity, 1.0, 0.0),
+            Array(true, true, true, true, false)
+          )
+        )
+      )
+
+    val source = Frame.values[Means](meansRef).toOption.get
+    val query: Frame[Result] = source
+      .groupBy(row => Tuple1(row.col("group").as("group")))
+      .aggregate(row => Tuple1(Aggregate.mean(row.col("value")).as("mean")))
+
+    def execute(input: Table[Means]): Table[Result] =
+      execution:
+        ReferenceInterpreter
+          .prepare(query.plan, ReferenceSources.empty.bind(meansRef, input))
+          .collect[Result]
+
+    val contiguous = execute(oneBatch)
+    val chunked = execute(twoBatches)
+    val contiguousMeans = scalars(contiguous, "mean")
+    val chunkedMeans = scalars(chunked, "mean")
+
+    assertEquals(scalars(contiguous, "group"), scalars(chunked, "group"))
+    assertEquals(
+      contiguousMeans.take(2),
+      Vector(
+        ScalarValue.Float64(Double.PositiveInfinity),
+        ScalarValue.Float64(Double.NegativeInfinity)
+      )
+    )
+    contiguousMeans
+      .slice(2, 4)
+      .foreach:
+        case ScalarValue.Float64(value) => assert(value.isNaN)
+        case other                      => fail(s"expected NaN mean, found $other")
+    assertEquals(contiguousMeans.last, ScalarValue.Null)
+    contiguousMeans
+      .zip(chunkedMeans)
+      .foreach:
+        case (ScalarValue.Float64(left), ScalarValue.Float64(right)) if left.isNaN && right.isNaN =>
+          ()
+        case (left, right) => assertEquals(left, right)
+
+    contiguous.close()
+    chunked.close()
+    oneBatch.close()
+    twoBatches.close()
 
   test("floating extrema propagate NaN independently of input order"):
     type Floating = (group: String, value: Double)
@@ -402,10 +552,10 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
 
     scalars(output, "minimum").foreach:
       case ScalarValue.Float64(value) => assert(value.isNaN)
-      case other => fail(s"expected NaN minimum, found $other")
+      case other                      => fail(s"expected NaN minimum, found $other")
     scalars(output, "maximum").foreach:
       case ScalarValue.Float64(value) => assert(value.isNaN)
-      case other => fail(s"expected NaN maximum, found $other")
+      case other                      => fail(s"expected NaN maximum, found $other")
 
     output.close()
     floatingTable.close()
@@ -443,12 +593,20 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
       (lhs.col("key") === rhs.col("rightKey")).isTrue
     val sources = ReferenceSources.empty.bind(leftRef, leftTable).bind(rightRef, rightTable)
 
-    val innerOutput = execution(ReferenceInterpreter.prepare(inner.plan, sources).collect[
-      (id: Int, key: Option[Int], rightKey: Option[Int], label: String)
-    ])
-    val outerOutput = execution(ReferenceInterpreter.prepare(outer.plan, sources).collect[
-      (id: Int, key: Option[Int], rightKey: Option[Int], label: Option[String])
-    ])
+    val innerOutput = execution(
+      ReferenceInterpreter
+        .prepare(inner.plan, sources)
+        .collect[
+          (id: Int, key: Option[Int], rightKey: Option[Int], label: String)
+        ]
+    )
+    val outerOutput = execution(
+      ReferenceInterpreter
+        .prepare(outer.plan, sources)
+        .collect[
+          (id: Int, key: Option[Int], rightKey: Option[Int], label: Option[String])
+        ]
+    )
 
     assertEquals(scalars(innerOutput, "id"), Vector(1, 1, 3, 3).map(ScalarValue.Int32.apply))
     assertEquals(
@@ -615,21 +773,31 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
       .get
     val (normalized, receipt) = original.normalized
     val sources = ReferenceSources.empty.bind(reference, input)
-    val first = execution(ReferenceInterpreter.prepare(original.plan, sources).collect[
-      (value: Option[Double], label: String)
-    ])
-    val second = execution(ReferenceInterpreter.prepare(normalized.plan, sources).collect[
-      (value: Option[Double], label: String)
-    ])
+    val first = execution(
+      ReferenceInterpreter
+        .prepare(original.plan, sources)
+        .collect[
+          (value: Option[Double], label: String)
+        ]
+    )
+    val second = execution(
+      ReferenceInterpreter
+        .prepare(normalized.plan, sources)
+        .collect[
+          (value: Option[Double], label: String)
+        ]
+    )
 
     assert(receipt.rules.contains(NormalizationRule.FuseFilters))
     assert(receipt.rules.contains(NormalizationRule.FuseProjects))
     assert(receipt.rules.contains(NormalizationRule.CollapseLimits))
     assertEquals(scalars(first, "label"), scalars(second, "label"))
-    scalars(first, "value").zip(scalars(second, "value")).foreach:
-      case (ScalarValue.Float64(left), ScalarValue.Float64(right))
-          if left.isNaN && right.isNaN => ()
-      case (left, right) => assertEquals(left, right)
+    scalars(first, "value")
+      .zip(scalars(second, "value"))
+      .foreach:
+        case (ScalarValue.Float64(left), ScalarValue.Float64(right)) if left.isNaN && right.isNaN =>
+          ()
+        case (left, right) => assertEquals(left, right)
     assertEquals(
       PlanNormalizer.normalize(original.plan).receipt.normalizedExplain,
       receipt.normalizedExplain

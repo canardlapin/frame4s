@@ -36,11 +36,15 @@ Security reports should receive acknowledgement within seven days; embargo and
 disclosure timing are agreed with the reporter. Public issues are appropriate
 for ordinary correctness and performance bugs, not undisclosed vulnerabilities.
 
-At least two maintainers should be able to release. A release requires clean
-JVM and Scala.js tests, the standalone extraction rehearsal, dependency review,
-and published semantic/benchmark receipts. If maintenance capacity falls below
-that level, the project should say so prominently and avoid compatibility
-promises it cannot sustain.
+Two release-capable maintainers remain the desired steady state. For `0.1`,
+frame4s explicitly operates under the single-maintainer continuity policy in
+[`release-policy.md`](release-policy.md): `canardlapin` owns the release path,
+and R6 blocks publication until a non-secret receipt proves the offline account,
+signing, repository, and publishing recovery procedure was rehearsed. This is a
+disclosed capacity limit, not a claim that a second maintainer currently
+exists. A release still requires clean JVM and Scala.js tests, the standalone
+extraction rehearsal, dependency review, and published semantic/benchmark
+receipts.
 
 ## Compatibility intent
 
@@ -54,9 +58,10 @@ compatibility promise is made by the current snapshot.
 Serialized plans are not yet a public wire format. Arrow IPC compatibility is
 delegated to Apache Arrow specifications and tested through the JVM adapter.
 CSV behavior is controlled by explicit schema, delimiter, null-token, and
-coercion options rather than ambient inference.
+coercion options rather than ambient inference. First-class TSV source and sink
+conveniences use the same codec with a fixed tab delimiter.
 
-Owning CSV and Arrow IPC source constructors return Cats Effect `Resource`
+Owning CSV, TSV, and Arrow IPC source constructors return Cats Effect `Resource`
 values. Collection and streaming similarly bracket materialized tables,
 execution cursors, and emitted batches. These lifetime contracts include
 failure and cancellation paths; manual source closure is not part of the public

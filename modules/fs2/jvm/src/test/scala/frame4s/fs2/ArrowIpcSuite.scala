@@ -7,13 +7,13 @@ import frame4s.*
 
 class ArrowIpcSuite extends munit.FunSuite:
   type Input = (
-    flag: Option[Boolean],
-    i32: Int,
-    i64: Long,
-    f32: Float,
-    f64: Option[Double],
-    text: String,
-    time: TimestampMicros
+      flag: Option[Boolean],
+      i32: Int,
+      i64: Long,
+      f32: Float,
+      f64: Option[Double],
+      text: String,
+      time: TimestampMicros
   )
 
   private val schema = summon[SchemaDescriptor[Input]].schema
@@ -81,7 +81,7 @@ class ArrowIpcSuite extends munit.FunSuite:
     assertEquals(observed._1, Vector(ScalarValue.Bool(true), ScalarValue.Null))
     observed._2.last match
       case ScalarValue.Float32(value) => assert(value.isNaN)
-      case other => fail(s"expected Float32 NaN, found $other")
+      case other                      => fail(s"expected Float32 NaN, found $other")
     assertEquals(observed._3, Vector(ScalarValue.Float64(2.5), ScalarValue.Null))
     assertEquals(observed._4, Vector("arrow", "λ").map(ScalarValue.Utf8.apply))
     assertEquals(
@@ -94,7 +94,7 @@ class ArrowIpcSuite extends munit.FunSuite:
 
     acquired.get.inspect.unsafeRunSync() match
       case Left(SourceError.Open(_)) => ()
-      case other => fail(s"expected finalized Arrow source, found $other")
+      case other                     => fail(s"expected finalized Arrow source, found $other")
     input.close()
 
   test("malformed Arrow IPC acquisition is structured and releases native resources"):
@@ -106,6 +106,6 @@ class ArrowIpcSuite extends munit.FunSuite:
         .use(_ => IO.unit)
         .attempt
         .unsafeRunSync() match
-          case Left(SourceFailure(SourceError.Open(detail))) => assert(detail.nonEmpty)
-          case other => fail(s"expected structured Arrow open failure, found $other")
+        case Left(SourceFailure(SourceError.Open(detail))) => assert(detail.nonEmpty)
+        case other => fail(s"expected structured Arrow open failure, found $other")
       attempt += 1

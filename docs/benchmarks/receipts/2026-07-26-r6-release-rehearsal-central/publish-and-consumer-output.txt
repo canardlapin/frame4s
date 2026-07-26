@@ -1,0 +1,58 @@
+[info] welcome to sbt 1.10.5 (Eclipse Adoptium Java 21.0.11)
+[info] loading settings for project frame4s-build from plugins.sbt ...
+[info] loading project definition from <workspace>/project
+[info] loading settings for project root from build.sbt ...
+[info] resolving key references (11719 settings) ...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] Defining ThisBuild / version
+[info] The new value will be used by ThisBuild / dynverAssertVersion, ThisBuild / dynverCheckVersion and 11 others.
+[info] 	Run `last` for details.
+[info] Reapplying settings...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] Defining coreJVM / publishTo
+[info] The new value will be used by coreJVM / otherResolvers, coreJVM / publishConfiguration, coreJVM / publishSignedConfiguration
+[info] Reapplying settings...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] Defining coreJS / publishTo
+[info] The new value will be used by coreJS / otherResolvers, coreJS / publishConfiguration, coreJS / publishSignedConfiguration
+[info] Reapplying settings...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] Defining fs2JVM / publishTo
+[info] The new value will be used by fs2JVM / otherResolvers, fs2JVM / publishConfiguration, fs2JVM / publishSignedConfiguration
+[info] Reapplying settings...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] Defining fs2JS / publishTo
+[info] The new value will be used by fs2JS / otherResolvers, fs2JS / publishConfiguration, fs2JS / publishSignedConfiguration
+[info] Reapplying settings...
+[info] set current project to frame4s (in build file:<workspace>/)
+[info] Wrote <workspace>/modules/core/jvm/target/scala-3.7.4/frame4s-core_3-0.1.0-RC1.pom
+[info] 	published frame4s-core_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_3/0.1.0-RC1/frame4s-core_3-0.1.0-RC1.pom
+[info] 	published frame4s-core_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_3/0.1.0-RC1/frame4s-core_3-0.1.0-RC1.jar
+[info] 	published frame4s-core_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_3/0.1.0-RC1/frame4s-core_3-0.1.0-RC1-sources.jar
+[info] 	published frame4s-core_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_3/0.1.0-RC1/frame4s-core_3-0.1.0-RC1-javadoc.jar
+[success] Total time: 1 s, completed Jul 26, 2026, 12:37:05 p.m.
+[info] Wrote <workspace>/modules/core/js/target/scala-3.7.4/frame4s-core_sjs1_3-0.1.0-RC1.pom
+[info] 	published frame4s-core_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_sjs1_3/0.1.0-RC1/frame4s-core_sjs1_3-0.1.0-RC1.pom
+[info] 	published frame4s-core_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_sjs1_3/0.1.0-RC1/frame4s-core_sjs1_3-0.1.0-RC1.jar
+[info] 	published frame4s-core_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_sjs1_3/0.1.0-RC1/frame4s-core_sjs1_3-0.1.0-RC1-sources.jar
+[info] 	published frame4s-core_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-core_sjs1_3/0.1.0-RC1/frame4s-core_sjs1_3-0.1.0-RC1-javadoc.jar
+[success] Total time: 0 s, completed Jul 26, 2026, 12:37:05 p.m.
+[info] Wrote <workspace>/modules/fs2/jvm/target/scala-3.7.4/frame4s-fs2_3-0.1.0-RC1.pom
+[warn] multiple main classes detected: run 'show discoveredMainClasses' to see the list
+[info] 	published frame4s-fs2_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_3/0.1.0-RC1/frame4s-fs2_3-0.1.0-RC1.pom
+[info] 	published frame4s-fs2_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_3/0.1.0-RC1/frame4s-fs2_3-0.1.0-RC1.jar
+[info] 	published frame4s-fs2_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_3/0.1.0-RC1/frame4s-fs2_3-0.1.0-RC1-sources.jar
+[info] 	published frame4s-fs2_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_3/0.1.0-RC1/frame4s-fs2_3-0.1.0-RC1-javadoc.jar
+[success] Total time: 0 s, completed Jul 26, 2026, 12:37:05 p.m.
+[info] Wrote <workspace>/modules/fs2/js/target/scala-3.7.4/frame4s-fs2_sjs1_3-0.1.0-RC1.pom
+[info] 	published frame4s-fs2_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_sjs1_3/0.1.0-RC1/frame4s-fs2_sjs1_3-0.1.0-RC1.pom
+[info] 	published frame4s-fs2_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_sjs1_3/0.1.0-RC1/frame4s-fs2_sjs1_3-0.1.0-RC1.jar
+[info] 	published frame4s-fs2_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_sjs1_3/0.1.0-RC1/frame4s-fs2_sjs1_3-0.1.0-RC1-sources.jar
+[info] 	published frame4s-fs2_sjs1_3 to <rehearsal-repository>/io/github/canardlapin/frame4s-fs2_sjs1_3/0.1.0-RC1/frame4s-fs2_sjs1_3-0.1.0-RC1-javadoc.jar
+[success] Total time: 0 s, completed Jul 26, 2026, 12:37:06 p.m.
+[info] running (fork) consumer.StagedConsumer
+[info] staged-jvm=ok
+[success] Total time: 1 s, completed Jul 26, 2026, 12:37:06 p.m.
+[info] Running consumer.StagedConsumer.
+staged-js=ok
+[success] Total time: 0 s, completed Jul 26, 2026, 12:37:07 p.m.
