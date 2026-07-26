@@ -20,6 +20,17 @@ the JVM and Scala.js.
   Scala.js.
 - Keep `-deprecation -feature -unchecked` warning-clean.
 
+## GitHub identity
+
+- This repository belongs to `canardlapin`. Keep `github.account`, commit
+  identity, and `origin` repo-local; never change the machine-wide GitHub
+  account for frame4s.
+- Git pushes use the `github-canardlapin` SSH alias. GitHub API and
+  administration commands use `tools/github/gh-repo`, which pins the isolated
+  `gh-canardlapin` profile.
+- Run `tools/github/doctor` before a push or release operation. A failed `gh`
+  token must not be mistaken for failed SSH Git authentication.
+
 ## Design contract
 
 - Query construction is pure and immutable; execution is a separate boundary.

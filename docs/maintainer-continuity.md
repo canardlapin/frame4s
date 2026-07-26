@@ -15,8 +15,10 @@ Use a clean checkout of the exact candidate commit in an isolated machine or
 user profile.
 
 1. Recover the GitHub account with an offline recovery factor. Authenticate
-   `gh` as `canardlapin` and confirm repository administration without changing
-   public state.
+   the isolated CLI profile with
+   `tools/github/gh-repo auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key`.
+   Run `tools/github/doctor`, then confirm repository administration without
+   changing public state. Do not change the machine-default GitHub account.
 2. Recover the artifact-signing key from offline backup and import it into the
    isolated profile. Record its full public fingerprint; do not export the
    private key into the checkout.
@@ -46,6 +48,12 @@ repository-pinned sbt 1.10.5 court, the sbt 1.12.11 Central Portal release
 runner, repository administration, Actions secret names, private-reporting
 status, and a detached signature made by the recovered production key. It then
 runs the full court and isolated JVM/Scala.js artifact rehearsal.
+
+Git transport and GitHub API authentication are deliberately separate. Commits
+and pushes use the repo-local `github-canardlapin` SSH route. GitHub
+administration uses the isolated `gh-canardlapin` profile through
+`tools/github/gh-repo`; an expired API token therefore cannot silently redirect
+Git operations to another account.
 
 Inspect `target/release-owner-preflight/status.properties` and its
 `artifact-rehearsal` directory before copying them to the release receipt. The

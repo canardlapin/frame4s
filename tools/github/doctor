@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+
+expected_account=canardlapin
+expected_alias=github-canardlapin
+expected_identity="canardlapin <307091466+canardlapin@users.noreply.github.com>"
+expected_remote="git@$expected_alias:canardlapin/frame4s.git"
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
+status=0
+
+check_equal() {
+  label=$1
+  actual=$2
+  expected=$3
+  if test "$actual" = "$expected"; then
+    printf 'ok   %-20s %s\n' "$label" "$actual"
+  else
+    printf 'fail %-20s expected %s; found %s\n' "$label" "$expected" "${actual:-unset}" >&2
+    status=1
+  fi
+}
+
+account=$(git -C "$repo_root" config --local --get github.account 2>/dev/null || true)
+name=$(git -C "$repo_root" config --local --get user.name 2>/dev/null || true)
+email=$(git -C "$repo_root" config --local --get user.email 2>/dev/null || true)
+remote=$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)
+
+check_equal "GitHub account" "$account" "$expected_account"
+check_equal "commit identity" "$name <$email>" "$expected_identity"
+check_equal "origin" "$remote" "$expected_remote"
+
+ssh_result=$(ssh -T "git@$expected_alias" 2>&1 || true)
+case "$ssh_result" in
+  *"Hi $expected_account!"*)
+    printf 'ok   %-20s %s\n' "SSH authentication" "$expected_account"
+    ;;
+  *)
+    printf 'fail %-20s %s\n' "SSH authentication" "$ssh_result" >&2
+    status=1
+    ;;
+esac
+
+if git -C "$repo_root" ls-remote origin >/dev/null 2>&1; then
+  printf 'ok   %-20s reachable\n' "Git remote"
+else
+  printf 'fail %-20s unreachable\n' "Git remote" >&2
+  status=1
+fi
+
+auth_output=$(mktemp "${TMPDIR:-/tmp}/frame4s-gh-auth.XXXXXX")
+trap 'rm -f "$auth_output"' EXIT HUP INT TERM
+if "$script_dir/gh-repo" auth status >"$auth_output" 2>&1; then
+  printf 'ok   %-20s valid\n' "GitHub API token"
+else
+  printf 'fail %-20s invalid or unavailable\n' "GitHub API token" >&2
+  sed -n '1,8p' "$auth_output" >&2
+  status=1
+fi
+
+if test "$status" -ne 0; then
+  cat >&2 <<'EOF'
+
+Git pushes use SSH and are independent of the gh API token.
+To repair only the isolated canardlapin API profile, run:
+
+  tools/github/gh-repo auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key
+
+Then rerun tools/github/doctor.
+EOF
+fi
+
+exit "$status"

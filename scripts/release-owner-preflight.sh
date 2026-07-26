@@ -25,7 +25,7 @@ if [[ "$#" -gt 1 ]]; then
   exit 2
 fi
 
-for command in git java node sbt gpg gh rg jar sha256sum; do
+for command in git java node sbt gpg rg jar sha256sum; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "required command is unavailable: $command" >&2
     exit 1
@@ -35,6 +35,11 @@ done
 repo_root="$(git rev-parse --show-toplevel)"
 if [[ "$(pwd -P)" != "$(cd "$repo_root" && pwd -P)" ]]; then
   echo "run this script from the repository root: $repo_root" >&2
+  exit 1
+fi
+gh_repo="$repo_root/tools/github/gh-repo"
+if [[ ! -x "$gh_repo" ]]; then
+  echo "required repository GitHub wrapper is unavailable: $gh_repo" >&2
   exit 1
 fi
 receipt="${1:-target/release-owner-preflight}"
@@ -146,15 +151,15 @@ rg -q $'\t\\+publishSigned$' "$toolchain_log" ||
   fail "sbt-ci-release is not configured to publish signed artifacts"
 
 current_step="github-administration"
-gh auth status >/dev/null 2>&1 ||
+"$gh_repo" auth status >/dev/null 2>&1 ||
   fail "GitHub CLI authentication is unavailable"
-repository_admin="$(gh api "repos/$repository" --jq '.permissions.admin')"
+repository_admin="$("$gh_repo" api "repos/$repository" --jq '.permissions.admin')"
 [[ "$repository_admin" == "true" ]] ||
   fail "$performed_by does not have repository administration access"
 
 current_step="github-release-secrets"
 release_secret_names="$(
-  gh secret list \
+  "$gh_repo" secret list \
     --repo "$repository" \
     --app actions \
     --json name \
@@ -174,7 +179,7 @@ done
 
 current_step="private-vulnerability-reporting"
 private_reporting="$(
-  gh api \
+  "$gh_repo" api \
     -H "Accept: application/vnd.github+json" \
     "repos/$repository/private-vulnerability-reporting" \
     --jq '.enabled'

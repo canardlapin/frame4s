@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+expected_account=canardlapin
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
+configured_account=$(
+  git -C "$repo_root" config --local --get github.account 2>/dev/null || true
+)
+
+if test "$configured_account" != "$expected_account"; then
+  echo "frame4s GitHub routing: expected repo-local github.account=$expected_account; found '${configured_account:-unset}'" >&2
+  echo "repair with: git config --local github.account $expected_account" >&2
+  exit 2
+fi
+
+config_base=${XDG_CONFIG_HOME:-"$HOME/.config"}
+profile_dir="$config_base/gh-$expected_account"
+if ! test -d "$profile_dir"; then
+  echo "frame4s GitHub routing: isolated profile is missing: $profile_dir" >&2
+  exit 2
+fi
+
+if test -n "${FRAME4S_GH_BIN:-}"; then
+  gh_bin=$FRAME4S_GH_BIN
+elif test -x /opt/homebrew/bin/gh; then
+  gh_bin=/opt/homebrew/bin/gh
+elif test -x /usr/local/bin/gh; then
+  gh_bin=/usr/local/bin/gh
+else
+  gh_bin=$(command -v gh || true)
+fi
+
+if test -z "${gh_bin:-}" || ! test -x "$gh_bin"; then
+  echo "frame4s GitHub routing: GitHub CLI is unavailable" >&2
+  exit 127
+fi
+
+export GH_CONFIG_DIR="$profile_dir"
+exec "$gh_bin" "$@"
