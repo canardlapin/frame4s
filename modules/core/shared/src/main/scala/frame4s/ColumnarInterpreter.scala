@@ -12,6 +12,20 @@ private[frame4s] object ColumnarInterpreter:
   def prepare(plan: LogicalPlan, sources: ReferenceSources): ColumnarExecution =
     new ColumnarExecution(plan, sources, KernelPlan.classify(plan))
 
+  def prepareIndexed(
+      plan: LogicalPlan,
+      sources: ReferenceSources
+  ): Either[SecondaryIndexError, ColumnarExecution] =
+    KernelPlan.classify(plan) match
+      case Some(join: HashJoin) =>
+        PreparedHashJoin
+          .build(join, sources)
+          .map(kernel => new ColumnarExecution(plan, sources, Some(kernel)))
+      case Some(kernel) =>
+        Left(SecondaryIndexError.UnsupportedKernel(kernel.name))
+      case None =>
+        Left(SecondaryIndexError.UnsupportedLogicalShape(plan.nodeName))
+
   def columnChecksum(column: ColumnArray): Either[ExecutionError, Long] =
     ColumnarVector
       .copy(column)
@@ -34,6 +48,8 @@ final private[frame4s] class ColumnarExecution private[frame4s] (
     sources: ReferenceSources,
     kernel: Option[KernelPlan]
 ):
+  private var closed = false
+
   def physicalExplain: String =
     kernel match
       case Some(value) =>
@@ -41,7 +57,23 @@ final private[frame4s] class ColumnarExecution private[frame4s] (
       case None =>
         s"ColumnarExecution(operator=ReferenceWholePlan, fallback=${fallbackReason(logicalPlan)})"
 
-  def run(): ColumnarRun =
+  def run(): ColumnarRun = synchronized:
+    if closed then
+      ColumnarRun(
+        Left(ExecutionError.Storage(StorageError.SourceClosed)),
+        ColumnarReceipt(
+          "ColumnarExecution(operator=Closed, fallback=none)",
+          fallback = None
+        )
+      )
+    else runOpen()
+
+  def close(): Unit = synchronized:
+    if !closed then
+      closed = true
+      kernel.foreach(_.close())
+
+  private def runOpen(): ColumnarRun =
     kernel match
       case Some(value) =>
         value.execute(sources) match
@@ -736,6 +768,7 @@ private enum KernelAttempt:
 sealed private trait KernelPlan:
   def name: String
   def execute(sources: ReferenceSources): KernelAttempt
+  def close(): Unit = ()
 
 private object KernelPlan:
   def classify(plan: LogicalPlan): Option[KernelPlan] = plan match
@@ -1687,7 +1720,7 @@ final private case class HashJoin(
           case Left(error)  => KernelAttempt.Completed(Left(error))
           case Right(value) => KernelAttempt.Completed(Right(value))
 
-  private def decode(
+  def decode(
       sources: ReferenceSources,
       reference: SourceRef,
       schema: Schema
@@ -1780,6 +1813,12 @@ final private case class HashJoin(
           )
       batchIndex += 1
 
+    materialize(rows, error)
+
+  def materialize(
+      rows: ArrayBuffer[Array[ScalarValue]],
+      error: Option[ExecutionError]
+  ): Either[ExecutionError, ColumnarResult] =
     error match
       case Some(value) => Left(value)
       case None        =>
@@ -1798,7 +1837,7 @@ final private case class HashJoin(
           )
         )
 
-  private def outputRow(
+  def outputRow(
       left: DecodedBatch,
       leftRow: Int,
       right: Option[(DecodedBatch, Int)]
@@ -1821,6 +1860,165 @@ final private case class HashJoin(
                 case Left(value)  => error = Some(value)
       column += 1
     error.toLeft(output)
+
+final private class PreparedHashJoin private (
+    join: HashJoin,
+    private var right: Vector[DecodedBatch],
+    private var rightBatch: Array[Int],
+    private var rightRow: Array[Int],
+    index: Int32SecondaryIndex
+) extends KernelPlan:
+  val name = s"Prepared${join.name}"
+
+  def execute(sources: ReferenceSources): KernelAttempt =
+    index
+      .withView(
+        sources,
+        join.rightReference,
+        join.rightSchema,
+        join.rightKey
+      ): view =>
+        join.decode(sources, join.leftReference, join.leftSchema) match
+          case Left(Left(error))   => KernelAttempt.Completed(Left(error))
+          case Left(Right(reason)) => KernelAttempt.Residual(reason)
+          case Right(left)         =>
+            KernelAttempt.Completed(probe(left, view))
+      .fold(
+        error => KernelAttempt.Completed(Left(PreparedHashJoin.executionError(error))),
+        identity
+      )
+
+  override def close(): Unit =
+    index.close()
+    right = Vector.empty
+    rightBatch = Array.emptyIntArray
+    rightRow = Array.emptyIntArray
+
+  private def probe(
+      left: Vector[DecodedBatch],
+      view: Int32SecondaryIndex
+  ): Either[ExecutionError, ColumnarResult] =
+    val rows = ArrayBuffer.empty[Array[ScalarValue]]
+    var batchIndex = 0
+    var error: Option[ExecutionError] = None
+    while batchIndex < left.length && error.isEmpty do
+      val leftBatch = left(batchIndex)
+      leftBatch.columns(join.leftKey) match
+        case key: RawInt32Vector =>
+          var row = 0
+          while row < leftBatch.rowCount && error.isEmpty do
+            var candidate =
+              if key.unsafeValid(row) then view.firstUnsafe(key.unsafeIntValue(row))
+              else -1
+            val existence =
+              join.kind == JoinKind.LeftSemi || join.kind == JoinKind.LeftAnti
+            val matched = candidate >= 0
+            if existence then
+              val emit =
+                (join.kind == JoinKind.LeftSemi && matched) ||
+                  (join.kind == JoinKind.LeftAnti && !matched)
+              if emit then
+                join.outputRow(leftBatch, row, None) match
+                  case Right(value) => rows += value
+                  case Left(value)  => error = Some(value)
+            else
+              while candidate >= 0 && error.isEmpty do
+                val sourceOrdinal = view.rowUnsafe(candidate)
+                join.outputRow(
+                  leftBatch,
+                  row,
+                  Some(
+                    right(rightBatch(sourceOrdinal)) -> rightRow(sourceOrdinal)
+                  )
+                ) match
+                  case Right(value) => rows += value
+                  case Left(value)  => error = Some(value)
+                candidate = view.nextUnsafe(candidate)
+            if !existence &&
+              !matched &&
+              join.kind == JoinKind.LeftOuter &&
+              error.isEmpty
+            then
+              join.outputRow(leftBatch, row, None) match
+                case Right(value) => rows += value
+                case Left(value)  => error = Some(value)
+            row += 1
+        case _ =>
+          error = Some(
+            ExecutionError.UnsupportedNode(
+              "prepared hash join left key is not plain Int32"
+            )
+          )
+      batchIndex += 1
+    join.materialize(rows, error)
+
+private object PreparedHashJoin:
+  def build(
+      join: HashJoin,
+      sources: ReferenceSources
+  ): Either[SecondaryIndexError, PreparedHashJoin] =
+    join.decode(sources, join.rightReference, join.rightSchema) match
+      case Left(reason) => Left(preparationError(reason))
+      case Right(right) =>
+        Int32SecondaryIndex
+          .build(
+            sources,
+            join.rightReference,
+            join.rightSchema,
+            join.rightKey
+          )
+          .map: index =>
+            val rightBatch = new Array[Int](index.rowCount)
+            val rightRow = new Array[Int](index.rowCount)
+            var global = 0
+            var batch = 0
+            while batch < right.length do
+              var row = 0
+              while row < right(batch).rowCount do
+                rightBatch(global) = batch
+                rightRow(global) = row
+                global += 1
+                row += 1
+              batch += 1
+            new PreparedHashJoin(join, right, rightBatch, rightRow, index)
+
+  def executionError(error: SecondaryIndexError): ExecutionError =
+    error match
+      case SecondaryIndexError.Closed =>
+        ExecutionError.Storage(StorageError.SourceClosed)
+      case SecondaryIndexError.Storage(value) =>
+        ExecutionError.Storage(value)
+      case SecondaryIndexError.SourceMismatch =>
+        ExecutionError.UnsupportedNode(SecondaryIndexError.SourceMismatch.message)
+      case value @ SecondaryIndexError.InvalidColumnIndex(_, _) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case value @ SecondaryIndexError.UnsupportedColumn(_, _, _) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case value @ SecondaryIndexError.UnsupportedKernel(_) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case value @ SecondaryIndexError.UnsupportedLogicalShape(_) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case value @ SecondaryIndexError.PreparationResidual(_) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case value @ SecondaryIndexError.TooManyRows(_) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case value @ SecondaryIndexError.InvalidRowOrdinal(_, _) =>
+        ExecutionError.UnsupportedNode(value.message)
+      case SecondaryIndexError.Execution(value) =>
+        value
+      case SecondaryIndexError.Source(value) =>
+        value
+
+  private def preparationError(
+      error: Either[ExecutionError, String]
+  ): SecondaryIndexError =
+    error match
+      case Left(ExecutionError.Storage(value)) =>
+        SecondaryIndexError.Storage(value)
+      case Left(value) =>
+        SecondaryIndexError.Execution(value)
+      case Right(reason) =>
+        SecondaryIndexError.PreparationResidual(reason)
 
 final private case class StreamingUnionAll(
     leftReference: SourceRef,

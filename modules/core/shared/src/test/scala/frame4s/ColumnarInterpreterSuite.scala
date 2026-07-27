@@ -236,7 +236,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       result.close()
       input.close()
 
-  test("hash inner and left joins preserve duplicate order and SQL null-key semantics"):
+  test("one-shot and prepared hash joins preserve duplicate order and SQL null-key semantics"):
     type Left = (key: Option[Int], leftValue: Long)
     type Right = (rightKey: Option[Int], rightValue: Long)
     val leftRef = reference("columnar-join-left")
@@ -262,15 +262,25 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     val inner = left.innerJoin(right)((lhs, rhs) => (lhs.col("key") === rhs.col("rightKey")).isTrue)
     val outer = left.leftJoin(right)((lhs, rhs) => (lhs.col("key") === rhs.col("rightKey")).isTrue)
     val sources = ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
-    val innerRun = ColumnarInterpreter.prepare(inner.plan, sources).run()
-    val outerRun = ColumnarInterpreter.prepare(outer.plan, sources).run()
+    val innerExecution = ColumnarInterpreter.prepare(inner.plan, sources)
+    val outerExecution = ColumnarInterpreter.prepare(outer.plan, sources)
+    val preparedExecution = value(ColumnarInterpreter.prepareIndexed(inner.plan, sources))
+    val innerRun = innerExecution.run()
+    val outerRun = outerExecution.run()
+    rightInput.close()
+    val preparedRun = preparedExecution.run()
+    val repeatedPreparedRun = preparedExecution.run()
     val innerResult = completed(innerRun)
     val outerResult = completed(outerRun)
+    val preparedResult = completed(preparedRun)
+    val repeatedPreparedResult = completed(repeatedPreparedRun)
     try
       assertEquals(innerRun.receipt.fallback, None)
       assertEquals(outerRun.receipt.fallback, None)
       assert(innerRun.receipt.physicalPlan.contains("HashJoin[Inner"))
       assert(outerRun.receipt.physicalPlan.contains("HashJoin[LeftOuter"))
+      assert(preparedExecution.physicalExplain.contains("PreparedHashJoin[Inner"))
+      assert(preparedRun.receipt.physicalPlan.contains("PreparedHashJoin[Inner"))
       assertEquals(
         innerResult.rows,
         Right(
@@ -290,6 +300,8 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           )
         )
       )
+      assertEquals(preparedResult.rows, innerResult.rows)
+      assertEquals(repeatedPreparedResult.rows, innerResult.rows)
       assertEquals(
         outerResult.rows.map(_.map(_.drop(2))),
         Right(
@@ -301,9 +313,19 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           )
         )
       )
+      preparedExecution.close()
+      assertEquals(
+        preparedExecution.run().result,
+        Left(ExecutionError.Storage(StorageError.SourceClosed))
+      )
     finally
       innerResult.close()
       outerResult.close()
+      preparedResult.close()
+      repeatedPreparedResult.close()
+      preparedExecution.close()
+      innerExecution.close()
+      outerExecution.close()
       leftInput.close()
       rightInput.close()
 

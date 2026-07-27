@@ -1,0 +1,2 @@
+data.table==1.18.4
+jsonlite==2.0.0

@@ -9,7 +9,14 @@ current full optimized-kernel court and its admission decision are
 The exact-work follow-up is the
 [R5c Saddle comparison](receipts/2026-07-26-r5c-saddle-exact/comparison.md);
 the separate cross-runtime results are in the
-[R5c Pandas receipt](receipts/2026-07-26-r5c-pandas/summary.md).
+[R5c Pandas receipt](receipts/2026-07-26-r5c-pandas/summary.md) and the
+[R5d data.table receipt](receipts/2026-07-26-r5d-datatable/summary.md). The
+explicit-index follow-up is split into the
+[R5e direct-index admission](receipts/2026-07-26-r5e-index-admitted/summary.md)
+and the
+[R5e prepared-join experiment](receipts/2026-07-26-r5e-prepared-join/summary.md).
+The accepted speed/memory layout follow-up is the
+[R5f layout court](receipts/2026-07-26-r5f-index-layouts/summary.md).
 
 The court uses sbt-jmh 0.4.8 and JMH 1.37. Fixture construction, query
 construction, validation, and teardown occur outside timed methods. Each
@@ -83,6 +90,93 @@ The full four-statistic group workload is shape-validated rather than
 checksum-ranked because the two runtimes use different legal floating-point
 reduction orders. All other admitted Pandas comparisons require exact
 checksums.
+
+data.table is measured in a separate single-thread R process with the same
+relational fixture and Scala validation receipt. Its ordinary relational
+measurements disable automatic and reusable indices so repeated samples do not
+silently exclude setup. The separate index study uses unsorted tables and
+reports a forced linear scan, cold `setindexv` construction plus lookup, and
+warm reuse at multiple scales:
+
+```sh
+scripts/datatable-court.sh \
+  --receipt docs/benchmarks/receipts/YYYY-MM-DD-datatable \
+  --rows 1000 \
+  --oracle-validation docs/benchmarks/receipts/YYYY-MM-DD-jvm/validation.tsv \
+  --frame4s-jmh docs/benchmarks/receipts/YYYY-MM-DD-jvm/raw/jmh.json \
+  --index-scales 1000,100000,1000000
+```
+
+Warm indexed results are a capability and amortization study, not equivalent
+frame4s win/loss rows. The court reports secondary-index bytes and the number
+of repeated queries needed to recover the measured construction cost.
+
+frame4s measures the corresponding explicit immutable index with:
+
+```sh
+scripts/index-court.sh \
+  docs/benchmarks/receipts/YYYY-MM-DD-index \
+  full \
+  admitted \
+  docs/benchmarks/receipts/YYYY-MM-DD-index-baseline
+```
+
+The index court uses the same unsorted permutation, single target, 32-target
+batch, stable output order, and checksums as the data.table study. Its direct
+lookup candidate is admitted. Prepared join reuse is measured separately with
+`scripts/prepared-join-court.sh`; it remains experimental because it does not
+beat the one-shot join across every designated shape after construction.
+
+Run the side-by-side layout court against a same-runtime execution of the
+frozen scan fixture with:
+
+```sh
+scripts/index-court.sh \
+  docs/benchmarks/receipts/YYYY-MM-DD-index-layouts/baseline \
+  full \
+  baseline
+scripts/index-court.sh \
+  docs/benchmarks/receipts/YYYY-MM-DD-index-layouts \
+  full \
+  layouts \
+  docs/benchmarks/receipts/YYYY-MM-DD-index-layouts/baseline
+```
+
+`FastHash` is the speed default. `CompactSorted` is the explicit
+memory-oriented layout: the current full receipt records 8 bytes/source row
+and stable scan parity without introducing an automatic cache or policy.
+
+R5g extends that layout court with explicit `PackedSorted` and
+`FlatHashRows` candidates plus a lower-allocation batch engine. The original
+stable unique permutation remains the frozen control. The extended court also
+uses mixed misses, duplicate fan-out, and skew/collision fixtures, with
+fixture construction and validation outside timed methods. Every layout is
+checked against a stable scan before timing, and the batch query array is
+verified unchanged. Run it with:
+
+```sh
+scripts/index-court.sh \
+  docs/benchmarks/receipts/YYYY-MM-DD-index-r5g \
+  full \
+  extended \
+  docs/benchmarks/receipts/YYYY-MM-DD-index-r5g/baseline
+```
+
+The packed result reports retained words separately from temporary radix-sort
+allocation. The flat result is called balanced only if it clears both the
+12-byte ceiling and the two unique-workload speed gates against
+`CompactSorted`; collision and duplicate losses are not hidden by the unique
+fixture. `FastHash` remains the default in the absence of whole-court evidence
+for changing it.
+
+The
+[full R5g receipt](receipts/2026-07-26-r5g-index-layouts/summary.md) admits
+packed storage, the lower-allocation batch engine, and flat hashing only for
+low-fanout workloads. It preserves the initially failing quick flat prototype
+and the pre-build-cache full run. A dedicated all-equal build case checks that
+the transient last-slot cache prevents quadratic repeated-key insertion; the
+cache is released before the index is returned and excluded from retained
+owned bytes.
 
 Scautable is intentionally absent from relational rankings. Its fixed-resource
 macro path and its runtime typed path are discussed separately in
