@@ -133,10 +133,13 @@ class SecondaryIndexSuite extends munit.FunSuite:
     val packed =
       build(sources, reference, table.schema, SecondaryIndexLayout.PackedSorted)
     val fast = build(sources, reference, table.schema, SecondaryIndexLayout.FastHash)
+    val grouped =
+      build(sources, reference, table.schema, SecondaryIndexLayout.GroupedHash)
     try
       assertEquals(compact.rowCount, ids.length)
       assertEquals(compact.ownedBytes, 5L * 8L)
       assertEquals(packed.ownedBytes, 5L * 4L + 4L)
+      assertEquals(grouped.ownedBytes, 152L)
       assertEquals(
         Int32OrdinalStore.ownedBytesFor(1000000, 1000000),
         2500000L
@@ -148,6 +151,7 @@ class SecondaryIndexSuite extends munit.FunSuite:
       compact.close()
       packed.close()
       fast.close()
+      grouped.close()
       table.close()
 
   test("empty and all-null sources have sound memory-oriented lookup and ownership"):
@@ -277,6 +281,223 @@ class SecondaryIndexSuite extends munit.FunSuite:
     finally
       index.close()
       table.close()
+
+  test("grouped hash stores unique ordinals directly and only duplicate groups overflow"):
+    assert(Int32SecondaryIndex.MaxRows < (1L << 30))
+    val ids = Array(7, 2, 7, 9, 7, 2, 11, 13)
+    val valid = Array(true, true, true, false, true, true, true, true)
+    val (table, reference, sources) =
+      fixture(
+        Vector(ids.take(3), ids.slice(3, 6), ids.drop(6)),
+        Vector(valid.take(3), valid.slice(3, 6), valid.drop(6)),
+        "secondary-index-grouped-overflow"
+      )
+    val index =
+      build(sources, reference, table.schema, SecondaryIndexLayout.GroupedHash)
+    try
+      assertEquals(ordinals(lookup(index, 7)), Vector(0, 2, 4))
+      assertEquals(ordinals(lookup(index, 2)), Vector(1, 5))
+      assertEquals(ordinals(lookup(index, 11)), Vector(6))
+      assertEquals(
+        ordinals(lookup(index, Array(13, 7, 2, 13))),
+        Vector(0, 1, 2, 4, 5, 7)
+      )
+      val distinct = 4
+      val duplicateGroups = 2
+      val rowsInDuplicateGroups = 5
+      assertEquals(
+        index.ownedBytes,
+        Int32SecondaryIndex.flatCapacityFor(distinct).toLong * 8L +
+          duplicateGroups.toLong * 4L +
+          rowsInDuplicateGroups.toLong * 4L
+      )
+    finally
+      index.close()
+      table.close()
+
+  test("grouped hash retained memory decreases with duplicate fan-out"):
+    def owned(ids: Array[Int]): Long =
+      val (table, reference, sources) =
+        fixture(ids, Array.fill(ids.length)(true))
+      val index =
+        build(sources, reference, table.schema, SecondaryIndexLayout.GroupedHash)
+      try index.ownedBytes
+      finally
+        index.close()
+        table.close()
+
+    val unique = Array.tabulate(1024)(identity)
+    val fanoutEight = Array.tabulate(1024)(_ / 8)
+    val allEqual = Array.fill(1024)(1)
+    assertEquals(
+      owned(unique),
+      Int32SecondaryIndex.flatCapacityFor(1024).toLong * 8L
+    )
+    assertEquals(
+      owned(fanoutEight),
+      Int32SecondaryIndex.flatCapacityFor(128).toLong * 8L +
+        128L * 4L +
+        1024L * 4L
+    )
+    assertEquals(
+      owned(allEqual),
+      Int32SecondaryIndex.flatCapacityFor(1).toLong * 8L + 4L + 1024L * 4L
+    )
+    assert(owned(allEqual) < owned(fanoutEight))
+    assert(owned(fanoutEight) < owned(unique))
+
+  test("large multi-key results take the allocation-neutral merge path"):
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 127,
+        streams = 32,
+        longestStream = 4,
+        workspace = 32,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.Sort
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 256,
+        streams = 3,
+        longestStream = 86,
+        workspace = 3,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.Sort
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 128,
+        streams = 4,
+        longestStream = 32,
+        workspace = 4,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.HeapMerge
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 8000,
+        streams = 32,
+        longestStream = 7900,
+        workspace = 32,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.Sort
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 7842,
+        streams = 30,
+        longestStream = 7813,
+        workspace = 32,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.DominantMerge
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 512,
+        streams = 1,
+        longestStream = 512,
+        workspace = 1,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.DominantMerge
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 7842,
+        streams = 30,
+        longestStream = 7813,
+        workspace = 32,
+        balancedStrategy = SecondaryIndexBatchStrategy.HeapMerge,
+        dominantStrategy = SecondaryIndexBatchStrategy.HeapMerge
+      ),
+      SecondaryIndexBatchStrategy.HeapMerge
+    )
+    assertEquals(
+      SecondaryIndexBatchStrategy.choose(
+        matches = 256,
+        streams = 32,
+        longestStream = 8,
+        workspace = 32,
+        balancedStrategy = SecondaryIndexBatchStrategy.Sort,
+        dominantStrategy = SecondaryIndexBatchStrategy.DominantMerge
+      ),
+      SecondaryIndexBatchStrategy.Sort
+    )
+    val ids = Array.tabulate(512): row =>
+      (row * 37) % 64
+    val valid = Array.tabulate(ids.length)(_ % 19 != 0)
+    val queries = Array.tabulate(32)(identity).reverse ++ Array(7, 7, 12)
+    val expectedKeys = queries.toSet
+    val expected = ids.indices.filter: row =>
+      valid(row) && expectedKeys.contains(ids(row))
+    val (table, reference, sources) =
+      fixture(
+        Vector(ids.take(129), ids.slice(129, 385), ids.drop(385)),
+        Vector(valid.take(129), valid.slice(129, 385), valid.drop(385)),
+        "secondary-index-batch-merge"
+      )
+    try
+      layouts.foreach: layout =>
+        val index = build(sources, reference, table.schema, layout)
+        try
+          val selection = lookup(index, queries)
+          assert(selection.size >= 128, layout.label)
+          assertEquals(ordinals(selection), expected.toVector, layout.label)
+        finally index.close()
+    finally table.close()
+
+  test("dominant-stream merge preserves source order without a result sort"):
+    val ids = Array.tabulate(512): row =>
+      if row % 16 == 0 then row else -1
+    val valid = Array.fill(ids.length)(true)
+    val queries = Array(-1) ++ Array.tabulate(31)(index => (index + 1) * 16)
+    val expectedKeys = queries.toSet
+    val expected = ids.indices.filter(row => expectedKeys.contains(ids(row)))
+    val (table, reference, sources) =
+      fixture(ids, valid)
+    try
+      layouts.foreach: layout =>
+        val index = build(sources, reference, table.schema, layout)
+        try
+          assertEquals(
+            ordinals(lookup(index, queries)),
+            expected.toVector,
+            layout.label
+          )
+        finally index.close()
+    finally table.close()
+
+  test("dominant-stream scratch compacts hits before many missing query keys"):
+    val ids = Array.fill(512)(7)
+    val valid = Array.fill(ids.length)(true)
+    val queries = Array(7) ++ Array.tabulate(1000)(index => 10000 + index)
+    val expectedQuery = queries.clone()
+    val (table, reference, sources) =
+      fixture(ids, valid)
+    try
+      layouts.foreach: layout =>
+        val index = build(sources, reference, table.schema, layout)
+        try
+          assertEquals(
+            ordinals(lookup(index, queries)),
+            ids.indices.toVector,
+            layout.label
+          )
+          assertEquals(queries.toVector, expectedQuery.toVector, layout.label)
+        finally index.close()
+    finally table.close()
 
   test("batch lookup never mutates caller-owned query keys"):
     val ids = Array(3, 1, 3, 2, 1, 4)

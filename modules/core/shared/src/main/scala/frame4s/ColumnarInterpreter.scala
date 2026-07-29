@@ -641,6 +641,37 @@ final private case class SelectedVector(
       index += 1
     hash
 
+/** A detached columnar gather view over primitive row selections.
+  *
+  * Join probing records batch and row ordinals once. Every output column shares those primitive
+  * arrays and resolves values lazily, avoiding row-wise `ScalarValue` arrays and a transpose pass.
+  * Nullable right-side gathers carry a validity bitmap instead of a sentinel ordinal.
+  */
+final private case class GatheredVector(
+    batches: Vector[DecodedBatch],
+    columnIndex: Int,
+    selectedBatches: Array[Int],
+    selectedRows: Array[Int],
+    validity: Option[Array[Byte]]
+) extends ColumnarVector:
+  val length: Int = selectedRows.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if !isValid(index) then Right(ScalarValue.Null)
+    else source(index).scalar(selectedRows(index))
+
+  def unsafeScalarHash(index: Int): Long =
+    if !isValid(index) then ColumnarVector.NullHash
+    else source(index).unsafeScalarHash(selectedRows(index))
+
+  private def source(index: Int): ColumnarVector =
+    batches(selectedBatches(index)).columns(columnIndex)
+
+  private def isValid(index: Int): Boolean =
+    validity.forall(bytes => bit(bytes, index))
+
 final private case class RawDictionaryVector(
     indices: RawInt32Vector,
     dictionary: ColumnarVector
@@ -1707,7 +1738,7 @@ final private case class HashJoin(
     rightKey: Int,
     columns: Vector[JoinColumn]
 ) extends KernelPlan:
-  val name = s"HashJoin[$kind,Int32]"
+  val name = s"HashJoin[$kind,Int32,SelectionGather]"
 
   def execute(sources: ReferenceSources): KernelAttempt =
     (decode(sources, leftReference, leftSchema), decode(sources, rightReference, rightSchema)) match
@@ -1771,7 +1802,8 @@ final private case class HashJoin(
           )
       batchIndex += 1
 
-    val rows = ArrayBuffer.empty[Array[ScalarValue]]
+    val selections =
+      new JoinSelectionBuilder(RightSelectionMode.forJoin(columns, kind))
     batchIndex = 0
     while batchIndex < left.length && error.isEmpty do
       val leftBatch = left(batchIndex)
@@ -1788,24 +1820,18 @@ final private case class HashJoin(
               val emit =
                 (kind == JoinKind.LeftSemi && matched) ||
                   (kind == JoinKind.LeftAnti && !matched)
-              if emit then
-                outputRow(leftBatch, row, None) match
-                  case Right(value) => rows += value
-                  case Left(value)  => error = Some(value)
+              if emit then selections.appendLeftOnly(batchIndex, row)
             else
               while candidate >= 0 && error.isEmpty do
-                outputRow(
-                  leftBatch,
+                selections.appendMatched(
+                  batchIndex,
                   row,
-                  Some(right(rightBatch(candidate)) -> rightRow(candidate))
-                ) match
-                  case Right(value) => rows += value
-                  case Left(value)  => error = Some(value)
+                  rightBatch(candidate),
+                  rightRow(candidate)
+                )
                 candidate = index.next(candidate)
             if !existence && !matched && kind == JoinKind.LeftOuter && error.isEmpty then
-              outputRow(leftBatch, row, None) match
-                case Right(value) => rows += value
-                case Left(value)  => error = Some(value)
+              selections.appendLeftOnly(batchIndex, row)
             row += 1
         case _ =>
           error = Some(
@@ -1813,53 +1839,132 @@ final private case class HashJoin(
           )
       batchIndex += 1
 
-    materialize(rows, error)
+    materialize(left, right, selections, error)
 
   def materialize(
-      rows: ArrayBuffer[Array[ScalarValue]],
+      left: Vector[DecodedBatch],
+      right: Vector[DecodedBatch],
+      selections: JoinSelectionBuilder,
       error: Option[ExecutionError]
   ): Either[ExecutionError, ColumnarResult] =
     error match
       case Some(value) => Left(value)
       case None        =>
-        val output = Vector.tabulate(columns.length): column =>
-          val values = new Array[ScalarValue](rows.length)
-          var row = 0
-          while row < rows.length do
-            values(row) = rows(row)(column)
-            row += 1
-          ScalarVector(values)
+        val selected = selections.result()
+        val output = columns.map:
+          case JoinColumn.Left(index) =>
+            GatheredVector(
+              left,
+              index,
+              selected.leftBatches,
+              selected.leftRows,
+              validity = None
+            )
+          case JoinColumn.Right(index) =>
+            GatheredVector(
+              right,
+              index,
+              selected.rightBatches,
+              selected.rightRows,
+              selected.rightValidity
+            )
         Right(
           ColumnarResult(
             outputSchema,
             order,
-            Vector(ColumnarBatch(output, rows.length))
+            Vector(ColumnarBatch(output, selected.length))
           )
         )
 
-  def outputRow(
-      left: DecodedBatch,
+final private case class JoinSelection(
+    leftBatches: Array[Int],
+    leftRows: Array[Int],
+    rightBatches: Array[Int],
+    rightRows: Array[Int],
+    rightValidity: Option[Array[Byte]]
+):
+  val length: Int = leftRows.length
+
+private enum RightSelectionMode:
+  case Absent
+  case Required
+  case Nullable
+
+private object RightSelectionMode:
+  def forJoin(columns: Vector[JoinColumn], kind: JoinKind): RightSelectionMode =
+    val hasRight = columns.exists:
+      case JoinColumn.Right(_) => true
+      case JoinColumn.Left(_)  => false
+    if !hasRight then RightSelectionMode.Absent
+    else
+      kind match
+        case JoinKind.Inner     => RightSelectionMode.Required
+        case JoinKind.LeftOuter => RightSelectionMode.Nullable
+        case JoinKind.LeftSemi  => RightSelectionMode.Nullable
+        case JoinKind.LeftAnti  => RightSelectionMode.Nullable
+
+final private class JoinSelectionBuilder(
+    rightMode: RightSelectionMode
+):
+  private var leftBatches = new Array[Int](16)
+  private var leftRows = new Array[Int](16)
+  private var rightBatches =
+    if rightMode != RightSelectionMode.Absent then new Array[Int](16)
+    else Array.emptyIntArray
+  private var rightRows =
+    if rightMode != RightSelectionMode.Absent then new Array[Int](16)
+    else Array.emptyIntArray
+  private var rightValidity =
+    if rightMode == RightSelectionMode.Nullable then new Array[Byte](2)
+    else Array.emptyByteArray
+  private var length = 0
+
+  def appendLeftOnly(leftBatch: Int, leftRow: Int): Unit =
+    ensureCapacity(length + 1)
+    leftBatches(length) = leftBatch
+    leftRows(length) = leftRow
+    length += 1
+
+  def appendMatched(
+      leftBatch: Int,
       leftRow: Int,
-      right: Option[(DecodedBatch, Int)]
-  ): Either[ExecutionError, Array[ScalarValue]] =
-    val output = new Array[ScalarValue](columns.length)
-    var column = 0
-    var error: Option[ExecutionError] = None
-    while column < columns.length && error.isEmpty do
-      columns(column) match
-        case JoinColumn.Left(index) =>
-          left.columns(index).scalar(leftRow) match
-            case Right(value) => output(column) = value
-            case Left(value)  => error = Some(value)
-        case JoinColumn.Right(index) =>
-          right match
-            case None               => output(column) = ScalarValue.Null
-            case Some((batch, row)) =>
-              batch.columns(index).scalar(row) match
-                case Right(value) => output(column) = value
-                case Left(value)  => error = Some(value)
-      column += 1
-    error.toLeft(output)
+      rightBatch: Int,
+      rightRow: Int
+  ): Unit =
+    ensureCapacity(length + 1)
+    leftBatches(length) = leftBatch
+    leftRows(length) = leftRow
+    if rightMode != RightSelectionMode.Absent then
+      rightBatches(length) = rightBatch
+      rightRows(length) = rightRow
+      if rightValidity.nonEmpty then
+        val byte = length >>> 3
+        rightValidity(byte) = (rightValidity(byte).toInt | (1 << (length & 7))).toByte
+    length += 1
+
+  def result(): JoinSelection =
+    new JoinSelection(
+      java.util.Arrays.copyOf(leftBatches, length),
+      java.util.Arrays.copyOf(leftRows, length),
+      if rightMode != RightSelectionMode.Absent then java.util.Arrays.copyOf(rightBatches, length)
+      else Array.emptyIntArray,
+      if rightMode != RightSelectionMode.Absent then java.util.Arrays.copyOf(rightRows, length)
+      else Array.emptyIntArray,
+      if rightValidity.nonEmpty then
+        Some(java.util.Arrays.copyOf(rightValidity, (length + 7) >>> 3))
+      else None
+    )
+
+  private def ensureCapacity(required: Int): Unit =
+    if required > leftRows.length then
+      val next = math.max(required, leftRows.length * 2)
+      leftBatches = java.util.Arrays.copyOf(leftBatches, next)
+      leftRows = java.util.Arrays.copyOf(leftRows, next)
+      if rightMode != RightSelectionMode.Absent then
+        rightBatches = java.util.Arrays.copyOf(rightBatches, next)
+        rightRows = java.util.Arrays.copyOf(rightRows, next)
+      if rightValidity.nonEmpty then
+        rightValidity = java.util.Arrays.copyOf(rightValidity, (next + 7) >>> 3)
 
 final private class PreparedHashJoin private (
     join: HashJoin,
@@ -1898,7 +2003,10 @@ final private class PreparedHashJoin private (
       left: Vector[DecodedBatch],
       view: Int32SecondaryIndex
   ): Either[ExecutionError, ColumnarResult] =
-    val rows = ArrayBuffer.empty[Array[ScalarValue]]
+    val selections =
+      new JoinSelectionBuilder(
+        RightSelectionMode.forJoin(join.columns, join.kind)
+      )
     var batchIndex = 0
     var error: Option[ExecutionError] = None
     while batchIndex < left.length && error.isEmpty do
@@ -1917,31 +2025,22 @@ final private class PreparedHashJoin private (
               val emit =
                 (join.kind == JoinKind.LeftSemi && matched) ||
                   (join.kind == JoinKind.LeftAnti && !matched)
-              if emit then
-                join.outputRow(leftBatch, row, None) match
-                  case Right(value) => rows += value
-                  case Left(value)  => error = Some(value)
+              if emit then selections.appendLeftOnly(batchIndex, row)
             else
               while candidate >= 0 && error.isEmpty do
                 val sourceOrdinal = view.rowUnsafe(candidate)
-                join.outputRow(
-                  leftBatch,
+                selections.appendMatched(
+                  batchIndex,
                   row,
-                  Some(
-                    right(rightBatch(sourceOrdinal)) -> rightRow(sourceOrdinal)
-                  )
-                ) match
-                  case Right(value) => rows += value
-                  case Left(value)  => error = Some(value)
+                  rightBatch(sourceOrdinal),
+                  rightRow(sourceOrdinal)
+                )
                 candidate = view.nextUnsafe(candidate)
             if !existence &&
               !matched &&
               join.kind == JoinKind.LeftOuter &&
               error.isEmpty
-            then
-              join.outputRow(leftBatch, row, None) match
-                case Right(value) => rows += value
-                case Left(value)  => error = Some(value)
+            then selections.appendLeftOnly(batchIndex, row)
             row += 1
         case _ =>
           error = Some(
@@ -1950,7 +2049,7 @@ final private class PreparedHashJoin private (
             )
           )
       batchIndex += 1
-    join.materialize(rows, error)
+    join.materialize(left, right, selections, error)
 
 private object PreparedHashJoin:
   def build(

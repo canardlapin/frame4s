@@ -1,13 +1,16 @@
 # ADR 0003: explicit immutable secondary indices
 
-Status: direct and compact layouts accepted; prepared join reuse remains
-experimental
+Status: R5e-R5g direct layouts, the R5h adaptive batch path, and designated
+prepared join reuse accepted; `GroupedHash` rejected; public API design remains
+deferred
 
 Date: 2026-07-26
 
 Decision issue: `bd-01KYFVGR24KEH030VX9XB2DY24`
 
 Layout follow-up issue: `bd-01KYG2RW0ZRDHEXECMA6ZCVV9N`
+
+Grouped-layout and join-output issue: `bd-01KYGMAPDXHVFN93191GPVHD8C`
 
 ## Context
 
@@ -260,6 +263,108 @@ tables and released before publication, reduces that result to 66.069 ms
 without changing retained bytes. A dedicated 1,000,000-row all-equal build
 takes 5.703 ms, guarding against quadratic repeated-key insertion. The
 pre-cache full receipt remains under `pre-build-cache/`.
+
+## R5h duplicate-adaptive index and join-output follow-up
+
+R5h adds `GroupedHash` for repeated keys. It stores one open-addressed main
+slot per distinct key. A unique key stores its source ordinal directly in that
+slot. A duplicate key stores a group number and keeps all of that key's source
+ordinals in one contiguous overflow block. The layout therefore pays overflow
+memory only for duplicate groups.
+
+Bit 30 distinguishes duplicate entries, overflow tokens, and final overflow
+rows from direct ordinals. `MaxRows` is strictly below `2^30`, so a valid
+ordinal cannot contain that bit. Main-table capacities do not exceed `2^30`,
+so a valid main slot cannot contain it either. Bit 31 remains clear for every
+occupied entry and continues to distinguish the negative empty sentinel.
+
+Construction uses the existing stable signed radix sort. Equal keys are
+contiguous and their ordinals remain in source order. The builder counts
+distinct keys, duplicate groups, and rows in duplicate groups before allocating
+the retained arrays. Sorted keys and ordinals are temporary build memory; they
+are not included in `ownedBytes`.
+
+Multi-key lookup now chooses among three physical strategies after its existing
+counting pass:
+
+- Small or irregular results use a primitive ordinal sort.
+- Balanced streams use a backend-selected k-way heap merge when token traversal
+  is cheap; otherwise they retain the primitive sort. The caller-key clone is
+  also the heap, so the merge path allocates no additional scratch array.
+- A dominant ordered stream is merged directly with the small remainder. The
+  remainder fits in the caller-key clone. `FastHash` specializes this loop over
+  its row-link array, avoiding both virtual token traversal and a second
+  result-sized sort workspace.
+
+The counting pass compacts only non-empty streams into the clone. This matters
+when a query contains many missing keys: the number of distinct query keys can
+exceed the result length, while the number of non-empty streams cannot. Tests
+cover one 512-row hit mixed with 1,000 missing keys so the scratch proof does
+not depend on the benchmark's mostly-hit queries.
+
+The columnar join kernel also replaces row-wise
+`Array[ScalarValue]` materialization with primitive row selections. It records
+left and right `(batch,row)` arrays once and exposes each output column as a
+gather over those shared arrays. Left-outer misses use a right-side validity
+bitmap, not a sentinel ordinal. The kernel still copies source vectors before
+probing, so a result remains readable after the source tables and prepared
+execution close. The semantic reference interpreter is unchanged.
+
+### R5h admission gates
+
+The full court requires:
+
+1. all five index layouts to agree with stable scans on the existing
+   cross-platform laws plus balanced, dominant, and many-miss batch fixtures;
+2. `GroupedHash` to use at most 12 bytes/source row for unique keys, 6 bytes
+   at fan-out 8, and 4.1 bytes when all keys are equal;
+3. grouped fan-out memory to be at least 40% below `FlatHashRows`, grouped
+   unique lookup to be at least 2x compact speed, grouped fan-out lookup not to
+   lose to compact, and grouped skewed batch lookup to be at least 1.5x flat
+   speed;
+4. the balanced FastHash and compact batch points to be at most 90% of their
+   R5g latency, every dominant-skew control to remain within 10% of R5g, and
+   large-batch allocation to remain below 70,000 B/op;
+5. selection-gather joins to preserve one-shot/prepared checksums, duplicate
+   order, null-key behavior, NaN bits, primitive families, and detached
+   lifetime on JVM and Scala.js;
+6. selection-gather to reduce one-shot allocation by at least 50% on the
+   one-to-one, one-to-many, and skewed joins and by at least 30% on sparse
+   joins; and
+7. warm prepared execution and construction plus first execution both to beat
+   one-shot execution on all four designated join shapes.
+
+### R5h current evidence and admission state
+
+The final exact-source
+[full index receipt](../benchmarks/receipts/2026-07-26-r5h-index-join-optimization/index-full/summary.md)
+validates all five layouts and four query shapes. The adaptive batch path is
+accepted: balanced fan-out is 0.626x R5g for `FastHash` and 0.757x for compact;
+every dominant-skew control remains within its frozen guardrail; and maximum
+normalized allocation is 62,977.227 B/op.
+
+`GroupedHash` is rejected. It meets every retained-memory gate at 1,000,000
+rows—10.667 bytes/source row for unique keys, 5.833 at fan-out 8, 10.615 on the
+sparse-skew fixture, and 4.000 when every key is equal—and clears the unique
+and skewed lookup gates. Its fan-out-8 single lookup reaches only 0.759x compact
+speed, missing the precommitted no-loss gate. The layout remains available for
+explicit study but is not an admitted default or automatic policy.
+
+The
+[full join receipt](../benchmarks/receipts/2026-07-26-r5h-index-join-optimization/join-full/summary.md)
+also passes. One-shot selection-gather allocation falls by 70.97% for
+one-to-one, 70.35% for one-to-many, 45.99% for sparse, and 68.73% for skewed
+joins. Warm prepared execution is 1.34x to 1.90x faster than the improved
+one-shot path. Construction plus first execution is also 1.18x to 1.73x
+faster, so prepared reuse is accepted for these physical `Int32` equality
+shapes. It remains package-internal and explicit; ordinary preparation does
+not build or cache an index.
+
+Separate-process refreshes record one-shot frame4s join speedups of 2.72x to
+12.13x over Pandas and 6.22x to 26.48x over data.table. The Saddle court has no
+semantically equivalent duplicate-key join, so R5h makes no Saddle join claim.
+The previous comparable Saddle projection, filter/project, and grouped-sum
+rows remain the Saddle boundary.
 
 ## Rejected alternatives
 

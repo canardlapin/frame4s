@@ -241,7 +241,15 @@ class CompactIndexLookupState extends IndexLookupState:
 
 @State(Scope.Benchmark)
 class ExtendedIndexLookupState extends IndexLookupState:
-  @Param(Array("fast-hash", "compact-sorted", "packed-sorted", "flat-hash-rows"))
+  @Param(
+    Array(
+      "fast-hash",
+      "compact-sorted",
+      "packed-sorted",
+      "flat-hash-rows",
+      "grouped-hash"
+    )
+  )
   var layoutName: String = ""
 
   @Param(Array("unique", "mixed-miss", "fanout-8", "skewed"))
@@ -253,6 +261,7 @@ class ExtendedIndexLookupState extends IndexLookupState:
       case "compact-sorted" => SecondaryIndexLayout.CompactSorted
       case "packed-sorted"  => SecondaryIndexLayout.PackedSorted
       case "flat-hash-rows" => SecondaryIndexLayout.FlatHashRows
+      case "grouped-hash"   => SecondaryIndexLayout.GroupedHash
       case unexpected       =>
         throw new IllegalArgumentException(s"unknown index layout: $unexpected")
 
@@ -299,14 +308,18 @@ class ExtendedIndexLookupState extends IndexLookupState:
 
 @State(Scope.Benchmark)
 class FlatAllEqualBuildState extends IndexLookupState:
-  @Param(Array("flat-hash-rows"))
+  @Param(Array("flat-hash-rows", "grouped-hash"))
   var layoutName: String = ""
 
   @Param(Array("all-equal"))
   var shape: String = ""
 
   override protected def indexLayout: SecondaryIndexLayout =
-    SecondaryIndexLayout.FlatHashRows
+    layoutName match
+      case "flat-hash-rows" => SecondaryIndexLayout.FlatHashRows
+      case "grouped-hash"   => SecondaryIndexLayout.GroupedHash
+      case unexpected       =>
+        throw new IllegalArgumentException(s"unknown index layout: $unexpected")
 
   override protected def configureFixture(): Unit =
     values = Array.fill(rows)(7)

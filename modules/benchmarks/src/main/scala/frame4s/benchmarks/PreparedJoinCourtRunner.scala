@@ -24,6 +24,12 @@ object PreparedJoinCourtRunner:
 
   private val BaselineRow =
     raw"""^\| `ColumnarBenchmarks\.([^`]+)` \| avgt \| ([0-9.Ee+-]+) ms/op \|.*$$""".r
+  private val FrozenOneShotAllocation = Map(
+    "joinOneToOne" -> 390458.820,
+    "joinOneToMany" -> 382202.592,
+    "joinSparse" -> 49856.414,
+    "joinSkewed" -> 362490.463
+  )
 
   def main(arguments: Array[String]): Unit =
     val configuration = parse(arguments.toList)
@@ -126,6 +132,7 @@ object PreparedJoinCourtRunner:
       s"quick=${configuration.quick}",
       "rows=1000",
       "index=plain-int32-explicit-prepared",
+      "join.materialization=selection-gather",
       s"baseline=${configuration.baseline.getFileName}",
       s"java.version=${System.getProperty("java.version")}",
       s"java.vendor=${System.getProperty("java.vendor")}",
@@ -158,6 +165,7 @@ object PreparedJoinCourtRunner:
   ): Unit =
     val baseline = readBaseline(configuration.baseline)
     var generallyAdmitted = true
+    var allocationAdmitted = true
     val rows = validations.map: validation =>
       val frozenOneShot = baseline.getOrElse(
         validation.method,
@@ -175,13 +183,27 @@ object PreparedJoinCourtRunner:
         if oneShot > warm then f"${build / (oneShot - warm)}%.2f"
         else "never"
       f"| ${validation.method} | $frozenOneShot%.6f | $oneShot%.6f | $warm%.6f | $warmSpeedup%.2fx | $build%.6f | $cold%.6f | $coldSpeedup%.2fx | $breakEven |"
+    val allocationRows = validations.map: validation =>
+      val frozen = FrozenOneShotAllocation(validation.method)
+      val oneShot =
+        normalizedAllocation(results, "ColumnarBenchmarks", validation.method)
+      val prepared =
+        normalizedAllocation(results, "PreparedJoinCourt", validation.method)
+      val minimumReduction =
+        if validation.method == "joinSparse" then 0.30 else 0.50
+      val reduction = 1.0 - oneShot / frozen
+      allocationAdmitted &&= reduction >= minimumReduction
+      f"| ${validation.method} | $frozen%.3f | $oneShot%.3f | ${reduction * 100.0}%.2f%% | >= ${minimumReduction * 100.0}%.0f%% | ${
+          if reduction >= minimumReduction then "pass" else "fail"
+        } | $prepared%.3f |"
     val mode =
       if configuration.quick then "Quick provisional receipt."
       else "Full prepared-join receipt."
     val decision =
-      if generallyAdmitted then "Decision: admit prepared join reuse for the designated shapes."
+      if generallyAdmitted && allocationAdmitted then
+        "Decision: admit prepared join reuse for the designated shapes."
       else
-        "Decision: do not generally admit prepared join reuse. At least one designated shape fails to improve both warm execution and construction plus first execution; the entry point remains package-internal experimental evidence."
+        "Decision: do not generally admit prepared join reuse. At least one designated shape fails its speed or allocation gate; the entry point remains package-internal experimental evidence."
     val summary =
       s"""@# frame4s prepared join index
          @
@@ -193,6 +215,12 @@ object PreparedJoinCourtRunner:
          @| Workload | Frozen one-shot ms/op | Same-run one-shot ms/op | Warm prepared ms/op | Warm speedup | Build ms | Cold first run ms | Cold speedup | Break-even runs |
          @|---|---:|---:|---:|---:|---:|---:|---:|---:|
          @${rows.mkString("\n")}
+         @
+         @## Selection-gather allocation
+         @
+         @| Workload | Frozen row-materialized B/op | One-shot selection-gather B/op | Reduction | Gate | Result | Warm prepared B/op |
+         @|---|---:|---:|---:|---:|---:|---:|
+         @${allocationRows.mkString("\n")}
          @
          @Cold first run is `build + warm run`; break-even includes construction.
          @Exact output cardinalities and checksums are in `validation.tsv`; raw JMH
@@ -226,6 +254,25 @@ object PreparedJoinCourtRunner:
         )
       .getPrimaryResult
       .getScore
+
+  private def normalizedAllocation(
+      results: Vector[RunResult],
+      benchmarkClass: String,
+      method: String
+  ): Double =
+    results
+      .find: result =>
+        val params = result.getParams
+        params.getBenchmark.endsWith(s"$benchmarkClass.$method") &&
+        params.getMode.shortLabel() == "avgt"
+      .flatMap: result =>
+        result.getSecondaryResults.asScala
+          .get("gc.alloc.rate.norm")
+          .map(_.getScore)
+      .getOrElse:
+        throw new IllegalStateException(
+          s"JMH result omits normalized allocation for $benchmarkClass.$method"
+        )
 
   private def write(path: Path, content: String): Unit =
     Files.writeString(path, content, StandardCharsets.UTF_8)

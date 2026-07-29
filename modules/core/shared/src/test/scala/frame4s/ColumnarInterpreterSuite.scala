@@ -274,13 +274,20 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     val outerResult = completed(outerRun)
     val preparedResult = completed(preparedRun)
     val repeatedPreparedResult = completed(repeatedPreparedRun)
+    innerExecution.close()
+    outerExecution.close()
+    preparedExecution.close()
+    leftInput.close()
     try
       assertEquals(innerRun.receipt.fallback, None)
       assertEquals(outerRun.receipt.fallback, None)
       assert(innerRun.receipt.physicalPlan.contains("HashJoin[Inner"))
       assert(outerRun.receipt.physicalPlan.contains("HashJoin[LeftOuter"))
+      assert(innerRun.receipt.physicalPlan.contains("SelectionGather"))
+      assert(outerRun.receipt.physicalPlan.contains("SelectionGather"))
       assert(preparedExecution.physicalExplain.contains("PreparedHashJoin[Inner"))
       assert(preparedRun.receipt.physicalPlan.contains("PreparedHashJoin[Inner"))
+      assert(preparedRun.receipt.physicalPlan.contains("SelectionGather"))
       assertEquals(
         innerResult.rows,
         Right(
@@ -313,7 +320,6 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           )
         )
       )
-      preparedExecution.close()
       assertEquals(
         preparedExecution.run().result,
         Left(ExecutionError.Storage(StorageError.SourceClosed))
@@ -326,6 +332,89 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       preparedExecution.close()
       innerExecution.close()
       outerExecution.close()
+      leftInput.close()
+      rightInput.close()
+
+  test("selection-backed outer joins gather every primitive family and survive owner closure"):
+    type Left =
+      (key: Int, flag: Boolean, ratio: Float, label: String, at: TimestampMicros)
+    type Right = (rightKey: Int, score: Double)
+    val leftRef = reference("columnar-gather-left")
+    val rightRef = reference("columnar-gather-right")
+    val leftInput = table[Left](
+      Vector(
+        (key = 1, flag = true, ratio = 1.5f, label = "one", at = TimestampMicros(7L)),
+        (key = 2, flag = false, ratio = -0.0f, label = "two", at = TimestampMicros(8L))
+      ),
+      batchSize = 1
+    )
+    val rightInput = table[Right](
+      Vector((rightKey = 1, score = Double.NaN)),
+      batchSize = 1
+    )
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val query =
+      left.leftJoin(right): (lhs, rhs) =>
+        lhs.col("key") === rhs.col("rightKey")
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val execution = ColumnarInterpreter.prepare(query.plan, sources)
+    val prepared = value(ColumnarInterpreter.prepareIndexed(query.plan, sources))
+    val run = execution.run()
+    val preparedRun = prepared.run()
+    val result = completed(run)
+    val preparedResult = completed(preparedRun)
+    execution.close()
+    prepared.close()
+    leftInput.close()
+    rightInput.close()
+    try
+      assert(run.receipt.physicalPlan.contains("SelectionGather"))
+      assert(preparedRun.receipt.physicalPlan.contains("SelectionGather"))
+      val expected =
+        Vector(
+          Vector(
+            ScalarValue.Int32(1),
+            ScalarValue.Bool(true),
+            ScalarValue.Float32(1.5f),
+            ScalarValue.Utf8("one"),
+            ScalarValue.Timestamp(7L, TimeUnit.Microsecond),
+            ScalarValue.Int32(1),
+            ScalarValue.Float64(Double.NaN)
+          ),
+          Vector(
+            ScalarValue.Int32(2),
+            ScalarValue.Bool(false),
+            ScalarValue.Float32(-0.0f),
+            ScalarValue.Utf8("two"),
+            ScalarValue.Timestamp(8L, TimeUnit.Microsecond),
+            ScalarValue.Null,
+            ScalarValue.Null
+          )
+        )
+      val actual = value(result.rows)
+      val preparedActual = value(preparedResult.rows)
+      def normalized(rows: Vector[Vector[ScalarValue]]): Vector[Vector[String]] =
+        rows.map:
+          _.map:
+            case ScalarValue.Float64(value) if value.isNaN => "Float64(NaN)"
+            case value                                     => value.toString
+      assertEquals(normalized(actual), normalized(expected))
+      assertEquals(normalized(preparedActual), normalized(expected))
+      actual.head(6) match
+        case ScalarValue.Float64(value) =>
+          assertEquals(
+            java.lang.Double.doubleToRawLongBits(value),
+            java.lang.Double.doubleToRawLongBits(Double.NaN)
+          )
+        case value => fail(s"expected gathered NaN, received $value")
+      assertEquals(result.checksum, preparedResult.checksum)
+    finally
+      result.close()
+      preparedResult.close()
+      execution.close()
+      prepared.close()
       leftInput.close()
       rightInput.close()
 

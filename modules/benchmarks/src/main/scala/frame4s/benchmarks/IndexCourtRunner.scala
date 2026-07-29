@@ -61,6 +61,12 @@ object IndexCourtRunner:
   private val AdmittedFastSingleOneMillionMilliseconds = 0.000015266
   private val R5fFastBatchOneMillionMilliseconds = 0.000384870
   private val R5fCompactBatchOneMillionMilliseconds = 0.00152138
+  private val R5gFastFanoutBatchMilliseconds = 0.00258322
+  private val R5gCompactFanoutBatchMilliseconds = 0.00288340
+  private val R5gFastSkewBatchMilliseconds = 0.126760
+  private val R5gCompactSkewBatchMilliseconds = 0.0330881
+  private val R5gPackedSkewBatchMilliseconds = 0.0382594
+  private val R5gFlatSkewBatchMilliseconds = 0.0819962
 
   def main(arguments: Array[String]): Unit =
     val configuration = parse(arguments.toList)
@@ -89,8 +95,6 @@ object IndexCourtRunner:
     configuration.phase match
       case Phase.Extended(_) =>
         val _ = builder.param("rows", "1000000")
-        if configuration.quick then
-          val _ = builder.param("shape", "unique")
       case _ => ()
 
     if configuration.quick then
@@ -231,19 +235,26 @@ object IndexCourtRunner:
         Vector(100000, 1000000).flatMap: rows =>
           validateLayout(rows, compact = false) ++ validateLayout(rows, compact = true)
       case Phase.Extended(_) =>
-        val extended = validateExtended(if quick then Vector("unique")
-        else
-          Vector(
-            "unique",
-            "mixed-miss",
-            "fanout-8",
-            "skewed"
-          ))
+        val extended =
+          validateExtended(
+            Vector(
+              "unique",
+              "mixed-miss",
+              "fanout-8",
+              "skewed"
+            )
+          )
         if quick then extended else extended ++ validateFlatAllEqual()
 
   private def validateExtended(shapes: Vector[String]): Vector[Validation] =
     val layouts =
-      Vector("fast-hash", "compact-sorted", "packed-sorted", "flat-hash-rows")
+      Vector(
+        "fast-hash",
+        "compact-sorted",
+        "packed-sorted",
+        "flat-hash-rows",
+        "grouped-hash"
+      )
     layouts.flatMap: layout =>
       shapes.flatMap: shape =>
         val state = new ExtendedIndexLookupState
@@ -295,30 +306,31 @@ object IndexCourtRunner:
         finally state.tearDown()
 
   private def validateFlatAllEqual(): Vector[Validation] =
-    val state = new FlatAllEqualBuildState
-    state.rows = 1000000
-    state.layoutName = "flat-hash-rows"
-    state.shape = "all-equal"
-    state.setup()
-    try
-      requireExact(
-        "all-equal single-key lookup",
-        state.rows,
-        state.scanSingle(),
-        state.indexedSingle()
-      )
-      Vector(
-        Validation(
-          "FlatAllEqualBuildCourt.build",
+    Vector("flat-hash-rows", "grouped-hash").flatMap: layout =>
+      val state = new FlatAllEqualBuildState
+      state.rows = 1000000
+      state.layoutName = layout
+      state.shape = "all-equal"
+      state.setup()
+      try
+        requireExact(
+          s"$layout all-equal single-key lookup",
           state.rows,
-          state.rows,
-          state.buildIndex().toString,
-          "all-equal build; exact lookup parity with stable scan",
-          state.layoutName,
-          state.shape
+          state.scanSingle(),
+          state.indexedSingle()
         )
-      )
-    finally state.tearDown()
+        Vector(
+          Validation(
+            "FlatAllEqualBuildCourt.build",
+            state.rows,
+            state.rows,
+            state.buildIndex().toString,
+            "all-equal build; exact lookup parity with stable scan",
+            state.layoutName,
+            state.shape
+          )
+        )
+      finally state.tearDown()
 
   private def validateLayout(rows: Int, compact: Boolean): Vector[Validation] =
     val state =
@@ -399,7 +411,7 @@ object IndexCourtRunner:
       case Phase.Layouts(baseline) =>
         "fast-hash,compact-sorted" -> displayPath(baseline)
       case Phase.Extended(baseline) =>
-        "fast-hash,compact-sorted,packed-sorted,flat-hash-rows" ->
+        "fast-hash,compact-sorted,packed-sorted,flat-hash-rows,grouped-hash" ->
           displayPath(baseline)
     val properties = Vector(
       "receipt_format=1",
@@ -703,12 +715,31 @@ object IndexCourtRunner:
     val compactBytes = extendedOwnedBytes(validations, "compact-sorted", "unique")
     val packedBytes = extendedOwnedBytes(validations, "packed-sorted", "unique")
     val flatBytes = extendedOwnedBytes(validations, "flat-hash-rows", "unique")
+    val groupedUniqueBytes =
+      extendedOwnedBytes(validations, "grouped-hash", "unique")
+    val groupedFanoutBytes =
+      extendedOwnedBytes(validations, "grouped-hash", "fanout-8")
+    val groupedSkewBytes =
+      extendedOwnedBytes(validations, "grouped-hash", "skewed")
+    val groupedAllEqualBytes =
+      if configuration.quick then None
+      else Some(allEqualOwnedBytes(validations, "grouped-hash"))
     val packedBytesPerRow = packedBytes.toDouble / rows.toDouble
     val flatBytesPerRow = flatBytes.toDouble / rows.toDouble
+    val groupedUniqueBytesPerRow = groupedUniqueBytes.toDouble / rows.toDouble
+    val groupedFanoutBytesPerRow = groupedFanoutBytes.toDouble / rows.toDouble
+    val groupedSkewBytesPerRow = groupedSkewBytes.toDouble / rows.toDouble
     val packedReduction = 1.0 - packedBytes.toDouble / compactBytes.toDouble
+    val groupedFanoutReduction =
+      1.0 - groupedFanoutBytes.toDouble / flatBytes.toDouble
     val packedMemoryPasses =
       packedBytesPerRow <= 6.75 && packedReduction >= 0.15
     val flatMemoryPasses = flatBytesPerRow <= 12.0
+    val groupedMemoryPasses =
+      groupedUniqueBytesPerRow <= 12.0 &&
+        groupedFanoutBytesPerRow <= 6.0 &&
+        groupedFanoutReduction >= 0.40 &&
+        groupedAllEqualBytes.forall(_.toDouble / rows.toDouble <= 4.1)
 
     val compactSingle =
       extendedAverageScore(results, "singleLookup", "compact-sorted", "unique")
@@ -721,22 +752,54 @@ object IndexCourtRunner:
     val flatSingleSpeedup = compactSingle / flatSingle
     val flatBatchSpeedup = compactBatch / flatBatch
     val flatSpeedPasses = flatSingleSpeedup >= 1.25 && flatBatchSpeedup >= 1.25
-    val skewRows =
-      if configuration.quick then ""
-      else
-        val compactSkewSingle =
-          extendedAverageScore(results, "singleLookup", "compact-sorted", "skewed")
-        val compactSkewBatch =
-          extendedAverageScore(results, "batch32Lookup", "compact-sorted", "skewed")
-        val flatSkewSingle =
-          extendedAverageScore(results, "singleLookup", "flat-hash-rows", "skewed")
-        val flatSkewBatch =
-          extendedAverageScore(results, "batch32Lookup", "flat-hash-rows", "skewed")
-        s"""@| Flat skewed single ratio versus compact | ${f"${compactSkewSingle / flatSkewSingle}%.3f"}x | reported loss/win | reported |
-           @| Flat skewed batch32 ratio versus compact | ${f"${compactSkewBatch / flatSkewBatch}%.3f"}x | reported loss/win | reported |"""
-          .stripMargin(
-            '@'
-          )
+    val groupedUniqueSingle =
+      extendedAverageScore(results, "singleLookup", "grouped-hash", "unique")
+    val groupedFanoutSingle =
+      extendedAverageScore(results, "singleLookup", "grouped-hash", "fanout-8")
+    val compactFanoutSingle =
+      extendedAverageScore(results, "singleLookup", "compact-sorted", "fanout-8")
+    val groupedUniqueSingleSpeedup = compactSingle / groupedUniqueSingle
+    val groupedFanoutSingleSpeedup = compactFanoutSingle / groupedFanoutSingle
+    val groupedSpeedPasses =
+      groupedUniqueSingleSpeedup >= 2.0 && groupedFanoutSingleSpeedup >= 1.0
+    val compactSkewSingle =
+      extendedAverageScore(results, "singleLookup", "compact-sorted", "skewed")
+    val compactSkewBatch =
+      extendedAverageScore(results, "batch32Lookup", "compact-sorted", "skewed")
+    val flatSkewSingle =
+      extendedAverageScore(results, "singleLookup", "flat-hash-rows", "skewed")
+    val flatSkewBatch =
+      extendedAverageScore(results, "batch32Lookup", "flat-hash-rows", "skewed")
+    val groupedSkewBatch =
+      extendedAverageScore(results, "batch32Lookup", "grouped-hash", "skewed")
+    val groupedSkewSpeedupVersusFlat = flatSkewBatch / groupedSkewBatch
+    val groupedSkewSpeedPasses = groupedSkewSpeedupVersusFlat >= 1.5
+    val fastFanoutBatch =
+      extendedAverageScore(results, "batch32Lookup", "fast-hash", "fanout-8")
+    val compactFanoutBatch =
+      extendedAverageScore(results, "batch32Lookup", "compact-sorted", "fanout-8")
+    val fastSkewBatch =
+      extendedAverageScore(results, "batch32Lookup", "fast-hash", "skewed")
+    val packedSkewBatch =
+      extendedAverageScore(results, "batch32Lookup", "packed-sorted", "skewed")
+    val adaptiveBatchPasses =
+      fastFanoutBatch <= R5gFastFanoutBatchMilliseconds * 0.90 &&
+        compactFanoutBatch <= R5gCompactFanoutBatchMilliseconds * 0.90 &&
+        fastSkewBatch <= R5gFastSkewBatchMilliseconds * 1.10 &&
+        compactSkewBatch <= R5gCompactSkewBatchMilliseconds * 1.10 &&
+        packedSkewBatch <= R5gPackedSkewBatchMilliseconds * 1.10 &&
+        flatSkewBatch <= R5gFlatSkewBatchMilliseconds * 1.10
+    val maximumSkewAllocation =
+      Vector(
+        "fast-hash",
+        "compact-sorted",
+        "packed-sorted",
+        "flat-hash-rows",
+        "grouped-hash"
+      ).map: layout =>
+        extendedNormalizedAllocation(results, "batch32Lookup", layout, "skewed")
+      .max
+    val adaptiveAllocationPasses = maximumSkewAllocation <= 70000.0
 
     val fastBatch =
       extendedAverageScore(results, "batch32Lookup", "fast-hash", "unique")
@@ -759,22 +822,37 @@ object IndexCourtRunner:
       if packedMemoryPasses then "admitted as the lower-memory sorted layout"
       else "not admitted"
     val batchDecision =
-      if batchAllocationPasses && frozenLatencyPasses then "admitted as the batch lookup path"
+      if batchAllocationPasses &&
+        frozenLatencyPasses &&
+        adaptiveBatchPasses &&
+        adaptiveAllocationPasses
+      then "admitted as the adaptive batch lookup path"
       else "not admitted"
     val flatDecision =
       if flatMemoryPasses && flatSpeedPasses then
         "admitted as an explicit low-fanout balanced layout; not as a skewed-key layout"
       else "not admitted as the low-fanout balanced layout"
+    val groupedDecision =
+      if groupedMemoryPasses && groupedSpeedPasses && groupedSkewSpeedPasses then
+        "admitted as the duplicate-adaptive hash layout"
+      else "not admitted as the duplicate-adaptive hash layout"
+    val allEqualGate = groupedAllEqualBytes.fold(
+      "| Grouped all-equal owned bytes/source row | not run | <= 4.100 | provisional |"
+    ): bytes =>
+      val perRow = bytes.toDouble / rows.toDouble
+      f"| Grouped all-equal owned bytes/source row | $perRow%.3f | <= 4.100 | ${status(
+          perRow <= 4.1
+        )} |"
     val mode =
       if configuration.quick then
         "Quick wiring receipt; timings and gate decisions are provisional."
-      else "Full R5g extended-layout receipt."
+      else "Full R5h grouped-layout and batch-merge receipt."
     val validationScope =
       if configuration.quick then
-        "All four layouts passed exact stable-scan validation on the 1M-row unique control."
-      else "All four layouts and all four query shapes passed exact stable-scan validation."
+        "All five layouts and all four query shapes passed exact stable-scan validation in the quick court."
+      else "All five layouts and all four query shapes passed exact stable-scan validation."
     val summary =
-      s"""@# frame4s R5g extended secondary-index court
+      s"""@# frame4s R5h extended secondary-index court
          @
          @$mode $validationScope Candidate losses remain visible below.
          @
@@ -783,6 +861,7 @@ object IndexCourtRunner:
          @- `PackedSorted` is **$packedDecision**.
          @- The clone-once/token-reuse batch engine is **$batchDecision**.
          @- `FlatHashRows` is **$flatDecision**.
+         @- `GroupedHash` is **$groupedDecision**.
          @- `FastHash` remains the default; this court does not infer an automatic
          @  layout policy.
          @
@@ -817,13 +896,55 @@ object IndexCourtRunner:
          @| Flat unique batch32 speedup versus compact | ${f"$flatBatchSpeedup%.3f"}x | >= 1.250x | ${status(
            flatBatchSpeedup >= 1.25
          )} |
-         @$skewRows
+         @| Grouped unique owned bytes/source row | ${f"$groupedUniqueBytesPerRow%.3f"} | <= 12.000 | ${status(
+           groupedUniqueBytesPerRow <= 12.0
+         )} |
+         @| Grouped fanout-8 owned bytes/source row | ${f"$groupedFanoutBytesPerRow%.3f"} | <= 6.000 | ${status(
+           groupedFanoutBytesPerRow <= 6.0
+         )} |
+         @| Grouped skew owned bytes/source row | ${f"$groupedSkewBytesPerRow%.3f"} | reported | reported |
+         @| Grouped fanout-8 reduction versus flat | ${f"${groupedFanoutReduction * 100.0}%.2f"}% | >= 40.00% | ${status(
+           groupedFanoutReduction >= 0.40
+         )} |
+         @$allEqualGate
+         @| Grouped unique single speedup versus compact | ${f"$groupedUniqueSingleSpeedup%.3f"}x | >= 2.000x | ${status(
+           groupedUniqueSingleSpeedup >= 2.0
+         )} |
+         @| Grouped fanout-8 single speedup versus compact | ${f"$groupedFanoutSingleSpeedup%.3f"}x | >= 1.000x | ${status(
+           groupedFanoutSingleSpeedup >= 1.0
+         )} |
+         @| Grouped skew batch32 speedup versus flat | ${f"$groupedSkewSpeedupVersusFlat%.3f"}x | >= 1.500x | ${status(
+           groupedSkewSpeedPasses
+         )} |
+         @| Balanced FastHash fanout ratio versus R5g | ${f"${fastFanoutBatch / R5gFastFanoutBatchMilliseconds}%.3f"}x | <= 0.900x | ${status(
+           fastFanoutBatch <= R5gFastFanoutBatchMilliseconds * 0.90
+         )} |
+         @| Balanced Compact fanout ratio versus R5g | ${f"${compactFanoutBatch / R5gCompactFanoutBatchMilliseconds}%.3f"}x | <= 0.900x | ${status(
+           compactFanoutBatch <= R5gCompactFanoutBatchMilliseconds * 0.90
+         )} |
+         @| Dominant FastHash skew ratio versus R5g | ${f"${fastSkewBatch / R5gFastSkewBatchMilliseconds}%.3f"}x | <= 1.100x | ${status(
+           fastSkewBatch <= R5gFastSkewBatchMilliseconds * 1.10
+         )} |
+         @| Dominant Compact skew ratio versus R5g | ${f"${compactSkewBatch / R5gCompactSkewBatchMilliseconds}%.3f"}x | <= 1.100x | ${status(
+           compactSkewBatch <= R5gCompactSkewBatchMilliseconds * 1.10
+         )} |
+         @| Dominant Packed skew ratio versus R5g | ${f"${packedSkewBatch / R5gPackedSkewBatchMilliseconds}%.3f"}x | <= 1.100x | ${status(
+           packedSkewBatch <= R5gPackedSkewBatchMilliseconds * 1.10
+         )} |
+         @| Dominant Flat skew ratio versus R5g | ${f"${flatSkewBatch / R5gFlatSkewBatchMilliseconds}%.3f"}x | <= 1.100x | ${status(
+           flatSkewBatch <= R5gFlatSkewBatchMilliseconds * 1.10
+         )} |
+         @| Maximum skew batch32 allocation | ${f"$maximumSkewAllocation%.3f"} B/op | <= 70000.000 B/op | ${status(
+           adaptiveAllocationPasses
+         )} |
+         @| Flat skewed single ratio versus compact | ${f"${compactSkewSingle / flatSkewSingle}%.3f"}x | reported loss/win | reported |
+         @| Flat skewed batch32 ratio versus compact | ${f"${compactSkewBatch / flatSkewBatch}%.3f"}x | reported loss/win | reported |
          @
-         @The two frozen-point ratios are conservative cross-run guardrails. Same-run
-         @layout rankings come from this receipt; a host/JDK difference is not
-         @presented as a causal code regression. Ratios below 1.0 on the two skew
-         @rows mean `CompactSorted` is faster; those losses limit the flat layout's
-         @admission even though they do not rewrite the precommitted unique gates.
+         @The frozen-point ratios are conservative cross-run guardrails. The adaptive
+         @batch path selects heap merging for pointer-cheap balanced hash streams,
+         @direct merging for ordered dominant streams, and sorting where traversal
+         @cost makes either merge slower. Same-run layout
+         @rankings remain primary, and all losses remain visible.
          @
          @## Full shape matrix
          @
@@ -836,7 +957,16 @@ object IndexCourtRunner:
          @`${displayPath(baselineDirectory.resolve("summary.md"))}`.
          @""".stripMargin('@')
     write(configuration.receipt.resolve("summary.md"), summary)
-    true
+    packedMemoryPasses &&
+    batchAllocationPasses &&
+    frozenLatencyPasses &&
+    flatMemoryPasses &&
+    flatSpeedPasses &&
+    groupedMemoryPasses &&
+    groupedSpeedPasses &&
+    groupedSkewSpeedPasses &&
+    adaptiveBatchPasses &&
+    adaptiveAllocationPasses
 
   private def layoutComparisons(
       baseline: Vector[BaselineScore],
@@ -1007,6 +1137,23 @@ object IndexCourtRunner:
       .getOrElse:
         throw new IllegalStateException(
           s"extended validation omits owned bytes layout=$layout shape=$shape"
+        )
+      .checksum
+      .toLong
+
+  private def allEqualOwnedBytes(
+      validations: Vector[Validation],
+      layout: String
+  ): Long =
+    validations
+      .find: validation =>
+        validation.benchmark == "FlatAllEqualBuildCourt.build" &&
+          validation.rows == 1000000 &&
+          validation.layout == layout &&
+          validation.shape == "all-equal"
+      .getOrElse:
+        throw new IllegalStateException(
+          s"extended validation omits all-equal owned bytes layout=$layout"
         )
       .checksum
       .toLong

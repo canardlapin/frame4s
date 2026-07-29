@@ -84,12 +84,14 @@ private[frame4s] enum SecondaryIndexLayout:
   case CompactSorted
   case PackedSorted
   case FlatHashRows
+  case GroupedHash
 
   def label: String = this match
     case FastHash      => "fast-hash"
     case CompactSorted => "compact-sorted"
     case PackedSorted  => "packed-sorted"
     case FlatHashRows  => "flat-hash-rows"
+    case GroupedHash   => "grouped-hash"
 
 private enum SortedSecondaryIndexLayout:
   case Compact
@@ -128,6 +130,96 @@ sealed private[frame4s] trait Int32IndexBackend:
   def select(key: Int): Int32RowSelection
   def ownedBytes: Long
   def close(): Unit
+  def balancedBatchStrategy: SecondaryIndexBatchStrategy =
+    SecondaryIndexBatchStrategy.Sort
+  def dominantBatchStrategy: SecondaryIndexBatchStrategy =
+    SecondaryIndexBatchStrategy.DominantMerge
+
+  def mergeBalancedStreams(
+      tokens: Array[Int],
+      tokenCount: Int,
+      ordinals: Array[Int]
+  ): Unit =
+    var heapSize = tokenCount
+    var parent = (heapSize >>> 1) - 1
+    while parent >= 0 do
+      siftDown(tokens, parent, heapSize)
+      parent -= 1
+
+    var output = 0
+    while heapSize > 0 do
+      val token = tokens(0)
+      ordinals(output) = row(token)
+      output += 1
+      val following = next(token)
+      if following >= 0 then tokens(0) = following
+      else
+        heapSize -= 1
+        if heapSize > 0 then tokens(0) = tokens(heapSize)
+      if heapSize > 1 then siftDown(tokens, 0, heapSize)
+
+  def mergeDominantStreams(
+      tokens: Array[Int],
+      tokenCount: Int,
+      dominantIndex: Int,
+      ordinals: Array[Int]
+  ): Unit =
+    var query = 0
+    while query < tokenCount do
+      ordinals(query) = tokens(query)
+      query += 1
+
+    var minorCount = 0
+    query = 0
+    while query < tokenCount do
+      if query != dominantIndex then
+        var token = ordinals(query)
+        while token >= 0 do
+          tokens(minorCount) = row(token)
+          minorCount += 1
+          token = next(token)
+      query += 1
+    java.util.Arrays.sort(tokens, 0, minorCount)
+
+    var dominantToken = ordinals(dominantIndex)
+    var minor = 0
+    var output = 0
+    while dominantToken >= 0 && minor < minorCount do
+      val dominantRow = row(dominantToken)
+      val minorRow = tokens(minor)
+      if dominantRow <= minorRow then
+        ordinals(output) = dominantRow
+        dominantToken = next(dominantToken)
+      else
+        ordinals(output) = minorRow
+        minor += 1
+      output += 1
+    while dominantToken >= 0 do
+      ordinals(output) = row(dominantToken)
+      output += 1
+      dominantToken = next(dominantToken)
+    while minor < minorCount do
+      ordinals(output) = tokens(minor)
+      output += 1
+      minor += 1
+
+  private def siftDown(tokens: Array[Int], root: Int, heapSize: Int): Unit =
+    var parent = root
+    var done = false
+    while !done do
+      val left = parent * 2 + 1
+      if left >= heapSize then done = true
+      else
+        val right = left + 1
+        val child =
+          if right < heapSize && row(tokens(right)) < row(tokens(left)) then right
+          else left
+        if row(tokens(parent)) <= row(tokens(child)) then done = true
+        else
+          val previous = tokens(parent)
+          tokens(parent) = tokens(child)
+          tokens(child) = previous
+          parent = child
 
 final private class FastHashBackend(
     private var keys: Array[Int],
@@ -138,6 +230,53 @@ final private class FastHashBackend(
 
   val ownedBytes: Long =
     (keys.length.toLong + heads.length.toLong + nextRows.length.toLong) * 4L
+
+  override val balancedBatchStrategy: SecondaryIndexBatchStrategy =
+    SecondaryIndexBatchStrategy.HeapMerge
+
+  override def mergeDominantStreams(
+      tokens: Array[Int],
+      tokenCount: Int,
+      dominantIndex: Int,
+      ordinals: Array[Int]
+  ): Unit =
+    var query = 0
+    while query < tokenCount do
+      ordinals(query) = tokens(query)
+      query += 1
+
+    var minorCount = 0
+    query = 0
+    while query < tokenCount do
+      if query != dominantIndex then
+        var row = ordinals(query)
+        while row >= 0 do
+          tokens(minorCount) = row
+          minorCount += 1
+          row = nextRows(row)
+      query += 1
+    java.util.Arrays.sort(tokens, 0, minorCount)
+
+    var dominantRow = ordinals(dominantIndex)
+    var minor = 0
+    var output = 0
+    while dominantRow >= 0 && minor < minorCount do
+      val minorRow = tokens(minor)
+      if dominantRow <= minorRow then
+        ordinals(output) = dominantRow
+        dominantRow = nextRows(dominantRow)
+      else
+        ordinals(output) = minorRow
+        minor += 1
+      output += 1
+    while dominantRow >= 0 do
+      ordinals(output) = dominantRow
+      output += 1
+      dominantRow = nextRows(dominantRow)
+    while minor < minorCount do
+      ordinals(output) = tokens(minor)
+      output += 1
+      minor += 1
 
   def first(key: Int): Int =
     var slot = SecondaryIndexHash.mix(key) & mask
@@ -191,6 +330,32 @@ final private class CompactSortedBackend(
   val ownedBytes: Long =
     (keys.length.toLong + rows.length.toLong) * 4L
 
+  override val balancedBatchStrategy: SecondaryIndexBatchStrategy =
+    SecondaryIndexBatchStrategy.HeapMerge
+
+  override def mergeBalancedStreams(
+      tokens: Array[Int],
+      tokenCount: Int,
+      ordinals: Array[Int]
+  ): Unit =
+    var heapSize = tokenCount
+    var parent = (heapSize >>> 1) - 1
+    while parent >= 0 do
+      siftRowsDown(tokens, parent, heapSize)
+      parent -= 1
+
+    var output = 0
+    while heapSize > 0 do
+      val token = tokens(0)
+      ordinals(output) = rows(token)
+      output += 1
+      val following = token + 1
+      if following < keys.length && keys(following) == keys(token) then tokens(0) = following
+      else
+        heapSize -= 1
+        if heapSize > 0 then tokens(0) = tokens(heapSize)
+      if heapSize > 1 then siftRowsDown(tokens, 0, heapSize)
+
   def first(key: Int): Int =
     var low = 0
     var high = keys.length
@@ -229,6 +394,24 @@ final private class CompactSortedBackend(
   def close(): Unit =
     keys = Array.emptyIntArray
     rows = Array.emptyIntArray
+
+  private def siftRowsDown(tokens: Array[Int], root: Int, heapSize: Int): Unit =
+    var parent = root
+    var done = false
+    while !done do
+      val left = parent * 2 + 1
+      if left >= heapSize then done = true
+      else
+        val right = left + 1
+        val child =
+          if right < heapSize && rows(tokens(right)) < rows(tokens(left)) then right
+          else left
+        if rows(tokens(parent)) <= rows(tokens(child)) then done = true
+        else
+          val previous = tokens(parent)
+          tokens(parent) = tokens(child)
+          tokens(child) = previous
+          parent = child
 
 sealed private[frame4s] trait Int32OrdinalStore:
   def apply(position: Int): Int
@@ -427,6 +610,157 @@ final private class FlatHashRowsBackend(
     val next = slot + 1
     if next == rows.length then 0 else next
 
+/** One hash slot per distinct key, with contiguous overflow rows only for duplicate groups.
+  *
+  * Main-table tokens are strictly below bit 30. Overflow tokens set bit 30 and carry an overflow
+  * position in the lower bits. The final row in each overflow group also sets bit 30 in its stored
+  * ordinal. [[Int32SecondaryIndex.MaxRows]] is strictly below `2^30`, so neither tag can collide
+  * with a valid source ordinal; bit 31 remains available for the negative empty sentinel.
+  */
+final private class GroupedHashBackend(
+    private var keys: Array[Int],
+    private var entries: Array[Int],
+    private var duplicateStarts: Array[Int],
+    private var duplicateRows: Array[Int]
+) extends Int32IndexBackend:
+  import GroupedHashBackend.*
+
+  val ownedBytes: Long =
+    (
+      keys.length.toLong +
+        entries.length.toLong +
+        duplicateStarts.length.toLong +
+        duplicateRows.length.toLong
+    ) * 4L
+
+  def first(key: Int): Int =
+    if entries.isEmpty then Int32SecondaryIndex.MissingRow
+    else
+      var slot = SecondaryIndexHash.initialSlot(key, entries.length)
+      while entries(slot) >= 0 && keys(slot) != key do slot = following(slot)
+      if entries(slot) >= 0 then slot else Int32SecondaryIndex.MissingRow
+
+  def next(token: Int): Int =
+    if isOverflowToken(token) then
+      val position = payload(token)
+      if isLastOverflowRow(duplicateRows(position)) then Int32SecondaryIndex.MissingRow
+      else OverflowTag | (position + 1)
+    else
+      val entry = entries(token)
+      if !isDuplicateEntry(entry) then Int32SecondaryIndex.MissingRow
+      else
+        val position = duplicateStarts(payload(entry))
+        if isLastOverflowRow(duplicateRows(position)) then Int32SecondaryIndex.MissingRow
+        else OverflowTag | (position + 1)
+
+  def row(token: Int): Int =
+    if isOverflowToken(token) then payload(duplicateRows(payload(token)))
+    else
+      val entry = entries(token)
+      if isDuplicateEntry(entry) then payload(duplicateRows(duplicateStarts(payload(entry))))
+      else entry
+
+  def select(key: Int): Int32RowSelection =
+    val slot = first(key)
+    if slot < 0 then Int32RowSelection.empty
+    else
+      val entry = entries(slot)
+      if !isDuplicateEntry(entry) then Int32RowSelection.single(entry)
+      else
+        val start = duplicateStarts(payload(entry))
+        var end = start
+        while !isLastOverflowRow(duplicateRows(end)) do end += 1
+        val matches = end - start + 1
+        val ordinals = new Array[Int](matches)
+        var input = start
+        var output = 0
+        while input <= end do
+          ordinals(output) = payload(duplicateRows(input))
+          input += 1
+          output += 1
+        Int32RowSelection.fromOwned(ordinals)
+
+  def close(): Unit =
+    keys = Array.emptyIntArray
+    entries = Array.emptyIntArray
+    duplicateStarts = Array.emptyIntArray
+    duplicateRows = Array.emptyIntArray
+
+  private[frame4s] def addUnique(key: Int, row: Int): Unit =
+    val slot = emptySlot(key)
+    keys(slot) = key
+    entries(slot) = row
+
+  private[frame4s] def addDuplicateGroup(
+      key: Int,
+      group: Int,
+      sourceRows: Array[Int],
+      from: Int,
+      until: Int,
+      overflowStart: Int
+  ): Unit =
+    val slot = emptySlot(key)
+    keys(slot) = key
+    entries(slot) = OverflowTag | group
+    duplicateStarts(group) = overflowStart
+    var input = from
+    var output = overflowStart
+    while input < until do
+      val lastTag = if input + 1 == until then OverflowTag else 0
+      duplicateRows(output) = sourceRows(input) | lastTag
+      input += 1
+      output += 1
+
+  private def emptySlot(key: Int): Int =
+    var slot = SecondaryIndexHash.initialSlot(key, entries.length)
+    while entries(slot) >= 0 do slot = following(slot)
+    slot
+
+  private def following(slot: Int): Int =
+    val next = slot + 1
+    if next == entries.length then 0 else next
+
+private[frame4s] object GroupedHashBackend:
+  private val OverflowTag = 1 << 30
+  private val PayloadMask = OverflowTag - 1
+
+  private def isOverflowToken(token: Int): Boolean =
+    (token & OverflowTag) != 0
+
+  private def isDuplicateEntry(entry: Int): Boolean =
+    (entry & OverflowTag) != 0
+
+  private def isLastOverflowRow(row: Int): Boolean =
+    (row & OverflowTag) != 0
+
+  private def payload(value: Int): Int =
+    value & PayloadMask
+
+private[frame4s] enum SecondaryIndexBatchStrategy:
+  case Sort
+  case HeapMerge
+  case DominantMerge
+
+private[frame4s] object SecondaryIndexBatchStrategy:
+  private val MinimumMatches = 128
+  private val MinimumStreams = 4
+
+  def choose(
+      matches: Int,
+      streams: Int,
+      longestStream: Int,
+      workspace: Int,
+      balancedStrategy: SecondaryIndexBatchStrategy,
+      dominantStrategy: SecondaryIndexBatchStrategy
+  ): SecondaryIndexBatchStrategy =
+    val minorMatches = matches - longestStream
+    if matches < MinimumMatches then SecondaryIndexBatchStrategy.Sort
+    else if longestStream.toLong * 2L > matches.toLong && minorMatches <= workspace then
+      dominantStrategy
+    else if streams >= MinimumStreams && longestStream.toLong * 2L <= matches.toLong then
+      balancedStrategy
+    else SecondaryIndexBatchStrategy.Sort
+
 final private[frame4s] class Int32SecondaryIndex private (
     boundSources: ReferenceSources,
     val reference: SourceRef,
@@ -467,26 +801,55 @@ final private[frame4s] class Int32SecondaryIndex private (
         val distinct = queryKeys.clone()
         val distinctCount = compactDistinctSorted(distinct)
         var matches = 0
+        var streams = 0
+        var longestStream = 0
+        var longestStreamIndex = Int32SecondaryIndex.MissingRow
         var query = 0
         while query < distinctCount do
           var token = backend.first(distinct(query))
-          distinct(query) = token
+          val streamIndex = streams
+          if token >= 0 then
+            distinct(streamIndex) = token
+            streams += 1
+          var streamMatches = 0
           while token >= 0 do
             matches += 1
+            streamMatches += 1
             token = backend.next(token)
+          if streamMatches > longestStream then
+            longestStream = streamMatches
+            longestStreamIndex = streamIndex
           query += 1
 
         val ordinals = new Array[Int](matches)
-        var output = 0
-        query = 0
-        while query < distinctCount do
-          var token = distinct(query)
-          while token >= 0 do
-            ordinals(output) = backend.row(token)
-            output += 1
-            token = backend.next(token)
-          query += 1
-        Sorting.quickSort(ordinals)
+        SecondaryIndexBatchStrategy.choose(
+          matches,
+          streams,
+          longestStream,
+          distinct.length,
+          backend.balancedBatchStrategy,
+          backend.dominantBatchStrategy
+        ) match
+          case SecondaryIndexBatchStrategy.HeapMerge =>
+            backend.mergeBalancedStreams(distinct, streams, ordinals)
+          case SecondaryIndexBatchStrategy.DominantMerge =>
+            backend.mergeDominantStreams(
+              distinct,
+              streams,
+              longestStreamIndex,
+              ordinals
+            )
+          case SecondaryIndexBatchStrategy.Sort =>
+            var output = 0
+            query = 0
+            while query < streams do
+              var token = distinct(query)
+              while token >= 0 do
+                ordinals(output) = backend.row(token)
+                output += 1
+                token = backend.next(token)
+              query += 1
+            java.util.Arrays.sort(ordinals)
         Right(Int32RowSelection.fromOwned(ordinals))
 
   private[frame4s] def withView[A](
@@ -591,6 +954,16 @@ private[frame4s] object Int32SecondaryIndex:
                   )
                 case SecondaryIndexLayout.FlatHashRows =>
                   buildFlatHashRows(
+                    sources,
+                    reference,
+                    schema,
+                    columnIndex,
+                    batches,
+                    columns,
+                    rows.toInt
+                  )
+                case SecondaryIndexLayout.GroupedHash =>
+                  buildGroupedHash(
                     sources,
                     reference,
                     schema,
@@ -791,6 +1164,100 @@ private[frame4s] object Int32SecondaryIndex:
       case None =>
         backend.finishBuild()
         Right(index)
+
+  private def buildGroupedHash(
+      sources: ReferenceSources,
+      reference: SourceRef,
+      schema: Schema,
+      columnIndex: Int,
+      batches: Vector[RecordBatch],
+      columns: Vector[Int32Array],
+      rows: Int
+  ): Either[SecondaryIndexError, Int32SecondaryIndex] =
+    val indexedRows = columns.foldLeft(0): (total, column) =>
+      total + column.length - column.nullCount
+    val keys = new Array[Int](indexedRows)
+    val ordinals = new Array[Int](indexedRows)
+    var batchStart = 0
+    var output = 0
+    var batch = 0
+    var error: Option[SecondaryIndexError] = None
+    while batch < batches.length && error.isEmpty do
+      columns(batch)
+        .withBorrowedValueBytes: (bytes, valuesStart, validity, logicalOffset, length) =>
+          var row = 0
+          while row < length do
+            val absolute = logicalOffset + row
+            val valid = validity.forall: bitmap =>
+              ((bitmap(absolute >>> 3).toInt >>> (absolute & 7)) & 1) == 1
+            if valid then
+              keys(output) = readInt(bytes, valuesStart + absolute * 4)
+              ordinals(output) = batchStart + row
+              output += 1
+            row += 1
+        .left
+        .map(SecondaryIndexError.Storage.apply) match
+        case Left(value) => error = Some(value)
+        case Right(())   => ()
+      batchStart += batches(batch).rowCount
+      batch += 1
+
+    error match
+      case Some(value) => Left(value)
+      case None        =>
+        stableSignedRadixSort(keys, ordinals)
+        var distinctKeys = 0
+        var duplicateGroups = 0
+        var duplicateRows = 0
+        var from = 0
+        while from < keys.length do
+          val key = keys(from)
+          var until = from + 1
+          while until < keys.length && keys(until) == key do until += 1
+          distinctKeys += 1
+          if until - from > 1 then
+            duplicateGroups += 1
+            duplicateRows += until - from
+          from = until
+
+        val backend = new GroupedHashBackend(
+          new Array[Int](flatCapacityFor(distinctKeys)),
+          Array.fill(flatCapacityFor(distinctKeys))(MissingRow),
+          new Array[Int](duplicateGroups),
+          new Array[Int](duplicateRows)
+        )
+        var group = 0
+        var overflowStart = 0
+        from = 0
+        while from < keys.length do
+          val key = keys(from)
+          var until = from + 1
+          while until < keys.length && keys(until) == key do until += 1
+          if until - from == 1 then backend.addUnique(key, ordinals(from))
+          else
+            backend.addDuplicateGroup(
+              key,
+              group,
+              ordinals,
+              from,
+              until,
+              overflowStart
+            )
+            group += 1
+            overflowStart += until - from
+          from = until
+
+        Right(
+          new Int32SecondaryIndex(
+            sources,
+            reference,
+            schema,
+            columnIndex,
+            rows,
+            SecondaryIndexLayout.GroupedHash,
+            backend
+          )
+        )
 
   private def capacityFor(rows: Int): Int =
     val target = math.max(16L, (rows.toLong * 4L + 2L) / 3L)
