@@ -10,7 +10,8 @@ import scala.collection.mutable.ArrayBuffer
   */
 private[frame4s] object ColumnarInterpreter:
   def prepare(plan: LogicalPlan, sources: ReferenceSources): ColumnarExecution =
-    new ColumnarExecution(plan, sources, KernelPlan.classify(plan))
+    val normalized = PlanNormalizer.normalize(plan).plan
+    new ColumnarExecution(plan, sources, KernelPlan.classify(normalized))
 
   def prepareIndexed(
       plan: LogicalPlan,
@@ -243,11 +244,12 @@ final private case class RawInt32Vector(
     values: Array[Byte],
     validity: Option[Array[Byte]],
     logicalOffset: Int,
-    length: Int
+    length: Int,
+    valuesStart: Int = 0
 ) extends ColumnarVector:
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     checked(index).map: absolute =>
-      if isValid(index) then ScalarValue.Int32(readInt(values, absolute * 4))
+      if isValid(index) then ScalarValue.Int32(readInt(values, valuesStart + absolute * 4))
       else ScalarValue.Null
 
   def unsafeScalarHash(index: Int): Long =
@@ -260,21 +262,21 @@ final private case class RawInt32Vector(
     validity match
       case None =>
         while index < length do
-          hash = hash * 31L + readInt(values, (logicalOffset + index) * 4).toLong
+          hash = hash * 31L + readInt(values, valuesStart + (logicalOffset + index) * 4).toLong
           index += 1
       case Some(bytes) =>
         while index < length do
           val absolute = logicalOffset + index
           val valid = ((bytes(absolute >>> 3).toInt >>> (absolute & 7)) & 1) == 1
           val value =
-            if valid then readInt(values, absolute * 4).toLong
+            if valid then readInt(values, valuesStart + absolute * 4).toLong
             else ColumnarVector.NullHash
           hash = hash * 31L + value
           index += 1
     hash
 
   def unsafeIntValue(index: Int): Int =
-    readInt(values, (logicalOffset + index) * 4)
+    readInt(values, valuesStart + (logicalOffset + index) * 4)
 
   def unsafeValid(index: Int): Boolean = isValid(index)
 
@@ -350,20 +352,26 @@ final private case class RawInt64Vector(
     validity: Option[Array[Byte]],
     logicalOffset: Int,
     length: Int,
-    timestampUnit: Option[TimeUnit]
+    timestampUnit: Option[TimeUnit],
+    valuesStart: Int = 0
 ) extends ColumnarVector:
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     checked(index).map: absolute =>
       if isValid(index) then
-        val value = readLong(values, absolute * 8)
+        val value = readLong(values, valuesStart + absolute * 8)
         timestampUnit.fold[ScalarValue](ScalarValue.Int64(value))(ScalarValue.Timestamp(value, _))
       else ScalarValue.Null
 
   def unsafeScalarHash(index: Int): Long =
     if isValid(index) then
-      val value = readLong(values, (logicalOffset + index) * 8)
+      val value = readLong(values, valuesStart + (logicalOffset + index) * 8)
       timestampUnit.fold(value)(unit => value ^ unit.ordinal.toLong)
     else ColumnarVector.NullHash
+
+  def unsafeLongValue(index: Int): Long =
+    readLong(values, valuesStart + (logicalOffset + index) * 8)
+
+  def unsafeValid(index: Int): Boolean = isValid(index)
 
   private def checked(index: Int): Either[ExecutionError, Int] =
     if index < 0 || index >= length then
@@ -379,17 +387,27 @@ final private case class RawFloat32Vector(
     values: Array[Byte],
     validity: Option[Array[Byte]],
     logicalOffset: Int,
-    length: Int
+    length: Int,
+    valuesStart: Int = 0
 ) extends ColumnarVector:
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     checked(index).map: absolute =>
       if isValid(index) then
-        ScalarValue.Float32(java.lang.Float.intBitsToFloat(readInt(values, absolute * 4)))
+        ScalarValue.Float32(
+          java.lang.Float.intBitsToFloat(readInt(values, valuesStart + absolute * 4))
+        )
       else ScalarValue.Null
 
   def unsafeScalarHash(index: Int): Long =
-    if isValid(index) then readInt(values, (logicalOffset + index) * 4).toLong
+    if isValid(index) then readInt(values, valuesStart + (logicalOffset + index) * 4).toLong
     else ColumnarVector.NullHash
+
+  def unsafeFloatValue(index: Int): Float =
+    java.lang.Float.intBitsToFloat(
+      readInt(values, valuesStart + (logicalOffset + index) * 4)
+    )
+
+  def unsafeValid(index: Int): Boolean = isValid(index)
 
   private def checked(index: Int): Either[ExecutionError, Int] =
     if index < 0 || index >= length then
@@ -405,17 +423,23 @@ final private case class RawBooleanVector(
     values: Array[Byte],
     validity: Option[Array[Byte]],
     logicalOffset: Int,
-    length: Int
+    length: Int,
+    valuesStart: Int = 0
 ) extends ColumnarVector:
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     checked(index).map: absolute =>
-      if isValid(index) then ScalarValue.Bool(bit(values, absolute))
+      if isValid(index) then ScalarValue.Bool(bit(values, valuesStart * 8 + absolute))
       else ScalarValue.Null
 
   def unsafeScalarHash(index: Int): Long =
     if !isValid(index) then ColumnarVector.NullHash
-    else if bit(values, logicalOffset + index) then 1L
+    else if bit(values, valuesStart * 8 + logicalOffset + index) then 1L
     else 2L
+
+  def unsafeBooleanValue(index: Int): Boolean =
+    bit(values, valuesStart * 8 + logicalOffset + index)
+
+  def unsafeValid(index: Int): Boolean = isValid(index)
 
   private def checked(index: Int): Either[ExecutionError, Int] =
     if index < 0 || index >= length then
@@ -444,6 +468,8 @@ final private case class RawUtf8Vector(
     else ColumnarVector.NullHash
 
   def required: Boolean = validity.isEmpty
+
+  def unsafeValid(index: Int): Boolean = isValid(index)
 
   def unsafeByteHash(index: Int): Int =
     val absolute = logicalOffset + index
@@ -492,8 +518,23 @@ final private case class RawUtf8Vector(
     val (from, until) = unsafeBounds(absolute)
     java.util.Arrays.copyOfRange(values, valuesStart + from, valuesStart + until)
 
+  def unsafeCopyBytes(index: Int, target: Array[Byte], targetOffset: Int): Int =
+    val absolute = logicalOffset + index
+    val (from, until) = unsafeBounds(absolute)
+    val length = until - from
+    System.arraycopy(values, valuesStart + from, target, targetOffset, length)
+    length
+
   def unsafeStringValue(index: Int): String =
     decode(logicalOffset + index)
+
+  def unsafeByteLength(index: Int): Int =
+    val (from, until) = unsafeBounds(logicalOffset + index)
+    until - from
+
+  def unsafeByte(index: Int, byteIndex: Int): Int =
+    val (from, _) = unsafeBounds(logicalOffset + index)
+    values(valuesStart + from + byteIndex) & 0xff
 
   private def checked(index: Int): Either[ExecutionError, Int] =
     if index < 0 || index >= length then
@@ -583,6 +624,22 @@ final private case class Int32Values(values: Array[Int]) extends ColumnarVector:
 
   def unsafeScalarHash(index: Int): Long = values(index).toLong
 
+final private case class NullableInt32Values(
+    values: Array[Int],
+    valid: Array[Boolean]
+) extends ColumnarVector:
+  val length: Int = values.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if valid(index) then Right(ScalarValue.Int32(values(index)))
+    else Right(ScalarValue.Null)
+
+  def unsafeScalarHash(index: Int): Long =
+    if valid(index) then values(index).toLong
+    else ColumnarVector.NullHash
+
 final private case class Int64Values(values: Array[Long]) extends ColumnarVector:
   val length: Int = values.length
 
@@ -592,6 +649,55 @@ final private case class Int64Values(values: Array[Long]) extends ColumnarVector
     else Right(ScalarValue.Int64(values(index)))
 
   def unsafeScalarHash(index: Int): Long = values(index)
+
+final private case class NullableInt64Values(
+    values: Array[Long],
+    valid: Array[Boolean]
+) extends ColumnarVector:
+  val length: Int = values.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if valid(index) then Right(ScalarValue.Int64(values(index)))
+    else Right(ScalarValue.Null)
+
+  def unsafeScalarHash(index: Int): Long =
+    if valid(index) then values(index)
+    else ColumnarVector.NullHash
+
+final private case class Float32Values(
+    values: Array[Float],
+    valid: Array[Boolean]
+) extends ColumnarVector:
+  val length: Int = values.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if valid(index) then Right(ScalarValue.Float32(values(index)))
+    else Right(ScalarValue.Null)
+
+  def unsafeScalarHash(index: Int): Long =
+    if valid(index) then java.lang.Float.floatToRawIntBits(values(index)).toLong
+    else ColumnarVector.NullHash
+
+final private case class TimestampValues(
+    values: Array[Long],
+    valid: Array[Boolean],
+    unit: TimeUnit
+) extends ColumnarVector:
+  val length: Int = values.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if valid(index) then Right(ScalarValue.Timestamp(values(index), unit))
+    else Right(ScalarValue.Null)
+
+  def unsafeScalarHash(index: Int): Long =
+    if valid(index) then values(index) ^ unit.ordinal.toLong
+    else ColumnarVector.NullHash
 
 final private case class Float64Values(
     values: Array[Double],
@@ -609,6 +715,23 @@ final private case class Float64Values(
     if valid(index) then java.lang.Double.doubleToRawLongBits(values(index))
     else ColumnarVector.NullHash
 
+final private case class BooleanValues(
+    values: Array[Boolean],
+    valid: Array[Boolean]
+) extends ColumnarVector:
+  val length: Int = values.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if valid(index) then Right(ScalarValue.Bool(values(index)))
+    else Right(ScalarValue.Null)
+
+  def unsafeScalarHash(index: Int): Long =
+    if !valid(index) then ColumnarVector.NullHash
+    else if values(index) then 1L
+    else 2L
+
 final private case class Utf8Values(values: Array[String]) extends ColumnarVector:
   val length: Int = values.length
 
@@ -618,6 +741,22 @@ final private case class Utf8Values(values: Array[String]) extends ColumnarVecto
     else Right(ScalarValue.Utf8(values(index)))
 
   def unsafeScalarHash(index: Int): Long = values(index).hashCode.toLong
+
+final private case class NullableUtf8Values(
+    values: Array[String],
+    valid: Array[Boolean]
+) extends ColumnarVector:
+  val length: Int = values.length
+
+  def scalar(index: Int): Either[ExecutionError, ScalarValue] =
+    if index < 0 || index >= length then
+      Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
+    else if valid(index) then Right(ScalarValue.Utf8(values(index)))
+    else Right(ScalarValue.Null)
+
+  def unsafeScalarHash(index: Int): Long =
+    if valid(index) then values(index).hashCode.toLong
+    else ColumnarVector.NullHash
 
 final private case class SelectedVector(
     input: ColumnarVector,
@@ -694,8 +833,208 @@ final private case class RawDictionaryVector(
     if !indices.unsafeValid(index) then ColumnarVector.NullHash
     else dictionary.unsafeScalarHash(indices.unsafeIntValue(index))
 
+private enum ColumnBorrowError:
+  case Storage(error: StorageError)
+  case Residual(reason: String)
+
 private object ColumnarVector:
   val NullHash = 0x61c8864680b583ebL
+
+  /** Nest buffer read scopes so a multi-column eager kernel can read without cloning its inputs.
+    *
+    * The callback must produce detached output. No returned value may retain a borrowed vector or
+    * its backing arrays.
+    */
+  def withBorrowedColumns[A](
+      batch: RecordBatch,
+      indices: Vector[Int]
+  )(
+      operation: Array[ColumnarVector] => A
+  ): Either[ColumnBorrowError, A] =
+    val vectors = new Array[ColumnarVector](indices.length)
+
+    def loop(position: Int): Either[ColumnBorrowError, A] =
+      if position == indices.length then Right(operation(vectors))
+      else
+        val index = indices(position)
+        batch.columns.lift(index) match
+          case None =>
+            Left(
+              ColumnBorrowError.Residual(
+                s"columnar input $index is outside a ${batch.columns.length}-column batch"
+              )
+            )
+          case Some(column) =>
+            withBorrowed(column): vector =>
+              vectors(position) = vector
+              loop(position + 1)
+
+    loop(0)
+
+  private def withBorrowed[A](
+      column: ColumnArray
+  )(
+      operation: ColumnarVector => Either[ColumnBorrowError, A]
+  ): Either[ColumnBorrowError, A] =
+    def scoped(
+        result: Either[StorageError, Either[ColumnBorrowError, A]]
+    ): Either[ColumnBorrowError, A] =
+      result.left
+        .map(ColumnBorrowError.Storage.apply)
+        .flatMap(identity)
+
+    column match
+      case value: Int32Array =>
+        scoped:
+          value.withBorrowedValueBytes: (bytes, start, validity, logicalOffset, length) =>
+            operation(RawInt32Vector(bytes, validity, logicalOffset, length, start))
+      case value: Int64Array =>
+        scoped:
+          value.withBorrowedValueBytes: (bytes, start, validity, logicalOffset, length) =>
+            operation(RawInt64Vector(bytes, validity, logicalOffset, length, None, start))
+      case value: TimestampArray =>
+        scoped:
+          value.withBorrowedValueBytes: (bytes, start, validity, logicalOffset, length) =>
+            operation(
+              RawInt64Vector(bytes, validity, logicalOffset, length, Some(value.unit), start)
+            )
+      case value: Float32Array =>
+        scoped:
+          value.withBorrowedValueBytes: (bytes, start, validity, logicalOffset, length) =>
+            operation(RawFloat32Vector(bytes, validity, logicalOffset, length, start))
+      case value: Float64Array =>
+        scoped:
+          value.withBorrowedValueBytes: (bytes, start, validity, logicalOffset, length) =>
+            operation(RawFloat64Vector(bytes, validity, logicalOffset, length, start))
+      case value: BooleanArray =>
+        scoped:
+          value.withBorrowedValueBytes: (bytes, start, validity, logicalOffset, length) =>
+            operation(RawBooleanVector(bytes, validity, logicalOffset, length, start))
+      case value: Utf8Array =>
+        scoped:
+          value.withBorrowedUtf8BytesAndValidity:
+            (
+                offsets,
+                offsetsStart,
+                bytes,
+                valuesStart,
+                validity,
+                logicalOffset,
+                length
+            ) =>
+              operation(
+                RawUtf8Vector(
+                  offsets,
+                  bytes,
+                  validity,
+                  logicalOffset,
+                  length,
+                  offsetsStart,
+                  valuesStart
+                )
+              )
+      case other =>
+        Left(
+          ColumnBorrowError.Residual(
+            s"unsupported borrowed ${other.dataType} encoding ${other.encoding}"
+          )
+        )
+
+  def compact(
+      input: ColumnarVector,
+      field: Field,
+      selected: Array[Int]
+  ): Either[String, ColumnarVector] = input match
+    case values: RawInt32Vector if field.dataType == DataType.Int32 =>
+      val output = new Array[Int](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length do
+        valid(row) = values.unsafeValid(selected(row))
+        if valid(row) then output(row) = values.unsafeIntValue(selected(row))
+        row += 1
+      if field.nullable then Right(NullableInt32Values(output, valid))
+      else Right(Int32Values(output))
+    case values: RawInt64Vector if field.dataType == DataType.Int64 =>
+      val output = new Array[Long](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length do
+        valid(row) = values.unsafeValid(selected(row))
+        if valid(row) then output(row) = values.unsafeLongValue(selected(row))
+        row += 1
+      if field.nullable then Right(NullableInt64Values(output, valid))
+      else Right(Int64Values(output))
+    case values: RawInt64Vector =>
+      field.dataType match
+        case DataType.Timestamp(unit) if values.timestampUnit.contains(unit) =>
+          val output = new Array[Long](selected.length)
+          val valid = new Array[Boolean](selected.length)
+          var row = 0
+          while row < selected.length do
+            valid(row) = values.unsafeValid(selected(row))
+            if valid(row) then output(row) = values.unsafeLongValue(selected(row))
+            row += 1
+          Right(TimestampValues(output, valid, unit))
+        case _ => Left(s"cannot compact Int64 input as ${field.dataType}")
+    case values: RawFloat32Vector if field.dataType == DataType.Float32 =>
+      val output = new Array[Float](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length do
+        valid(row) = values.unsafeValid(selected(row))
+        if valid(row) then output(row) = values.unsafeFloatValue(selected(row))
+        row += 1
+      Right(Float32Values(output, valid))
+    case values: RawFloat64Vector if field.dataType == DataType.Float64 =>
+      val output = new Array[Double](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length do
+        valid(row) = values.unsafeValid(selected(row))
+        if valid(row) then output(row) = values.unsafeDoubleValue(selected(row))
+        row += 1
+      Right(Float64Values(output, valid))
+    case values: RawBooleanVector if field.dataType == DataType.Bool =>
+      val output = new Array[Boolean](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length do
+        valid(row) = values.unsafeValid(selected(row))
+        if valid(row) then output(row) = values.unsafeBooleanValue(selected(row))
+        row += 1
+      Right(BooleanValues(output, valid))
+    case values: RawUtf8Vector if field.dataType == DataType.Utf8 =>
+      Right(compactUtf8(values, field.nullable, selected))
+    case other =>
+      Left(s"cannot compact ${other.getClass.getSimpleName} as ${field.dataType}")
+
+  private def compactUtf8(
+      input: RawUtf8Vector,
+      nullable: Boolean,
+      selected: Array[Int]
+  ): RawUtf8Vector =
+    var valueBytes = 0
+    var row = 0
+    while row < selected.length do
+      if input.unsafeValid(selected(row)) then valueBytes += input.unsafeByteLength(selected(row))
+      row += 1
+    val offsets = new Array[Byte]((selected.length + 1) * 4)
+    val values = new Array[Byte](valueBytes)
+    val validity =
+      if nullable then Some(new Array[Byte]((selected.length + 7) >>> 3))
+      else None
+    var cursor = 0
+    row = 0
+    while row < selected.length do
+      val source = selected(row)
+      writeInt(offsets, row * 4, cursor)
+      if input.unsafeValid(source) then
+        validity.foreach(bytes => setBit(bytes, row))
+        cursor += input.unsafeCopyBytes(source, values, cursor)
+      row += 1
+    writeInt(offsets, selected.length * 4, cursor)
+    RawUtf8Vector(offsets, values, validity, logicalOffset = 0, length = selected.length)
 
   def copy(column: ColumnArray): Either[String, ColumnarVector] =
     column match
@@ -792,6 +1131,1063 @@ private object ColumnarVector:
     case ScalarValue.Utf8(actual)            => actual.hashCode.toLong
     case ScalarValue.Timestamp(actual, unit) => actual ^ unit.ordinal.toLong
 
+final private class PrimitiveEvalContext:
+  var error: Option[ExecutionError] = None
+
+  def failed: Boolean = error.nonEmpty
+
+sealed private trait NullablePrimitiveExpression:
+  def valid: Boolean
+  def bind(columns: Array[ColumnarVector]): Option[String]
+  def inputIndices: Vector[Int]
+
+sealed abstract private class Int32PrimitiveExpression extends NullablePrimitiveExpression:
+  var valid: Boolean = false
+  var value: Int = 0
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit
+
+final private case class Int32ColumnExpression(index: Int) extends Int32PrimitiveExpression:
+  private var column: Option[RawInt32Vector] = None
+  val inputIndices = Vector(index)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    columns.lift(index) match
+      case Some(value: RawInt32Vector) =>
+        column = Some(value)
+        None
+      case _ => Some(s"expression input $index is not plain ${DataType.Int32}")
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    column match
+      case Some(actual) =>
+        valid = actual.unsafeValid(row)
+        if valid then value = actual.unsafeIntValue(row)
+      case None => valid = false
+
+final private case class Int32LiteralExpression(literal: Option[Int])
+    extends Int32PrimitiveExpression:
+  val inputIndices = Vector.empty
+  def bind(columns: Array[ColumnarVector]): Option[String] = None
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    valid = literal.nonEmpty
+    literal.foreach(actual => value = actual)
+
+final private case class Int32UnaryExpression(
+    id: ExprId,
+    operator: UnaryOperator,
+    input: Int32PrimitiveExpression
+) extends Int32PrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input.evaluate(row, columns, context)
+    valid = input.valid
+    if valid && !context.failed then
+      operator match
+        case UnaryOperator.Negate =>
+          if input.value == Int.MinValue then
+            context.error = Some(ExecutionError.IntegerOverflow(id, BinaryOperator.Subtract))
+            valid = false
+          else value = -input.value
+        case _ =>
+          valid = false
+
+final private case class Int32BinaryExpression(
+    id: ExprId,
+    operator: BinaryOperator,
+    left: Int32PrimitiveExpression,
+    right: Int32PrimitiveExpression
+) extends Int32PrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    valid = left.valid && right.valid && !context.failed
+    if valid then
+      try
+        value = operator match
+          case BinaryOperator.Add      => Math.addExact(left.value, right.value)
+          case BinaryOperator.Subtract => Math.subtractExact(left.value, right.value)
+          case BinaryOperator.Multiply => Math.multiplyExact(left.value, right.value)
+          case _                       => left.value
+      catch
+        case _: ArithmeticException =>
+          context.error = Some(ExecutionError.IntegerOverflow(id, operator))
+          valid = false
+
+sealed abstract private class Int64PrimitiveExpression extends NullablePrimitiveExpression:
+  var valid: Boolean = false
+  var value: Long = 0L
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit
+
+final private case class Int64ColumnExpression(index: Int) extends Int64PrimitiveExpression:
+  private var column: Option[RawInt64Vector] = None
+  val inputIndices = Vector(index)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    columns.lift(index) match
+      case Some(value: RawInt64Vector) =>
+        column = Some(value)
+        None
+      case _ => Some(s"expression input $index is not plain ${DataType.Int64}")
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    column match
+      case Some(actual) =>
+        valid = actual.unsafeValid(row)
+        if valid then value = actual.unsafeLongValue(row)
+      case None => valid = false
+
+final private case class Int64LiteralExpression(literal: Option[Long])
+    extends Int64PrimitiveExpression:
+  val inputIndices = Vector.empty
+  def bind(columns: Array[ColumnarVector]): Option[String] = None
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    valid = literal.nonEmpty
+    literal.foreach(actual => value = actual)
+
+final private case class Int64UnaryExpression(
+    id: ExprId,
+    operator: UnaryOperator,
+    input: Int64PrimitiveExpression
+) extends Int64PrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input.evaluate(row, columns, context)
+    valid = input.valid
+    if valid && !context.failed then
+      operator match
+        case UnaryOperator.Negate =>
+          if input.value == Long.MinValue then
+            context.error = Some(ExecutionError.IntegerOverflow(id, BinaryOperator.Subtract))
+            valid = false
+          else value = -input.value
+        case _ =>
+          valid = false
+
+final private case class Int64BinaryExpression(
+    id: ExprId,
+    operator: BinaryOperator,
+    left: Int64PrimitiveExpression,
+    right: Int64PrimitiveExpression
+) extends Int64PrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    valid = left.valid && right.valid && !context.failed
+    if valid then
+      try
+        value = operator match
+          case BinaryOperator.Add      => Math.addExact(left.value, right.value)
+          case BinaryOperator.Subtract => Math.subtractExact(left.value, right.value)
+          case BinaryOperator.Multiply => Math.multiplyExact(left.value, right.value)
+          case _                       => left.value
+      catch
+        case _: ArithmeticException =>
+          context.error = Some(ExecutionError.IntegerOverflow(id, operator))
+          valid = false
+
+sealed abstract private class Float32PrimitiveExpression extends NullablePrimitiveExpression:
+  var valid: Boolean = false
+  var value: Float = 0.0f
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit
+
+final private case class Float32ColumnExpression(index: Int) extends Float32PrimitiveExpression:
+  private var column: Option[RawFloat32Vector] = None
+  val inputIndices = Vector(index)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    columns.lift(index) match
+      case Some(value: RawFloat32Vector) =>
+        column = Some(value)
+        None
+      case _ => Some(s"expression input $index is not plain ${DataType.Float32}")
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    column match
+      case Some(actual) =>
+        valid = actual.unsafeValid(row)
+        if valid then value = actual.unsafeFloatValue(row)
+      case None => valid = false
+
+final private case class Float32LiteralExpression(literal: Option[Float])
+    extends Float32PrimitiveExpression:
+  val inputIndices = Vector.empty
+  def bind(columns: Array[ColumnarVector]): Option[String] = None
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    valid = literal.nonEmpty
+    literal.foreach(actual => value = actual)
+
+final private case class Float32UnaryExpression(
+    operator: UnaryOperator,
+    input: Float32PrimitiveExpression
+) extends Float32PrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input.evaluate(row, columns, context)
+    valid = input.valid
+    if valid then
+      value = operator match
+        case UnaryOperator.Negate => -input.value
+        case UnaryOperator.Sqrt   => math.sqrt(input.value.toDouble).toFloat
+        case _                    => input.value
+
+final private case class Float32BinaryExpression(
+    operator: BinaryOperator,
+    left: Float32PrimitiveExpression,
+    right: Float32PrimitiveExpression
+) extends Float32PrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    valid = left.valid && right.valid && !context.failed
+    if valid then
+      value = operator match
+        case BinaryOperator.Add      => left.value + right.value
+        case BinaryOperator.Subtract => left.value - right.value
+        case BinaryOperator.Multiply => left.value * right.value
+        case BinaryOperator.Divide   => left.value / right.value
+        case _                       => left.value
+
+sealed abstract private class Float64PrimitiveExpression extends NullablePrimitiveExpression:
+  var valid: Boolean = false
+  var value: Double = 0.0
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit
+
+final private case class Float64ColumnExpression(index: Int) extends Float64PrimitiveExpression:
+  private var column: Option[RawFloat64Vector] = None
+  val inputIndices = Vector(index)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    columns.lift(index) match
+      case Some(value: RawFloat64Vector) =>
+        column = Some(value)
+        None
+      case _ => Some(s"expression input $index is not plain ${DataType.Float64}")
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    column match
+      case Some(actual) =>
+        valid = actual.unsafeValid(row)
+        if valid then value = actual.unsafeDoubleValue(row)
+      case None => valid = false
+
+final private case class Float64LiteralExpression(literal: Option[Double])
+    extends Float64PrimitiveExpression:
+  val inputIndices = Vector.empty
+  def bind(columns: Array[ColumnarVector]): Option[String] = None
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    valid = literal.nonEmpty
+    literal.foreach(actual => value = actual)
+
+final private case class Float64UnaryExpression(
+    operator: UnaryOperator,
+    input: Float64PrimitiveExpression
+) extends Float64PrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input.evaluate(row, columns, context)
+    valid = input.valid
+    if valid then
+      value = operator match
+        case UnaryOperator.Negate => -input.value
+        case UnaryOperator.Sqrt   => math.sqrt(input.value)
+        case _                    => input.value
+
+final private case class Float64BinaryExpression(
+    operator: BinaryOperator,
+    left: Float64PrimitiveExpression,
+    right: Float64PrimitiveExpression
+) extends Float64PrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    valid = left.valid && right.valid && !context.failed
+    if valid then
+      value = operator match
+        case BinaryOperator.Add      => left.value + right.value
+        case BinaryOperator.Subtract => left.value - right.value
+        case BinaryOperator.Multiply => left.value * right.value
+        case BinaryOperator.Divide   => left.value / right.value
+        case _                       => left.value
+
+sealed abstract private class Utf8PrimitiveExpression extends NullablePrimitiveExpression:
+  var valid: Boolean = false
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit
+  def byteLength: Int
+  def byteAt(index: Int): Int
+  def stringValue: String
+
+final private case class Utf8ColumnExpression(index: Int) extends Utf8PrimitiveExpression:
+  private var column: Option[RawUtf8Vector] = None
+  private var row: Int = 0
+  val inputIndices = Vector(index)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    columns.lift(index) match
+      case Some(value: RawUtf8Vector) =>
+        column = Some(value)
+        None
+      case _ => Some(s"expression input $index is not plain ${DataType.Utf8}")
+
+  def evaluate(
+      actualRow: Int,
+      columns: Array[ColumnarVector],
+      context: PrimitiveEvalContext
+  ): Unit =
+    row = actualRow
+    valid = column.exists(_.unsafeValid(actualRow))
+
+  def byteLength: Int = column.fold(0)(_.unsafeByteLength(row))
+
+  def byteAt(index: Int): Int = column.fold(0)(_.unsafeByte(row, index))
+
+  def stringValue: String = column.fold("")(_.unsafeStringValue(row))
+
+final private case class Utf8LiteralExpression(literal: Option[String])
+    extends Utf8PrimitiveExpression:
+  private val bytes = literal.fold(Array.emptyByteArray)(_.getBytes("UTF-8"))
+  val inputIndices = Vector.empty
+
+  def bind(columns: Array[ColumnarVector]): Option[String] = None
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    valid = literal.nonEmpty
+
+  def byteLength: Int = bytes.length
+
+  def byteAt(index: Int): Int = bytes(index) & 0xff
+
+  def stringValue: String = literal.getOrElse("")
+
+sealed abstract private class BooleanPrimitiveExpression extends NullablePrimitiveExpression:
+  var valid: Boolean = false
+  var value: Boolean = false
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit
+
+final private case class BooleanColumnExpression(index: Int) extends BooleanPrimitiveExpression:
+  private var column: Option[RawBooleanVector] = None
+  val inputIndices = Vector(index)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    columns.lift(index) match
+      case Some(value: RawBooleanVector) =>
+        column = Some(value)
+        None
+      case _ => Some(s"expression input $index is not plain ${DataType.Bool}")
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    column match
+      case Some(actual) =>
+        valid = actual.unsafeValid(row)
+        if valid then value = actual.unsafeBooleanValue(row)
+      case None => valid = false
+
+final private case class BooleanLiteralExpression(literal: Option[Boolean])
+    extends BooleanPrimitiveExpression:
+  val inputIndices = Vector.empty
+  def bind(columns: Array[ColumnarVector]): Option[String] = None
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    valid = literal.nonEmpty
+    literal.foreach(actual => value = actual)
+
+final private case class IsNullExpression(input: NullablePrimitiveExpression)
+    extends BooleanPrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input match
+      case value: Int32PrimitiveExpression   => value.evaluate(row, columns, context)
+      case value: Int64PrimitiveExpression   => value.evaluate(row, columns, context)
+      case value: Float32PrimitiveExpression => value.evaluate(row, columns, context)
+      case value: Float64PrimitiveExpression => value.evaluate(row, columns, context)
+      case value: Utf8PrimitiveExpression    => value.evaluate(row, columns, context)
+      case value: BooleanPrimitiveExpression => value.evaluate(row, columns, context)
+    valid = true
+    value = !input.valid
+
+final private case class IsTrueExpression(input: BooleanPrimitiveExpression)
+    extends BooleanPrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input.evaluate(row, columns, context)
+    valid = true
+    value = input.valid && input.value
+
+final private case class BooleanLogicExpression(
+    operator: BinaryOperator,
+    left: BooleanPrimitiveExpression,
+    right: BooleanPrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if context.failed then valid = false
+    else
+      operator match
+        case BinaryOperator.And =>
+          if (left.valid && !left.value) || (right.valid && !right.value) then
+            valid = true
+            value = false
+          else if left.valid && right.valid then
+            valid = true
+            value = true
+          else valid = false
+        case BinaryOperator.Or =>
+          if (left.valid && left.value) || (right.valid && right.value) then
+            valid = true
+            value = true
+          else if left.valid && right.valid then
+            valid = true
+            value = false
+          else valid = false
+        case _ => valid = false
+
+final private case class Int32ComparisonExpression(
+    operator: BinaryOperator,
+    left: Int32PrimitiveExpression,
+    right: Int32PrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if operator == BinaryOperator.NullSafeEqual then
+      valid = true
+      value =
+        if !left.valid then !right.valid
+        else right.valid && left.value == right.value
+    else
+      valid = left.valid && right.valid && !context.failed
+      if valid then
+        val compared = left.value.compare(right.value)
+        value = PrimitiveExpression.comparison(operator, compared, equal = compared == 0)
+
+final private case class Int64ComparisonExpression(
+    operator: BinaryOperator,
+    left: Int64PrimitiveExpression,
+    right: Int64PrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if operator == BinaryOperator.NullSafeEqual then
+      valid = true
+      value =
+        if !left.valid then !right.valid
+        else right.valid && left.value == right.value
+    else
+      valid = left.valid && right.valid && !context.failed
+      if valid then
+        val compared = left.value.compare(right.value)
+        value = PrimitiveExpression.comparison(operator, compared, equal = compared == 0)
+
+final private case class Float32ComparisonExpression(
+    operator: BinaryOperator,
+    left: Float32PrimitiveExpression,
+    right: Float32PrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if operator == BinaryOperator.NullSafeEqual then
+      valid = true
+      value =
+        if !left.valid then !right.valid
+        else right.valid && PrimitiveExpression.floatEqual(left.value, right.value)
+    else
+      valid = left.valid && right.valid && !context.failed
+      if valid then
+        val compared = PrimitiveExpression.compareFloat(left.value, right.value)
+        value = PrimitiveExpression.comparison(
+          operator,
+          compared,
+          PrimitiveExpression.floatEqual(left.value, right.value)
+        )
+
+final private case class Float64ComparisonExpression(
+    operator: BinaryOperator,
+    left: Float64PrimitiveExpression,
+    right: Float64PrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if operator == BinaryOperator.NullSafeEqual then
+      valid = true
+      value =
+        if !left.valid then !right.valid
+        else right.valid && PrimitiveExpression.floatEqual(left.value, right.value)
+    else
+      valid = left.valid && right.valid && !context.failed
+      if valid then
+        val compared = PrimitiveExpression.compareFloat(left.value, right.value)
+        value = PrimitiveExpression.comparison(
+          operator,
+          compared,
+          PrimitiveExpression.floatEqual(left.value, right.value)
+        )
+
+final private case class Utf8ComparisonExpression(
+    operator: BinaryOperator,
+    left: Utf8PrimitiveExpression,
+    right: Utf8PrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if operator == BinaryOperator.NullSafeEqual then
+      valid = true
+      value =
+        if !left.valid then !right.valid
+        else right.valid && PrimitiveExpression.equalUtf8(left, right)
+    else
+      valid = left.valid && right.valid && !context.failed
+      if valid then
+        val compared = PrimitiveExpression.compareUtf8(left, right)
+        value = PrimitiveExpression.comparison(operator, compared, equal = compared == 0)
+
+private enum PrimitiveProjection:
+  case Direct(index: Int)
+  case Int32Value(expression: Int32PrimitiveExpression)
+  case Int64Value(expression: Int64PrimitiveExpression)
+  case Float32Value(expression: Float32PrimitiveExpression)
+  case Float64Value(expression: Float64PrimitiveExpression)
+  case Utf8Value(expression: Utf8PrimitiveExpression)
+  case BooleanValue(expression: BooleanPrimitiveExpression)
+
+  def bind(columns: Array[ColumnarVector]): Option[String] = this match
+    case Direct(_)                => None
+    case Int32Value(expression)   => expression.bind(columns)
+    case Int64Value(expression)   => expression.bind(columns)
+    case Float32Value(expression) => expression.bind(columns)
+    case Float64Value(expression) => expression.bind(columns)
+    case Utf8Value(expression)    => expression.bind(columns)
+    case BooleanValue(expression) => expression.bind(columns)
+
+  def inputIndices: Vector[Int] = this match
+    case Direct(_)                => Vector.empty
+    case Int32Value(expression)   => expression.inputIndices
+    case Int64Value(expression)   => expression.inputIndices
+    case Float32Value(expression) => expression.inputIndices
+    case Float64Value(expression) => expression.inputIndices
+    case Utf8Value(expression)    => expression.inputIndices
+    case BooleanValue(expression) => expression.inputIndices
+
+private object PrimitiveExpression:
+  def compileProjection(expression: ResolvedExpr): Option[PrimitiveProjection] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index) =>
+        Some(PrimitiveProjection.Direct(index))
+      case _ =>
+        expression.dataType match
+          case DataType.Int32 => compileInt32(expression).map(PrimitiveProjection.Int32Value.apply)
+          case DataType.Int64 => compileInt64(expression).map(PrimitiveProjection.Int64Value.apply)
+          case DataType.Float32 =>
+            compileFloat32(expression).map(PrimitiveProjection.Float32Value.apply)
+          case DataType.Float64 =>
+            compileFloat64(expression).map(PrimitiveProjection.Float64Value.apply)
+          case DataType.Utf8 =>
+            compileUtf8(expression).map(PrimitiveProjection.Utf8Value.apply)
+          case DataType.Bool =>
+            compileBoolean(expression).map(PrimitiveProjection.BooleanValue.apply)
+          case _ => None
+
+  def compileBoolean(expression: ResolvedExpr): Option[BooleanPrimitiveExpression] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index)
+          if expression.dataType == DataType.Bool =>
+        Some(BooleanColumnExpression(index))
+      case ExprNode.Literal(LiteralValue.Bool(value)) =>
+        Some(BooleanLiteralExpression(Some(value)))
+      case ExprNode.Literal(LiteralValue.Null(DataType.Bool)) =>
+        Some(BooleanLiteralExpression(None))
+      case ExprNode.Unary(UnaryOperator.IsTrue, input) =>
+        compileBoolean(input).map(IsTrueExpression.apply)
+      case ExprNode.Unary(UnaryOperator.IsNull, input) =>
+        compileNullable(input).map(IsNullExpression.apply)
+      case ExprNode.Binary(operator @ (BinaryOperator.And | BinaryOperator.Or), left, right) =>
+        for
+          lhs <- compileBoolean(left)
+          rhs <- compileBoolean(right)
+        yield BooleanLogicExpression(operator, lhs, rhs)
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+              BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual |
+              BinaryOperator.GreaterThan | BinaryOperator.GreaterThanOrEqual
+            ),
+            left,
+            right
+          ) if left.dataType == DataType.Int32 && right.dataType == DataType.Int32 =>
+        for
+          lhs <- compileInt32(left)
+          rhs <- compileInt32(right)
+        yield Int32ComparisonExpression(operator, lhs, rhs)
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+              BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual |
+              BinaryOperator.GreaterThan | BinaryOperator.GreaterThanOrEqual
+            ),
+            left,
+            right
+          ) if left.dataType == DataType.Int64 && right.dataType == DataType.Int64 =>
+        for
+          lhs <- compileInt64(left)
+          rhs <- compileInt64(right)
+        yield Int64ComparisonExpression(operator, lhs, rhs)
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+              BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual |
+              BinaryOperator.GreaterThan | BinaryOperator.GreaterThanOrEqual
+            ),
+            left,
+            right
+          ) if left.dataType == DataType.Float32 && right.dataType == DataType.Float32 =>
+        for
+          lhs <- compileFloat32(left)
+          rhs <- compileFloat32(right)
+        yield Float32ComparisonExpression(operator, lhs, rhs)
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+              BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual |
+              BinaryOperator.GreaterThan | BinaryOperator.GreaterThanOrEqual
+            ),
+            left,
+            right
+          ) if left.dataType == DataType.Float64 && right.dataType == DataType.Float64 =>
+        for
+          lhs <- compileFloat64(left)
+          rhs <- compileFloat64(right)
+        yield Float64ComparisonExpression(operator, lhs, rhs)
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+              BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual |
+              BinaryOperator.GreaterThan | BinaryOperator.GreaterThanOrEqual
+            ),
+            left,
+            right
+          ) if left.dataType == DataType.Utf8 && right.dataType == DataType.Utf8 =>
+        for
+          lhs <- compileUtf8(left)
+          rhs <- compileUtf8(right)
+        yield Utf8ComparisonExpression(operator, lhs, rhs)
+      case _ => None
+
+  private def compileNullable(expression: ResolvedExpr): Option[NullablePrimitiveExpression] =
+    expression.dataType match
+      case DataType.Int32   => compileInt32(expression)
+      case DataType.Int64   => compileInt64(expression)
+      case DataType.Float32 => compileFloat32(expression)
+      case DataType.Float64 => compileFloat64(expression)
+      case DataType.Utf8    => compileUtf8(expression)
+      case DataType.Bool    => compileBoolean(expression)
+      case _                => None
+
+  private def compileInt32(expression: ResolvedExpr): Option[Int32PrimitiveExpression] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index)
+          if expression.dataType == DataType.Int32 =>
+        Some(Int32ColumnExpression(index))
+      case ExprNode.Literal(LiteralValue.Int32(value)) =>
+        Some(Int32LiteralExpression(Some(value)))
+      case ExprNode.Literal(LiteralValue.Null(DataType.Int32)) =>
+        Some(Int32LiteralExpression(None))
+      case ExprNode.Unary(UnaryOperator.Negate, input) =>
+        compileInt32(input).map(Int32UnaryExpression(expression.id, UnaryOperator.Negate, _))
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Add | BinaryOperator.Subtract | BinaryOperator.Multiply
+            ),
+            left,
+            right
+          ) =>
+        for
+          lhs <- compileInt32(left)
+          rhs <- compileInt32(right)
+        yield Int32BinaryExpression(expression.id, operator, lhs, rhs)
+      case _ => None
+
+  private def compileInt64(expression: ResolvedExpr): Option[Int64PrimitiveExpression] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index)
+          if expression.dataType == DataType.Int64 =>
+        Some(Int64ColumnExpression(index))
+      case ExprNode.Literal(LiteralValue.Int64(value)) =>
+        Some(Int64LiteralExpression(Some(value)))
+      case ExprNode.Literal(LiteralValue.Null(DataType.Int64)) =>
+        Some(Int64LiteralExpression(None))
+      case ExprNode.Unary(UnaryOperator.Negate, input) =>
+        compileInt64(input).map(Int64UnaryExpression(expression.id, UnaryOperator.Negate, _))
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Add | BinaryOperator.Subtract | BinaryOperator.Multiply
+            ),
+            left,
+            right
+          ) =>
+        for
+          lhs <- compileInt64(left)
+          rhs <- compileInt64(right)
+        yield Int64BinaryExpression(expression.id, operator, lhs, rhs)
+      case _ => None
+
+  private def compileFloat32(expression: ResolvedExpr): Option[Float32PrimitiveExpression] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index)
+          if expression.dataType == DataType.Float32 =>
+        Some(Float32ColumnExpression(index))
+      case ExprNode.Literal(LiteralValue.Float32(value)) =>
+        Some(Float32LiteralExpression(Some(value)))
+      case ExprNode.Literal(LiteralValue.Null(DataType.Float32)) =>
+        Some(Float32LiteralExpression(None))
+      case ExprNode.Unary(operator @ (UnaryOperator.Negate | UnaryOperator.Sqrt), input) =>
+        compileFloat32(input).map(Float32UnaryExpression(operator, _))
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Add | BinaryOperator.Subtract | BinaryOperator.Multiply |
+              BinaryOperator.Divide
+            ),
+            left,
+            right
+          ) =>
+        for
+          lhs <- compileFloat32(left)
+          rhs <- compileFloat32(right)
+        yield Float32BinaryExpression(operator, lhs, rhs)
+      case _ => None
+
+  private def compileFloat64(expression: ResolvedExpr): Option[Float64PrimitiveExpression] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index)
+          if expression.dataType == DataType.Float64 =>
+        Some(Float64ColumnExpression(index))
+      case ExprNode.Literal(LiteralValue.Float64(value)) =>
+        Some(Float64LiteralExpression(Some(value)))
+      case ExprNode.Literal(LiteralValue.Null(DataType.Float64)) =>
+        Some(Float64LiteralExpression(None))
+      case ExprNode.Unary(operator @ (UnaryOperator.Negate | UnaryOperator.Sqrt), input) =>
+        compileFloat64(input).map(Float64UnaryExpression(operator, _))
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Add | BinaryOperator.Subtract | BinaryOperator.Multiply |
+              BinaryOperator.Divide
+            ),
+            left,
+            right
+          ) =>
+        for
+          lhs <- compileFloat64(left)
+          rhs <- compileFloat64(right)
+        yield Float64BinaryExpression(operator, lhs, rhs)
+      case _ => None
+
+  private def compileUtf8(expression: ResolvedExpr): Option[Utf8PrimitiveExpression] =
+    expression.node match
+      case ExprNode.Column(InputRef.Current, _, _, _, index)
+          if expression.dataType == DataType.Utf8 =>
+        Some(Utf8ColumnExpression(index))
+      case ExprNode.Literal(LiteralValue.Utf8(value)) =>
+        Some(Utf8LiteralExpression(Some(value)))
+      case ExprNode.Literal(LiteralValue.Null(DataType.Utf8)) =>
+        Some(Utf8LiteralExpression(None))
+      case _ => None
+
+  def comparison(operator: BinaryOperator, compared: Int, equal: Boolean): Boolean =
+    operator match
+      case BinaryOperator.Equal              => equal
+      case BinaryOperator.NotEqual           => !equal
+      case BinaryOperator.LessThan           => compared < 0
+      case BinaryOperator.LessThanOrEqual    => compared <= 0
+      case BinaryOperator.GreaterThan        => compared > 0
+      case BinaryOperator.GreaterThanOrEqual => compared >= 0
+      case BinaryOperator.NullSafeEqual      => equal
+      case _                                 => false
+
+  def floatEqual(left: Double, right: Double): Boolean =
+    !left.isNaN && !right.isNaN && left == right
+
+  def compareFloat(left: Double, right: Double): Int =
+    if left.isNaN then if right.isNaN then 0 else 1
+    else if right.isNaN then -1
+    else left.compare(right)
+
+  def equalUtf8(left: Utf8PrimitiveExpression, right: Utf8PrimitiveExpression): Boolean =
+    if left.byteLength != right.byteLength then false
+    else
+      var index = 0
+      var equal = true
+      while index < left.byteLength && equal do
+        equal = left.byteAt(index) == right.byteAt(index)
+        index += 1
+      equal
+
+  def compareUtf8(left: Utf8PrimitiveExpression, right: Utf8PrimitiveExpression): Int =
+    val limit = math.min(left.byteLength, right.byteLength)
+    var index = 0
+    while index < limit do
+      val compared = left.byteAt(index).compare(right.byteAt(index))
+      if compared != 0 then return compared
+      index += 1
+    left.byteLength.compare(right.byteLength)
+
+final private case class PrimitiveExpressionPipeline(
+    reference: SourceRef,
+    inputSchema: Schema,
+    outputSchema: Schema,
+    order: OrderGuarantee,
+    predicate: Option[BooleanPrimitiveExpression],
+    projections: Vector[PrimitiveProjection]
+) extends KernelPlan:
+  val name =
+    s"ExpressionPipeline[filter=${predicate.nonEmpty},projections=${projections.length}]"
+  private val borrowedIndices =
+    (predicate.toVector.flatMap(_.inputIndices) ++ projections.flatMap(_.inputIndices)).distinct
+  private val directIndices = projections
+    .collect:
+      case PrimitiveProjection.Direct(index) => index
+    .distinct
+
+  def execute(sources: ReferenceSources): KernelAttempt =
+    sources.borrowedBatches(reference, inputSchema) match
+      case Left(error)    => KernelAttempt.Completed(Left(error))
+      case Right(batches) =>
+        val output = Vector.newBuilder[ColumnarBatch]
+        val context = new PrimitiveEvalContext
+        var residual: Option[String] = None
+        var batchIndex = 0
+        while batchIndex < batches.length && residual.isEmpty && !context.failed do
+          val batch = batches(batchIndex)
+          val directColumns = Array.fill[Option[ColumnarVector]](batch.columns.length)(None)
+          val plainDirect = Vector.newBuilder[Int]
+          var direct = 0
+          while direct < directIndices.length && residual.isEmpty do
+            val index = directIndices(direct)
+            batch.columns.lift(index) match
+              case None =>
+                residual = Some(
+                  s"direct projection $index is outside a ${batch.columns.length}-column batch"
+                )
+              case Some(column) if column.encoding == PhysicalEncoding.Plain =>
+                plainDirect += index
+              case Some(column) =>
+                ColumnarVector.copy(column) match
+                  case Right(value) => directColumns(index) = Some(value)
+                  case Left(reason) => residual = Some(reason)
+            direct += 1
+
+          if residual.isEmpty then
+            val batchBorrowedIndices = (borrowedIndices ++ plainDirect.result()).distinct
+            val borrowed =
+              ColumnarVector.withBorrowedColumns(
+                batch,
+                batchBorrowedIndices
+              ): borrowedColumns =>
+                val columns = new Array[ColumnarVector](batch.columns.length)
+                var borrowedIndex = 0
+                while borrowedIndex < batchBorrowedIndices.length do
+                  columns(batchBorrowedIndices(borrowedIndex)) = borrowedColumns(borrowedIndex)
+                  borrowedIndex += 1
+
+                residual = predicate.flatMap(_.bind(columns))
+                var projection = 0
+                while projection < projections.length && residual.isEmpty do
+                  residual = projections(projection).bind(columns)
+                  projection += 1
+
+                if residual.isEmpty then
+                  val selected = new Array[Int](batch.rowCount)
+                  var selectedCount = 0
+                  var row = 0
+                  while row < batch.rowCount && !context.failed do
+                    predicate match
+                      case Some(filter) =>
+                        filter.evaluate(row, columns, context)
+                        if filter.valid && filter.value then
+                          selected(selectedCount) = row
+                          selectedCount += 1
+                      case None =>
+                        selected(selectedCount) = row
+                        selectedCount += 1
+                    row += 1
+
+                  if !context.failed then
+                    val compact = java.util.Arrays.copyOf(selected, selectedCount)
+                    val projected = Vector.newBuilder[ColumnarVector]
+                    projection = 0
+                    while projection < projections.length && !context.failed && residual.isEmpty
+                    do
+                      evaluateProjection(
+                        projections(projection),
+                        outputSchema.fields(projection),
+                        columns,
+                        directColumns,
+                        compact,
+                        context
+                      ) match
+                        case Right(value) => projected += value
+                        case Left(reason) => residual = Some(reason)
+                      projection += 1
+                    if !context.failed && residual.isEmpty then
+                      output += ColumnarBatch(projected.result(), selectedCount)
+            borrowed match
+              case Left(ColumnBorrowError.Storage(error)) =>
+                context.error = Some(ExecutionError.Storage(error))
+              case Left(ColumnBorrowError.Residual(reason)) =>
+                residual = Some(reason)
+              case Right(()) => ()
+          batchIndex += 1
+
+        residual match
+          case Some(reason) => KernelAttempt.Residual(reason)
+          case None         =>
+            KernelAttempt.Completed(
+              context.error.toLeft(ColumnarResult(outputSchema, order, output.result()))
+            )
+
+  private def evaluateProjection(
+      projection: PrimitiveProjection,
+      field: Field,
+      columns: Array[ColumnarVector],
+      directColumns: Array[Option[ColumnarVector]],
+      selected: Array[Int],
+      context: PrimitiveEvalContext
+  ): Either[String, ColumnarVector] = projection match
+    case PrimitiveProjection.Direct(index) =>
+      directColumns(index) match
+        case Some(column) =>
+          Right(
+            if selected.length == column.length then column
+            else SelectedVector(column, selected)
+          )
+        case None => ColumnarVector.compact(columns(index), field, selected)
+    case PrimitiveProjection.Int32Value(expression) =>
+      val values = new Array[Int](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length && !context.failed do
+        expression.evaluate(selected(row), columns, context)
+        valid(row) = expression.valid
+        if expression.valid then values(row) = expression.value
+        row += 1
+      Right(
+        if field.nullable then NullableInt32Values(values, valid)
+        else Int32Values(values)
+      )
+    case PrimitiveProjection.Int64Value(expression) =>
+      val values = new Array[Long](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length && !context.failed do
+        expression.evaluate(selected(row), columns, context)
+        valid(row) = expression.valid
+        if expression.valid then values(row) = expression.value
+        row += 1
+      Right(
+        if field.nullable then NullableInt64Values(values, valid)
+        else Int64Values(values)
+      )
+    case PrimitiveProjection.Float32Value(expression) =>
+      val values = new Array[Float](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length && !context.failed do
+        expression.evaluate(selected(row), columns, context)
+        valid(row) = expression.valid
+        if expression.valid then values(row) = expression.value
+        row += 1
+      Right(Float32Values(values, valid))
+    case PrimitiveProjection.Float64Value(expression) =>
+      val values = new Array[Double](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length && !context.failed do
+        expression.evaluate(selected(row), columns, context)
+        valid(row) = expression.valid
+        if expression.valid then values(row) = expression.value
+        row += 1
+      Right(Float64Values(values, valid))
+    case PrimitiveProjection.Utf8Value(expression) =>
+      val values = new Array[String](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length && !context.failed do
+        expression.evaluate(selected(row), columns, context)
+        valid(row) = expression.valid
+        if expression.valid then values(row) = expression.stringValue
+        row += 1
+      Right(
+        if field.nullable then NullableUtf8Values(values, valid)
+        else Utf8Values(values)
+      )
+    case PrimitiveProjection.BooleanValue(expression) =>
+      val values = new Array[Boolean](selected.length)
+      val valid = new Array[Boolean](selected.length)
+      var row = 0
+      while row < selected.length && !context.failed do
+        expression.evaluate(selected(row), columns, context)
+        valid(row) = expression.valid
+        if expression.valid then values(row) = expression.value
+        row += 1
+      Right(BooleanValues(values, valid))
+
 private enum KernelAttempt:
   case Completed(result: Either[ExecutionError, ColumnarResult])
   case Residual(reason: String)
@@ -808,8 +2204,19 @@ private object KernelPlan:
           expressions,
           outputSchema
         ) =>
-      directProjection(expressions).map: indices =>
-        DirectProjection(reference, inputSchema, outputSchema, plan.order, indices)
+      directProjection(expressions)
+        .map: indices =>
+          DirectProjection(reference, inputSchema, outputSchema, plan.order, indices)
+        .orElse:
+          primitiveProjections(expressions).map: projections =>
+            PrimitiveExpressionPipeline(
+              reference,
+              inputSchema,
+              outputSchema,
+              plan.order,
+              None,
+              projections
+            )
     case LogicalPlan.Project(
           LogicalPlan.Filter(
             LogicalPlan.Source(reference, inputSchema),
@@ -819,7 +2226,7 @@ private object KernelPlan:
           expressions,
           outputSchema
         ) =>
-      for
+      (for
         filter <- int32Filter(predicate)
         projections <- int32Projections(expressions)
       yield FusedInt32(
@@ -829,41 +2236,73 @@ private object KernelPlan:
         plan.order,
         filter,
         projections
-      )
+      )).orElse:
+        for
+          filter <- PrimitiveExpression.compileBoolean(predicate)
+          projections <- primitiveProjections(expressions)
+        yield PrimitiveExpressionPipeline(
+          reference,
+          inputSchema,
+          outputSchema,
+          plan.order,
+          Some(filter),
+          projections
+        )
     case LogicalPlan.Filter(
           LogicalPlan.Source(reference, inputSchema),
           predicate,
           outputSchema
         ) =>
-      int32Filter(predicate).map: filter =>
-        FilterInt32(reference, inputSchema, outputSchema, plan.order, filter)
+      int32Filter(predicate)
+        .map: filter =>
+          FilterInt32(reference, inputSchema, outputSchema, plan.order, filter)
+        .orElse:
+          PrimitiveExpression
+            .compileBoolean(predicate)
+            .map: filter =>
+              PrimitiveExpressionPipeline(
+                reference,
+                inputSchema,
+                outputSchema,
+                plan.order,
+                Some(filter),
+                inputSchema.fields.indices.toVector.map(PrimitiveProjection.Direct.apply)
+              )
     case LogicalPlan.Aggregate(
           LogicalPlan.Source(reference, inputSchema),
           keys,
           aggregates,
           outputSchema
         ) =>
-      aggregate(reference, inputSchema, outputSchema, plan.order, keys, aggregates)
+      aggregate(
+        reference,
+        inputSchema,
+        outputSchema,
+        plan.order,
+        keys,
+        aggregates,
+        inputSchema.fields.indices.toVector
+      )
     case LogicalPlan.Aggregate(
           LogicalPlan.Project(
-            LogicalPlan.Source(reference, sourceSchema),
+            LogicalPlan.Source(reference, inputSchema),
             projections,
             _
           ),
           keys,
           aggregates,
           outputSchema
-        ) if aggregates.isEmpty =>
-      for
-        projected <- directProjection(projections)
-        keyIndices <- directProjection(keys)
-      yield HashDistinct(
-        reference,
-        sourceSchema,
-        outputSchema,
-        plan.order,
-        keyIndices.map(projected)
-      )
+        ) =>
+      directProjection(projections).flatMap: sourceIndices =>
+        aggregate(
+          reference,
+          inputSchema,
+          outputSchema,
+          plan.order,
+          keys,
+          aggregates,
+          sourceIndices
+        )
     case LogicalPlan.Join(
           LogicalPlan.Source(leftReference, leftSchema),
           LogicalPlan.Source(rightReference, rightSchema),
@@ -966,71 +2405,134 @@ private object KernelPlan:
             Some(Int32Projection.Add(index, value, id))
           case _ => None
 
+  private def primitiveProjections(
+      expressions: Vector[NamedExpression]
+  ): Option[Vector[PrimitiveProjection]] =
+    sequence(expressions.map(named => PrimitiveExpression.compileProjection(named.expression)))
+
   private def aggregate(
       reference: SourceRef,
       inputSchema: Schema,
       outputSchema: Schema,
       order: OrderGuarantee,
       keys: Vector[NamedExpression],
-      aggregates: Vector[NamedAggregateExpression]
+      aggregates: Vector[NamedAggregateExpression],
+      sourceIndices: Vector[Int]
   ): Option[KernelPlan] =
-    val distinct = Option.when(aggregates.isEmpty):
+    val distinctPlan = Option.when(aggregates.isEmpty):
       val indices = keys
         .map(_.expression.node)
         .map:
-          case ExprNode.Column(InputRef.Current, _, _, _, index) => Some(index)
-          case _                                                 => None
+          case ExprNode.Column(InputRef.Current, _, _, _, index) =>
+            sourceIndices.lift(index)
+          case _ => None
       sequence(indices).map: columns =>
-        HashDistinct(reference, inputSchema, outputSchema, order, columns)
+        distinct(reference, inputSchema, outputSchema, order, columns)
 
-    distinct.flatten.orElse:
-      keys match
-        case Vector(
-              NamedExpression(
+    distinctPlan.flatten.orElse:
+      val compiledKeys = sequence:
+        keys.map:
+          case NamedExpression(
                 _,
                 ResolvedExpr(
                   _,
                   keyType @ (DataType.Int32 | DataType.Utf8),
-                  false,
+                  nullable,
                   ExprNode.Column(InputRef.Current, _, _, _, keyIndex)
                 )
-              )
-            ) =>
-          val specs = aggregates.map: named =>
-            named.expression.node match
-              case AggregateNode.Count      => Some(AggregateSpec.Count)
-              case AggregateNode.Sum(input) =>
-                aggregateInput(input).map((index, _) => AggregateSpec.Sum(index))
-              case AggregateNode.Mean(input) =>
-                aggregateInput(input).map((index, _) => AggregateSpec.Mean(index))
-              case AggregateNode.VariancePop(input) =>
-                aggregateInput(input).map((index, _) => AggregateSpec.VariancePop(index))
-              case _ => None
-          sequence(specs).flatMap: compiled =>
-            val numericIndices = compiled.flatMap(_.inputIndex)
-            Option
-              .when(numericIndices.distinct.size <= 1):
-                (keyType, compiled) match
-                  case (DataType.Utf8, Vector(AggregateSpec.Sum(valueIndex))) =>
-                    Utf8SumAggregate(
-                      reference,
-                      inputSchema,
-                      outputSchema,
-                      order,
-                      keyIndex,
-                      valueIndex
-                    )
-                  case _ =>
-                    HashAggregate(
-                      reference,
-                      inputSchema,
-                      outputSchema,
-                      order,
-                      keyIndex,
-                      keyType,
-                      compiled
-                    )
-        case _ => None
+              ) =>
+            sourceIndices.lift(keyIndex).map(AggregateKey(_, keyType, nullable))
+          case _ => None
+      val compiledAggregates = sequence:
+        aggregates.map: named =>
+          named.expression.node match
+            case AggregateNode.Count      => Some(AggregateSpec.Count)
+            case AggregateNode.Sum(input) =>
+              aggregateInput(input)
+                .flatMap((index, _) => sourceIndices.lift(index))
+                .map(AggregateSpec.Sum.apply)
+            case AggregateNode.Mean(input) =>
+              aggregateInput(input)
+                .flatMap((index, _) => sourceIndices.lift(index))
+                .map(AggregateSpec.Mean.apply)
+            case AggregateNode.VariancePop(input) =>
+              aggregateInput(input)
+                .flatMap((index, _) => sourceIndices.lift(index))
+                .map(AggregateSpec.VariancePop.apply)
+            case _ => None
+
+      for
+        compiledKeyVector <- compiledKeys
+        compiled <- compiledAggregates
+        if compiledKeyVector.nonEmpty
+      yield
+        val numericIndices = compiled.flatMap(_.inputIndex)
+        compiledKeyVector match
+          case Vector(AggregateKey(keyIndex, keyType, false))
+              if numericIndices.distinct.size <= 1 =>
+            (keyType, compiled) match
+              case (DataType.Utf8, Vector(AggregateSpec.Sum(valueIndex))) =>
+                Utf8SumAggregate(
+                  reference,
+                  inputSchema,
+                  outputSchema,
+                  order,
+                  keyIndex,
+                  valueIndex
+                )
+              case (DataType.Utf8, _) =>
+                Utf8PrimitiveAggregate(
+                  reference,
+                  inputSchema,
+                  outputSchema,
+                  order,
+                  keyIndex,
+                  compiled
+                )
+              case (DataType.Int32, _) =>
+                Int32HashAggregate(
+                  reference,
+                  inputSchema,
+                  outputSchema,
+                  order,
+                  keyIndex,
+                  compiled
+                )
+              case _ =>
+                HashAggregate(
+                  reference,
+                  inputSchema,
+                  outputSchema,
+                  order,
+                  keyIndex,
+                  keyType,
+                  compiled
+                )
+          case _ =>
+            GeneralHashAggregate(
+              reference,
+              inputSchema,
+              outputSchema,
+              order,
+              compiledKeyVector,
+              compiled
+            )
+
+  private def distinct(
+      reference: SourceRef,
+      inputSchema: Schema,
+      outputSchema: Schema,
+      order: OrderGuarantee,
+      indices: Vector[Int]
+  ): KernelPlan =
+    indices match
+      case Vector(index)
+          if inputSchema.fields
+            .lift(index)
+            .exists(field => field.dataType == DataType.Int32 && !field.nullable) =>
+        Int32Distinct(reference, inputSchema, outputSchema, order, index)
+      case _ =>
+        HashDistinct(reference, inputSchema, outputSchema, order, indices)
 
   private def aggregateInput(input: ResolvedExpr): Option[(Int, ExprId)] =
     input match
@@ -1223,11 +2725,325 @@ private enum AggregateSpec:
     case Mean(index)        => Some(index)
     case VariancePop(index) => Some(index)
 
+final private case class AggregateKey(
+    index: Int,
+    dataType: DataType,
+    nullable: Boolean
+)
+
+private enum StoredGroupKey:
+  case Null
+  case Int32(value: Int)
+  case Utf8(value: Array[Byte])
+
+  def scalar: ScalarValue = this match
+    case Null         => ScalarValue.Null
+    case Int32(value) => ScalarValue.Int32(value)
+    case Utf8(value)  => ScalarValue.Utf8(new String(value, "UTF-8"))
+
+/** Allocation-free-per-row composite grouping index.
+  *
+  * Key material is copied only when a new group is created. Probes compare primitive values or
+  * borrowed UTF-8 bytes against those retained group keys, so increasing key arity does not create
+  * a `Vector[ScalarValue]` for every input row.
+  */
+final private class CompositeGroupIndex(keys: Vector[AggregateKey]):
+  private var hashes = new Array[Int](32)
+  private var groups = Array.fill(32)(-1)
+  private var retained = new Array[Array[StoredGroupKey]](32)
+  private var size = 0
+
+  def groupCount: Int = size
+
+  def findOrPut(vectors: Array[ColumnarVector], row: Int): Int =
+    if (size + 1) * 2 > groups.length then grow()
+    val hash = rowHash(vectors, row)
+    var slot = hash & (groups.length - 1)
+    while groups(slot) >= 0 &&
+      (hashes(slot) != hash || !matches(retained(groups(slot)), vectors, row))
+    do slot = (slot + 1) & (groups.length - 1)
+    val found = groups(slot)
+    if found >= 0 then found
+    else
+      ensureRetainedCapacity()
+      val created = size
+      retained(created) = copyKey(vectors, row)
+      hashes(slot) = hash
+      groups(slot) = created
+      size += 1
+      created
+
+  def scalar(group: Int, key: Int): ScalarValue =
+    retained(group)(key).scalar
+
+  private def rowHash(vectors: Array[ColumnarVector], row: Int): Int =
+    var hash = 1
+    var key = 0
+    while key < keys.length do
+      val component = (keys(key).dataType, vectors(key)) match
+        case (DataType.Int32, values: RawInt32Vector) =>
+          if values.unsafeValid(row) then mix(values.unsafeIntValue(row))
+          else 0x61c88647
+        case (DataType.Utf8, values: RawUtf8Vector) =>
+          if values.unsafeValid(row) then values.unsafeByteHash(row)
+          else 0x61c88647
+        case _ => 0
+      hash = hash * 31 + component
+      key += 1
+    mix(hash)
+
+  private def matches(
+      expected: Array[StoredGroupKey],
+      vectors: Array[ColumnarVector],
+      row: Int
+  ): Boolean =
+    var key = 0
+    var equal = true
+    while key < keys.length && equal do
+      equal = (expected(key), vectors(key)) match
+        case (StoredGroupKey.Null, values: RawInt32Vector) =>
+          !values.unsafeValid(row)
+        case (StoredGroupKey.Int32(value), values: RawInt32Vector) =>
+          values.unsafeValid(row) && values.unsafeIntValue(row) == value
+        case (StoredGroupKey.Null, values: RawUtf8Vector) =>
+          !values.unsafeValid(row)
+        case (StoredGroupKey.Utf8(value), values: RawUtf8Vector) =>
+          values.unsafeValid(row) && values.unsafeBytesEqual(row, value)
+        case _ => false
+      key += 1
+    equal
+
+  private def copyKey(
+      vectors: Array[ColumnarVector],
+      row: Int
+  ): Array[StoredGroupKey] =
+    val copied = new Array[StoredGroupKey](keys.length)
+    var key = 0
+    while key < keys.length do
+      copied(key) = vectors(key) match
+        case values: RawInt32Vector =>
+          if values.unsafeValid(row) then StoredGroupKey.Int32(values.unsafeIntValue(row))
+          else StoredGroupKey.Null
+        case values: RawUtf8Vector =>
+          if values.unsafeValid(row) then StoredGroupKey.Utf8(values.unsafeCopyBytes(row))
+          else StoredGroupKey.Null
+        case _ => StoredGroupKey.Null
+      key += 1
+    copied
+
+  private def ensureRetainedCapacity(): Unit =
+    if size == retained.length then retained = java.util.Arrays.copyOf(retained, size * 2)
+
+  private def grow(): Unit =
+    val oldHashes = hashes
+    val oldGroups = groups
+    hashes = new Array[Int](oldHashes.length * 2)
+    groups = Array.fill(oldGroups.length * 2)(-1)
+    var oldSlot = 0
+    while oldSlot < oldGroups.length do
+      if oldGroups(oldSlot) >= 0 then
+        var slot = oldHashes(oldSlot) & (groups.length - 1)
+        while groups(slot) >= 0 do slot = (slot + 1) & (groups.length - 1)
+        hashes(slot) = oldHashes(oldSlot)
+        groups(slot) = oldGroups(oldSlot)
+      oldSlot += 1
+
+  private def mix(value: Int): Int =
+    var hash = value
+    hash ^= hash >>> 16
+    hash *= 0x7feb352d
+    hash ^= hash >>> 15
+    hash *= 0x846ca68b
+    hash ^ (hash >>> 16)
+
+final private class MultiMeasureState(requirements: AggregateRequirements):
+  private var numericCounts = new Array[Long](32)
+  private var sums =
+    if requirements.sum then new Array[Double](32) else Array.emptyDoubleArray
+  private var meanTotals =
+    if requirements.mean then new Array[Double](32) else Array.emptyDoubleArray
+  private var means =
+    if requirements.variance then new Array[Double](32) else Array.emptyDoubleArray
+  private var m2 =
+    if requirements.variance then new Array[Double](32) else Array.emptyDoubleArray
+
+  def ensureCapacity(required: Int): Unit =
+    if required > numericCounts.length then
+      var next = numericCounts.length * 2
+      while next < required do next *= 2
+      numericCounts = java.util.Arrays.copyOf(numericCounts, next)
+      if requirements.sum then sums = java.util.Arrays.copyOf(sums, next)
+      if requirements.mean then meanTotals = java.util.Arrays.copyOf(meanTotals, next)
+      if requirements.variance then
+        means = java.util.Arrays.copyOf(means, next)
+        m2 = java.util.Arrays.copyOf(m2, next)
+
+  def add(group: Int, value: Double): Unit =
+    val first = numericCounts(group) == 0L
+    numericCounts(group) += 1L
+    if requirements.sum then sums(group) = if first then value else sums(group) + value
+    if requirements.mean then meanTotals(group) += value
+    if requirements.variance then
+      val delta = value - means(group)
+      means(group) += delta / numericCounts(group).toDouble
+      val delta2 = value - means(group)
+      m2(group) += delta * delta2
+
+  def result(spec: AggregateSpec, size: Int): ColumnarVector =
+    val valid = new Array[Boolean](size)
+    var group = 0
+    while group < size do
+      valid(group) = numericCounts(group) > 0L
+      group += 1
+    spec match
+      case AggregateSpec.Sum(_) =>
+        Float64Values(java.util.Arrays.copyOf(sums, size), valid)
+      case AggregateSpec.Mean(_) =>
+        val output = new Array[Double](size)
+        group = 0
+        while group < size do
+          output(group) = meanTotals(group) / numericCounts(group).toDouble
+          group += 1
+        Float64Values(output, valid)
+      case AggregateSpec.VariancePop(_) =>
+        val output = new Array[Double](size)
+        group = 0
+        while group < size do
+          output(group) = m2(group) / numericCounts(group).toDouble
+          group += 1
+        Float64Values(output, valid)
+      case AggregateSpec.Count =>
+        Int64Values(Array.fill(size)(0L))
+
+/** General grouped reduction for arbitrary Int32/UTF-8 key vectors and Float64 measure vectors.
+  *
+  * Specialized one-key kernels remain available for their narrower fast paths. This kernel owns the
+  * structural contract: any key arity, nullable keys, any number of measure columns, projected
+  * source lineage, repeated aggregate use of one measure, and stable first-group order.
+  */
+final private case class GeneralHashAggregate(
+    reference: SourceRef,
+    inputSchema: Schema,
+    outputSchema: Schema,
+    order: OrderGuarantee,
+    keys: Vector[AggregateKey],
+    aggregates: Vector[AggregateSpec]
+) extends KernelPlan:
+  private val measureIndices = aggregates.flatMap(_.inputIndex).distinct
+  val name = s"HashAggregate[General,keys=${keys.length},measures=${measureIndices.length}]"
+  private val needsCount = aggregates.contains(AggregateSpec.Count)
+  private val requirements = measureIndices.map: index =>
+    AggregateRequirements.from(aggregates.filter(_.inputIndex.contains(index)))
+
+  def execute(sources: ReferenceSources): KernelAttempt =
+    val required = (keys.map(_.index) ++ measureIndices).distinct
+    sources.borrowedBatches(reference, inputSchema) match
+      case Left(error)    => KernelAttempt.Completed(Left(error))
+      case Right(batches) =>
+        val groupIndex = new CompositeGroupIndex(keys)
+        val states = requirements.map(new MultiMeasureState(_)).toArray
+        var rowCounts = if needsCount then new Array[Long](32) else Array.emptyLongArray
+        var error: Option[ExecutionError] = None
+        var residual: Option[String] = None
+        var batchIndex = 0
+        while batchIndex < batches.length && error.isEmpty && residual.isEmpty do
+          val batch = batches(batchIndex)
+          val borrowed =
+            ColumnarVector.withBorrowedColumns(batch, required): decoded =>
+              val keyVectors = new Array[ColumnarVector](keys.length)
+              var key = 0
+              while key < keys.length && residual.isEmpty do
+                val vector = decoded(required.indexOf(keys(key).index))
+                val compatible = (keys(key).dataType, vector) match
+                  case (DataType.Int32, _: RawInt32Vector) => true
+                  case (DataType.Utf8, _: RawUtf8Vector)   => true
+                  case _                                   => false
+                if compatible then keyVectors(key) = vector
+                else
+                  residual = Some(
+                    s"aggregate key ${keys(key).index} is not plain ${keys(key).dataType}"
+                  )
+                key += 1
+
+              val measureVectors = new Array[RawFloat64Vector](measureIndices.length)
+              var measure = 0
+              while measure < measureIndices.length && residual.isEmpty do
+                decoded(required.indexOf(measureIndices(measure))) match
+                  case value: RawFloat64Vector => measureVectors(measure) = value
+                  case _                       =>
+                    residual = Some(
+                      s"aggregate input ${measureIndices(measure)} is not plain Float64"
+                    )
+                measure += 1
+
+              if residual.isEmpty then
+                var row = 0
+                while row < batch.rowCount do
+                  val group = groupIndex.findOrPut(keyVectors, row)
+                  val requiredSize = group + 1
+                  if needsCount && requiredSize > rowCounts.length then
+                    var next = rowCounts.length * 2
+                    while next < requiredSize do next *= 2
+                    rowCounts = java.util.Arrays.copyOf(rowCounts, next)
+                  if needsCount then rowCounts(group) += 1L
+                  measure = 0
+                  while measure < measureVectors.length do
+                    val values = measureVectors(measure)
+                    states(measure).ensureCapacity(requiredSize)
+                    if values.unsafeValid(row) then
+                      states(measure).add(group, values.unsafeDoubleValue(row))
+                    measure += 1
+                  row += 1
+          borrowed match
+            case Left(ColumnBorrowError.Storage(value)) =>
+              error = Some(ExecutionError.Storage(value))
+            case Left(ColumnBorrowError.Residual(reason)) =>
+              residual = Some(reason)
+            case Right(()) => ()
+          batchIndex += 1
+
+        error match
+          case Some(value) => KernelAttempt.Completed(Left(value))
+          case None        =>
+            residual match
+              case Some(reason) => KernelAttempt.Residual(reason)
+              case None         =>
+                val size = groupIndex.groupCount
+                val columns = Vector.newBuilder[ColumnarVector]
+                var key = 0
+                while key < keys.length do
+                  columns += ScalarVector(
+                    Array.tabulate(size)(group => groupIndex.scalar(group, key))
+                  )
+                  key += 1
+                aggregates.foreach:
+                  case AggregateSpec.Count =>
+                    columns += Int64Values(java.util.Arrays.copyOf(rowCounts, size))
+                  case spec @ AggregateSpec.Sum(inputIndex) =>
+                    val measure = measureIndices.indexOf(inputIndex)
+                    columns += states(measure).result(spec, size)
+                  case spec @ AggregateSpec.Mean(inputIndex) =>
+                    val measure = measureIndices.indexOf(inputIndex)
+                    columns += states(measure).result(spec, size)
+                  case spec @ AggregateSpec.VariancePop(inputIndex) =>
+                    val measure = measureIndices.indexOf(inputIndex)
+                    columns += states(measure).result(spec, size)
+                KernelAttempt.Completed(
+                  Right(
+                    ColumnarResult(
+                      outputSchema,
+                      order,
+                      Vector(ColumnarBatch(columns.result(), size))
+                    )
+                  )
+                )
+
 final private class AggregateGroup(val key: ScalarValue):
   private var needs: AggregateRequirements = AggregateRequirements.all
   var rows: Long = 0L
   var numericCount: Long = 0L
   var sum: Double = 0.0
+  var meanTotal: Double = 0.0
   var mean: Double = 0.0
   var m2: Double = 0.0
 
@@ -1241,8 +3057,10 @@ final private class AggregateGroup(val key: ScalarValue):
   def addValue(actual: Double): Unit =
     if needs.count then rows += 1L
     if needs.numeric then
+      val first = numericCount == 0L
       numericCount += 1L
-      if needs.sum then sum += actual
+      if needs.sum then sum = if first then actual else sum + actual
+      if needs.mean then meanTotal += actual
       if needs.variance then
         val delta = actual - mean
         mean += delta / numericCount.toDouble
@@ -1253,23 +3071,27 @@ final private case class AggregateRequirements(
     count: Boolean,
     numeric: Boolean,
     sum: Boolean,
+    mean: Boolean,
     variance: Boolean
 )
 
 private object AggregateRequirements:
   val all: AggregateRequirements =
-    AggregateRequirements(count = true, numeric = true, sum = true, variance = true)
+    AggregateRequirements(count = true, numeric = true, sum = true, mean = true, variance = true)
 
   def from(aggregates: Vector[AggregateSpec]): AggregateRequirements =
     val count = aggregates.contains(AggregateSpec.Count)
     val numeric = aggregates.exists(_.inputIndex.nonEmpty)
     val sum = aggregates.exists:
-      case AggregateSpec.Sum(_) | AggregateSpec.Mean(_) => true
-      case _                                            => false
+      case AggregateSpec.Sum(_) => true
+      case _                    => false
+    val mean = aggregates.exists:
+      case AggregateSpec.Mean(_) => true
+      case _                     => false
     val variance = aggregates.exists:
       case AggregateSpec.VariancePop(_) => true
       case _                            => false
-    AggregateRequirements(count, numeric, sum, variance)
+    AggregateRequirements(count, numeric, sum, mean, variance)
 
 final private class IntGroupIndex:
   private var keys = new Array[Int](32)
@@ -1459,7 +3281,8 @@ final private class Utf8SumAccumulator:
       if group == size then
         val _ = append(key, row)
       if values.unsafeValid(row) then
-        sums(group) += values.unsafeDoubleValue(row)
+        val actual = values.unsafeDoubleValue(row)
+        sums(group) = if counts(group) == 0L then actual else sums(group) + actual
         counts(group) += 1L
       row += 1
 
@@ -1542,6 +3365,397 @@ final private class Utf8SumIndex:
     hash ^= hash >>> 16
     hash *= 0x7feb352d
     hash ^ (hash >>> 15)
+
+final private case class Utf8PrimitiveAggregate(
+    reference: SourceRef,
+    inputSchema: Schema,
+    outputSchema: Schema,
+    order: OrderGuarantee,
+    keyIndex: Int,
+    aggregates: Vector[AggregateSpec]
+) extends KernelPlan:
+  val name = "HashAggregate[Utf8,Primitive]"
+  private val requirements = AggregateRequirements.from(aggregates)
+
+  def execute(sources: ReferenceSources): KernelAttempt =
+    val valueIndex = aggregates.flatMap(_.inputIndex).headOption
+    sources.borrowedBatches(reference, inputSchema) match
+      case Left(error)    => KernelAttempt.Completed(Left(error))
+      case Right(batches) =>
+        val accumulator = new Utf8AggregateAccumulator(requirements)
+        var batchIndex = 0
+        var error: Option[ExecutionError] = None
+        var residual: Option[String] = None
+        while batchIndex < batches.length && error.isEmpty && residual.isEmpty do
+          val batch = batches(batchIndex)
+          batch.columns(keyIndex) match
+            case key: Utf8Array if key.nullCount == 0 =>
+              val added =
+                valueIndex match
+                  case None =>
+                    addCountBatch(key, accumulator)
+                  case Some(index) =>
+                    batch.columns(index) match
+                      case values: Float64Array =>
+                        addNumericBatch(key, values, accumulator)
+                      case _ =>
+                        residual = Some("aggregate input is not plain Float64")
+                        Right(())
+              added match
+                case Left(value) => error = Some(ExecutionError.Storage(value))
+                case Right(())   => ()
+            case _: Utf8Array =>
+              residual = Some("aggregate UTF-8 key became nullable")
+            case _ =>
+              residual = Some("aggregate UTF-8 key is not plain UTF-8")
+          batchIndex += 1
+
+        residual match
+          case Some(reason) => KernelAttempt.Residual(reason)
+          case None         =>
+            KernelAttempt.Completed(
+              error.toLeft(accumulator.result(outputSchema, order, aggregates))
+            )
+
+  private def addCountBatch(
+      key: Utf8Array,
+      accumulator: Utf8AggregateAccumulator
+  ): Either[StorageError, Unit] =
+    key.withBorrowedUtf8Bytes:
+      (offsets, offsetsStart, keyValues, keyValuesStart, keyOffset, keyLength) =>
+        accumulator.addBatch(
+          RawUtf8Vector(
+            offsets,
+            keyValues,
+            None,
+            keyOffset,
+            keyLength,
+            offsetsStart,
+            keyValuesStart
+          ),
+          None,
+          keyLength
+        )
+
+  private def addNumericBatch(
+      key: Utf8Array,
+      values: Float64Array,
+      accumulator: Utf8AggregateAccumulator
+  ): Either[StorageError, Unit] =
+    key
+      .withBorrowedUtf8Bytes:
+        (offsets, offsetsStart, keyValues, keyValuesStart, keyOffset, keyLength) =>
+          values.withBorrowedValueBytes:
+            (numericValues, numericStart, validity, numericOffset, numericLength) =>
+              accumulator.addBatch(
+                RawUtf8Vector(
+                  offsets,
+                  keyValues,
+                  None,
+                  keyOffset,
+                  keyLength,
+                  offsetsStart,
+                  keyValuesStart
+                ),
+                Some(
+                  RawFloat64Vector(
+                    numericValues,
+                    validity,
+                    numericOffset,
+                    numericLength,
+                    numericStart
+                  )
+                ),
+                keyLength
+              )
+      .flatMap(identity)
+
+final private class Utf8AggregateAccumulator(requirements: AggregateRequirements):
+  private val index = new Utf8SumIndex
+  private var keys = new Array[Array[Byte]](32)
+  private var rows =
+    if requirements.count then new Array[Long](32) else new Array[Long](0)
+  private var numericCounts =
+    if requirements.numeric then new Array[Long](32) else new Array[Long](0)
+  private var sums =
+    if requirements.sum then new Array[Double](32) else new Array[Double](0)
+  private var meanTotals =
+    if requirements.mean then new Array[Double](32) else new Array[Double](0)
+  private var means =
+    if requirements.variance then new Array[Double](32) else new Array[Double](0)
+  private var m2 =
+    if requirements.variance then new Array[Double](32) else new Array[Double](0)
+  private var size = 0
+
+  def addBatch(
+      key: RawUtf8Vector,
+      values: Option[RawFloat64Vector],
+      rowCount: Int
+  ): Unit =
+    var row = 0
+    while row < rowCount do
+      val group = index.findOrPut(key, row, size)
+      if group == size then append(key, row)
+      if requirements.count then rows(group) += 1L
+      values match
+        case Some(numeric) if numeric.unsafeValid(row) =>
+          val first = numericCounts(group) == 0L
+          numericCounts(group) += 1L
+          val value = numeric.unsafeDoubleValue(row)
+          if requirements.sum then sums(group) = if first then value else sums(group) + value
+          if requirements.mean then meanTotals(group) += value
+          if requirements.variance then
+            val delta = value - means(group)
+            means(group) += delta / numericCounts(group).toDouble
+            val delta2 = value - means(group)
+            m2(group) += delta * delta2
+        case _ => ()
+      row += 1
+
+  private def append(key: RawUtf8Vector, row: Int): Unit =
+    if size == keys.length then
+      val next = size * 2
+      keys = java.util.Arrays.copyOf(keys, next)
+      if requirements.count then rows = java.util.Arrays.copyOf(rows, next)
+      if requirements.numeric then numericCounts = java.util.Arrays.copyOf(numericCounts, next)
+      if requirements.sum then sums = java.util.Arrays.copyOf(sums, next)
+      if requirements.mean then meanTotals = java.util.Arrays.copyOf(meanTotals, next)
+      if requirements.variance then
+        means = java.util.Arrays.copyOf(means, next)
+        m2 = java.util.Arrays.copyOf(m2, next)
+    keys(size) = key.unsafeCopyBytes(row)
+    size += 1
+
+  def result(
+      schema: Schema,
+      order: OrderGuarantee,
+      aggregates: Vector[AggregateSpec]
+  ): ColumnarResult =
+    val outputKeys = new Array[String](size)
+    var group = 0
+    while group < size do
+      outputKeys(group) = new String(keys(group), "UTF-8")
+      group += 1
+
+    val valid =
+      if requirements.numeric then
+        val output = new Array[Boolean](size)
+        group = 0
+        while group < size do
+          output(group) = numericCounts(group) > 0L
+          group += 1
+        output
+      else Array.emptyBooleanArray
+
+    val columns = Vector.newBuilder[ColumnarVector]
+    columns += Utf8Values(outputKeys)
+    aggregates.foreach:
+      case AggregateSpec.Count =>
+        columns += Int64Values(java.util.Arrays.copyOf(rows, size))
+      case AggregateSpec.Sum(_) =>
+        columns += Float64Values(java.util.Arrays.copyOf(sums, size), valid)
+      case AggregateSpec.Mean(_) =>
+        val output = new Array[Double](size)
+        group = 0
+        while group < size do
+          output(group) = meanTotals(group) / numericCounts(group).toDouble
+          group += 1
+        columns += Float64Values(output, valid)
+      case AggregateSpec.VariancePop(_) =>
+        val output = new Array[Double](size)
+        group = 0
+        while group < size do
+          output(group) = m2(group) / numericCounts(group).toDouble
+          group += 1
+        columns += Float64Values(output, valid)
+
+    ColumnarResult(
+      schema,
+      order,
+      Vector(ColumnarBatch(columns.result(), size))
+    )
+
+final private case class Int32HashAggregate(
+    reference: SourceRef,
+    inputSchema: Schema,
+    outputSchema: Schema,
+    order: OrderGuarantee,
+    keyIndex: Int,
+    aggregates: Vector[AggregateSpec]
+) extends KernelPlan:
+  val name = "HashAggregate[Int32,Primitive]"
+  private val requirements = AggregateRequirements.from(aggregates)
+
+  def execute(sources: ReferenceSources): KernelAttempt =
+    val valueIndex = aggregates.flatMap(_.inputIndex).headOption
+    sources.borrowedBatches(reference, inputSchema) match
+      case Left(error)    => KernelAttempt.Completed(Left(error))
+      case Right(batches) =>
+        val accumulator = new Int32AggregateAccumulator(requirements)
+        var batchIndex = 0
+        var error: Option[ExecutionError] = None
+        var residual: Option[String] = None
+        while batchIndex < batches.length && error.isEmpty && residual.isEmpty do
+          val batch = batches(batchIndex)
+          batch.columns(keyIndex) match
+            case key: Int32Array if key.nullCount == 0 =>
+              val added =
+                valueIndex match
+                  case None =>
+                    addCountBatch(key, accumulator)
+                  case Some(index) =>
+                    batch.columns(index) match
+                      case values: Float64Array =>
+                        addNumericBatch(key, values, accumulator)
+                      case _ =>
+                        residual = Some("aggregate input is not plain Float64")
+                        Right(())
+              added match
+                case Left(value) => error = Some(ExecutionError.Storage(value))
+                case Right(())   => ()
+            case _: Int32Array =>
+              residual = Some("aggregate Int32 key became nullable")
+            case _ =>
+              residual = Some("aggregate Int32 key is not plain Int32")
+          batchIndex += 1
+
+        residual match
+          case Some(reason) => KernelAttempt.Residual(reason)
+          case None         =>
+            KernelAttempt.Completed(
+              error.toLeft(accumulator.result(outputSchema, order, aggregates))
+            )
+
+  private def addCountBatch(
+      key: Int32Array,
+      accumulator: Int32AggregateAccumulator
+  ): Either[StorageError, Unit] =
+    key.withBorrowedValueBytes: (keyBytes, keyStart, _, keyOffset, keyLength) =>
+      var row = 0
+      while row < keyLength do
+        accumulator.add(
+          readInt(keyBytes, keyStart + (keyOffset + row) * 4),
+          valid = false,
+          value = 0.0
+        )
+        row += 1
+
+  private def addNumericBatch(
+      key: Int32Array,
+      values: Float64Array,
+      accumulator: Int32AggregateAccumulator
+  ): Either[StorageError, Unit] =
+    key
+      .withBorrowedValueBytes: (keyBytes, keyStart, _, keyOffset, keyLength) =>
+        values.withBorrowedValueBytes: (valueBytes, valueStart, validity, valueOffset, _) =>
+          var row = 0
+          while row < keyLength do
+            val valid = validity.forall(bit(_, valueOffset + row))
+            accumulator.add(
+              readInt(keyBytes, keyStart + (keyOffset + row) * 4),
+              valid,
+              java.lang.Double.longBitsToDouble(
+                readLong(valueBytes, valueStart + (valueOffset + row) * 8)
+              )
+            )
+            row += 1
+      .flatMap(identity)
+
+final private class Int32AggregateAccumulator(requirements: AggregateRequirements):
+  private val groups = new IntGroupIndex
+  private var keys = new Array[Int](32)
+  private var rows =
+    if requirements.count then new Array[Long](32) else new Array[Long](0)
+  private var numericCounts =
+    if requirements.numeric then new Array[Long](32) else new Array[Long](0)
+  private var sums =
+    if requirements.sum then new Array[Double](32) else new Array[Double](0)
+  private var meanTotals =
+    if requirements.mean then new Array[Double](32) else new Array[Double](0)
+  private var means =
+    if requirements.variance then new Array[Double](32) else new Array[Double](0)
+  private var m2 =
+    if requirements.variance then new Array[Double](32) else new Array[Double](0)
+  private var size = 0
+
+  def add(key: Int, valid: Boolean, value: Double): Unit =
+    val found = groups.find(key)
+    val group =
+      if found >= 0 then found
+      else
+        ensureCapacity()
+        val created = size
+        keys(created) = key
+        groups.put(key, created)
+        size += 1
+        created
+
+    if requirements.count then rows(group) += 1L
+    if requirements.numeric && valid then
+      val first = numericCounts(group) == 0L
+      numericCounts(group) += 1L
+      if requirements.sum then sums(group) = if first then value else sums(group) + value
+      if requirements.mean then meanTotals(group) += value
+      if requirements.variance then
+        val delta = value - means(group)
+        means(group) += delta / numericCounts(group).toDouble
+        val delta2 = value - means(group)
+        m2(group) += delta * delta2
+
+  private def ensureCapacity(): Unit =
+    if size == keys.length then
+      val next = size * 2
+      keys = java.util.Arrays.copyOf(keys, next)
+      if requirements.count then rows = java.util.Arrays.copyOf(rows, next)
+      if requirements.numeric then numericCounts = java.util.Arrays.copyOf(numericCounts, next)
+      if requirements.sum then sums = java.util.Arrays.copyOf(sums, next)
+      if requirements.mean then meanTotals = java.util.Arrays.copyOf(meanTotals, next)
+      if requirements.variance then
+        means = java.util.Arrays.copyOf(means, next)
+        m2 = java.util.Arrays.copyOf(m2, next)
+
+  def result(
+      schema: Schema,
+      order: OrderGuarantee,
+      aggregates: Vector[AggregateSpec]
+  ): ColumnarResult =
+    val columns = Vector.newBuilder[ColumnarVector]
+    columns += Int32Values(java.util.Arrays.copyOf(keys, size))
+    val valid =
+      if requirements.numeric then
+        val output = new Array[Boolean](size)
+        var group = 0
+        while group < size do
+          output(group) = numericCounts(group) > 0L
+          group += 1
+        output
+      else Array.emptyBooleanArray
+
+    aggregates.foreach:
+      case AggregateSpec.Count =>
+        columns += Int64Values(java.util.Arrays.copyOf(rows, size))
+      case AggregateSpec.Sum(_) =>
+        columns += Float64Values(java.util.Arrays.copyOf(sums, size), valid)
+      case AggregateSpec.Mean(_) =>
+        val output = new Array[Double](size)
+        var group = 0
+        while group < size do
+          output(group) = meanTotals(group) / numericCounts(group).toDouble
+          group += 1
+        columns += Float64Values(output, valid)
+      case AggregateSpec.VariancePop(_) =>
+        val output = new Array[Double](size)
+        var group = 0
+        while group < size do
+          output(group) = m2(group) / numericCounts(group).toDouble
+          group += 1
+        columns += Float64Values(output, valid)
+
+    ColumnarResult(
+      schema,
+      order,
+      Vector(ColumnarBatch(columns.result(), size))
+    )
 
 final private case class HashAggregate(
     reference: SourceRef,
@@ -1673,7 +3887,7 @@ final private case class HashAggregate(
         )
       case AggregateSpec.Mean(_) =>
         columns += Float64Values(
-          groups.map(group => group.sum / group.numericCount.toDouble).toArray,
+          groups.map(group => group.meanTotal / group.numericCount.toDouble).toArray,
           groups.map(_.numericCount > 0L).toArray
         )
       case AggregateSpec.VariancePop(_) =>
@@ -2164,6 +4378,68 @@ final private case class StreamingUnionAll(
           batchIndex += 1
         residual.toLeft(output.result()).left.map(Right.apply)
 
+final private case class Int32Distinct(
+    reference: SourceRef,
+    inputSchema: Schema,
+    outputSchema: Schema,
+    order: OrderGuarantee,
+    index: Int
+) extends KernelPlan:
+  val name = "HashDistinct[Int32,Primitive]"
+
+  def execute(sources: ReferenceSources): KernelAttempt =
+    sources.borrowedBatches(reference, inputSchema) match
+      case Left(error)    => KernelAttempt.Completed(Left(error))
+      case Right(batches) =>
+        val groups = new IntGroupIndex
+        var values = new Array[Int](32)
+        var size = 0
+        var batchIndex = 0
+        var error: Option[ExecutionError] = None
+        var residual: Option[String] = None
+        while batchIndex < batches.length && error.isEmpty && residual.isEmpty do
+          val batch = batches(batchIndex)
+          batch.columns(index) match
+            case column: Int32Array if column.nullCount == 0 =>
+              val borrowed =
+                column.withBorrowedValueBytes: (bytes, start, _, logicalOffset, length) =>
+                  var row = 0
+                  while row < length do
+                    val actual = readInt(bytes, start + (logicalOffset + row) * 4)
+                    if groups.find(actual) < 0 then
+                      if size == values.length then
+                        values = java.util.Arrays.copyOf(values, size * 2)
+                      values(size) = actual
+                      groups.put(actual, size)
+                      size += 1
+                    row += 1
+              borrowed match
+                case Left(value) => error = Some(ExecutionError.Storage(value))
+                case Right(())   => ()
+            case _: Int32Array =>
+              residual = Some(s"distinct column $index became nullable")
+            case _ =>
+              residual = Some(s"distinct column $index is not plain Int32")
+          batchIndex += 1
+
+        residual match
+          case Some(reason) => KernelAttempt.Residual(reason)
+          case None         =>
+            KernelAttempt.Completed(
+              error.toLeft(
+                ColumnarResult(
+                  outputSchema,
+                  order,
+                  Vector(
+                    ColumnarBatch(
+                      Vector(Int32Values(java.util.Arrays.copyOf(values, size))),
+                      size
+                    )
+                  )
+                )
+              )
+            )
+
 private enum DistinctAtom:
   case Null
   case Bool(value: Boolean)
@@ -2365,5 +4641,15 @@ private def readLong(bytes: Array[Byte], offset: Int): Long =
   (readInt(bytes, offset).toLong & 0xffffffffL) |
     (readInt(bytes, offset + 4).toLong << 32)
 
+private def writeInt(bytes: Array[Byte], offset: Int, value: Int): Unit =
+  bytes(offset) = value.toByte
+  bytes(offset + 1) = (value >>> 8).toByte
+  bytes(offset + 2) = (value >>> 16).toByte
+  bytes(offset + 3) = (value >>> 24).toByte
+
 private def bit(bytes: Array[Byte], index: Int): Boolean =
   ((bytes(index >>> 3).toInt >>> (index & 7)) & 1) == 1
+
+private def setBit(bytes: Array[Byte], index: Int): Unit =
+  val byteIndex = index >>> 3
+  bytes(byteIndex) = (bytes(byteIndex) | (1 << (index & 7))).toByte

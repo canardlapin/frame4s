@@ -573,6 +573,13 @@ final class BooleanArray private[frame4s] (
     validity.copyBuffers.flatMap: validityBuffers =>
       values.copyBytes.map(validityBuffers :+ _)
 
+  private[frame4s] def withBorrowedValueBytes[A](
+      operation: (Array[Byte], Int, Option[Array[Byte]], Int, Int) => A
+  ): Either[StorageError, A] =
+    validity.copyBuffers.flatMap: validityBuffers =>
+      values.read: (bytes, start) =>
+        operation(bytes, start, validityBuffers.headOption, logicalOffset, length)
+
   def value(index: Int): Either[StorageError, Boolean] =
     if index < 0 || index >= length then Left(StorageError.InvalidRange(index, 1, length))
     else
@@ -661,6 +668,37 @@ final class Utf8Array private[frame4s] (
             length
           )
       .flatMap(identity)
+
+  /** Borrow UTF-8 offsets, values, and a detached validity bitmap for one eager kernel.
+    *
+    * The callback remains scoped by both buffer read locks. The validity copy carries the logical
+    * slice offset; the borrowed offsets and values must not escape the callback.
+    */
+  private[frame4s] def withBorrowedUtf8BytesAndValidity[A](
+      operation: (
+          Array[Byte],
+          Int,
+          Array[Byte],
+          Int,
+          Option[Array[Byte]],
+          Int,
+          Int
+      ) => A
+  ): Either[StorageError, A] =
+    validity.copyBuffers.flatMap: validityBuffers =>
+      offsets
+        .read: (offsetBytes, offsetStart) =>
+          values.read: (valueBytes, valueStart) =>
+            operation(
+              offsetBytes,
+              offsetStart,
+              valueBytes,
+              valueStart,
+              validityBuffers.headOption,
+              logicalOffset,
+              length
+            )
+        .flatMap(identity)
 
   private def bounds(index: Int): Either[StorageError, (Int, Int)] =
     if index < 0 || index >= length then Left(StorageError.InvalidRange(index, 1, length))

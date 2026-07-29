@@ -278,17 +278,17 @@ sealed class ExprOf[A, Origin] private[frame4s] (
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def +[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      Numeric[A]
+      NumericColumn[A]
   ): ExprOf[A, Origin | OtherOrigin] =
     Expr.sameType(BinaryOperator.Add, this, other)
 
-  def +(other: LiteralExpr[A])(using Numeric[A]): ExprOf[A, Origin] =
+  def +(other: LiteralExpr[A])(using NumericColumn[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Add, this, other)
 
   def +[Value](value: Value)(using
       exact: ExactScalarOperand[A, Value],
       columnType: ColumnType[A],
-      numeric: Numeric[A]
+      numeric: NumericColumn[A]
   ): ExprOf[A, Origin] =
     this + Expr.literal(exact.widen(value))
 
@@ -296,17 +296,17 @@ sealed class ExprOf[A, Origin] private[frame4s] (
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def -[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      Numeric[A]
+      NumericColumn[A]
   ): ExprOf[A, Origin | OtherOrigin] =
     Expr.sameType(BinaryOperator.Subtract, this, other)
 
-  def -(other: LiteralExpr[A])(using Numeric[A]): ExprOf[A, Origin] =
+  def -(other: LiteralExpr[A])(using NumericColumn[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Subtract, this, other)
 
   def -[Value](value: Value)(using
       exact: ExactScalarOperand[A, Value],
       columnType: ColumnType[A],
-      numeric: Numeric[A]
+      numeric: NumericColumn[A]
   ): ExprOf[A, Origin] =
     this - Expr.literal(exact.widen(value))
 
@@ -314,17 +314,17 @@ sealed class ExprOf[A, Origin] private[frame4s] (
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def *[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      Numeric[A]
+      NumericColumn[A]
   ): ExprOf[A, Origin | OtherOrigin] =
     Expr.sameType(BinaryOperator.Multiply, this, other)
 
-  def *(other: LiteralExpr[A])(using Numeric[A]): ExprOf[A, Origin] =
+  def *(other: LiteralExpr[A])(using NumericColumn[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Multiply, this, other)
 
   def *[Value](value: Value)(using
       exact: ExactScalarOperand[A, Value],
       columnType: ColumnType[A],
-      numeric: Numeric[A]
+      numeric: NumericColumn[A]
   ): ExprOf[A, Origin] =
     this * Expr.literal(exact.widen(value))
 
@@ -332,17 +332,17 @@ sealed class ExprOf[A, Origin] private[frame4s] (
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def /[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      Fractional[A]
+      FractionalColumn[A]
   ): ExprOf[A, Origin | OtherOrigin] =
     Expr.sameType(BinaryOperator.Divide, this, other)
 
-  def /(other: LiteralExpr[A])(using Fractional[A]): ExprOf[A, Origin] =
+  def /(other: LiteralExpr[A])(using FractionalColumn[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Divide, this, other)
 
   def /[Value](value: Value)(using
       exact: ExactScalarOperand[A, Value],
       columnType: ColumnType[A],
-      fractional: Fractional[A]
+      fractional: FractionalColumn[A]
   ): ExprOf[A, Origin] =
     this / Expr.literal(exact.widen(value))
 
@@ -749,7 +749,15 @@ object Aggregate:
       )
     )
 
-trait NumericColumn[A]
+/** Evidence that a typed column supports addition, subtraction, and multiplication.
+  *
+  * The closed instances preserve the physical width and lift explicitly nullable `Option` columns
+  * without defining arithmetic for ordinary Scala `Option` values.
+  */
+@implicitNotFound(
+  "Arithmetic requires an Int, Long, Float, Double, or nullable Option of one of those types."
+)
+sealed trait NumericColumn[A]
 
 object NumericColumn:
   given NumericColumn[Int] with {}
@@ -757,6 +765,17 @@ object NumericColumn:
   given NumericColumn[Float] with {}
   given NumericColumn[Double] with {}
   given [A](using NumericColumn[A]): NumericColumn[Option[A]] with {}
+
+/** Evidence that a typed column supports IEEE floating-point division. */
+@implicitNotFound(
+  "Division requires Float, Double, or a nullable Option of one of those types."
+)
+sealed trait FractionalColumn[A]
+
+object FractionalColumn:
+  given FractionalColumn[Float] with {}
+  given FractionalColumn[Double] with {}
+  given [A](using FractionalColumn[A]): FractionalColumn[Option[A]] with {}
 
 @implicitNotFound(
   "sqrt requires a Float, Double, Option[Float], or Option[Double] expression."

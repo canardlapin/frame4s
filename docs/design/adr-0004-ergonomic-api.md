@@ -64,10 +64,13 @@ row.col("id") + 1
 ```
 
 Each overload constructs `Expr.literal(value)` and calls the existing
-expression-to-expression operation. It uses the existing `ColumnType[A]`,
-`Ordering[A]`, `Numeric[A]`, or `Fractional[A]` evidence. There is no implicit
-conversion, numeric widening, cast, or new expression node. Existing
-`LiteralExpr[A]` overloads remain available for a reusable literal.
+expression-to-expression operation. It uses `ColumnType[A]`, `Ordering[A]`, or
+the closed frame4s `NumericColumn[A]` and `FractionalColumn[A]` witnesses.
+Those witnesses admit the primitive numeric columns and their explicit
+`Option` forms without installing a global `Numeric[Option[A]]` instance.
+There is no implicit conversion, numeric widening, cast, or new expression
+node. Existing `LiteralExpr[A]` overloads remain available for a reusable
+literal.
 
 The experiment exposed a current hole: with Scala explicit-nulls mode disabled,
 `column === null` compiles because `null` conforms to the reference type

@@ -91,6 +91,51 @@ checksum-ranked because the two runtimes use different legal floating-point
 reduction orders. All other admitted Pandas comparisons require exact
 checksums.
 
+dplyr also has a separate-process practical-pipeline court. Its two workloads
+follow the verb composition in the
+[official dplyr introduction](https://dplyr.tidyverse.org/articles/dplyr.html)
+instead of timing isolated operators:
+
+- two UTF-8 predicates, two immutable `withColumn` derivations, and a final
+  projection, with `Option[Double]` propagation through missing measures; and
+- a four-column projection followed by two nullable grouping keys and means
+  over two nullable measure columns. The dplyr side uses the tutorial's
+  `na.rm = TRUE`; frame4s uses its documented null-ignoring aggregate semantics.
+
+The Scala queries use typed `filter`, `withColumn`, `select`, `groupBy`, and
+`aggregate`; they do not reproduce dplyr's non-standard evaluation API.
+Fixture and query construction occur outside timing. Both dplyr outputs must
+match the semantic reference interpreter's row count and exact ordered
+non-floating/null structure before the separate R and JMH measurements are
+compared. Per-floating-column count, sum, sum of squares, minimum, maximum, and
+row-weighted first and second moments must also agree within a declared `1e-10`
+relative tolerance. The row-weighted terms bind floating values to output
+order instead of accepting only the same marginal distribution. The frame4s
+reference and candidate still require exact raw-bit checksums:
+
+```sh
+scripts/dplyr-practical-court.sh \
+  docs/benchmarks/receipts/YYYY-MM-DD-dplyr-practical \
+  full
+```
+
+The committed
+[frame4s receipt](receipts/2026-07-29-dplyr-practical/frame4s/summary.md) and
+[dplyr comparison](receipts/2026-07-29-dplyr-practical/dplyr/summary.md)
+record the full 10,000-row court. The internal columnar candidate completes
+the filter/derived-column/projection pipeline in 0.487 ms/op versus dplyr's
+1.340 ms median, and the projected nullable grouping pipeline in 0.722 ms/op
+versus 1.594 ms. These separate-process ratios are descriptive, not a claim
+that the semantic reference runtime has been replaced.
+
+The candidate rows forbid fallback. The current general expression compiler
+covers Boolean composition, UTF-8 comparisons, and checked or floating
+arithmetic over Int32, Int64, Float32, and Float64 columns. Direct projections
+retain all storage types. General grouped reduction accepts projected nullable
+Int32 and UTF-8 key vectors and multiple Float64 measures. Other physical
+families remain explicit capability residuals rather than silently ranked
+reference executions.
+
 data.table is measured in a separate single-thread R process with the same
 relational fixture and Scala validation receipt. Its ordinary relational
 measurements disable automatic and reusable indices so repeated samples do not

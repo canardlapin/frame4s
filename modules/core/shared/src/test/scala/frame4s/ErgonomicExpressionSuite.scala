@@ -100,6 +100,49 @@ class ErgonomicExpressionSuite extends munit.FunSuite:
     assertEquals(concise.schema, expanded.schema)
     assertEquals(concise.explain, expanded.explain)
 
+  test("nullable arithmetic preserves Option types, plans, and null propagation"):
+    type Output = (adjusted: Option[Double])
+    val reference = get(SourceRef.values("nullable-arithmetic", "nullable-arithmetic"))
+    val frame = get(Frame.values[Input](reference))
+    val concise: Frame[Output] = frame.select: row =>
+      Tuple1(((row.col("score") / Some(2.0)) + Some(1.0)).as("adjusted"))
+    val expanded: Frame[Output] = frame.select: row =>
+      Tuple1(
+        (
+          (row.col("score") / Expr.literal[Option[Double]](Some(2.0))) +
+            Expr.literal[Option[Double]](Some(1.0))
+        ).as("adjusted")
+      )
+    val input = get(
+      Table.fromRows[Input](
+        Vector(
+          (id = 1, score = Some(4.0), value = 0.0, label = "present"),
+          (id = 2, score = None, value = 0.0, label = "missing")
+        )
+      )
+    )
+    val result = get(
+      ReferenceInterpreter
+        .prepare(concise.plan, ReferenceSources.empty.bind(reference, input))
+        .collect[Output]
+    )
+    try
+      assertEquals(concise.plan, expanded.plan)
+      assertEquals(
+        result.column("adjusted"),
+        Right(Vector(Some(3.0), None))
+      )
+    finally
+      result.close()
+      input.close()
+
+    val message = firstDiagnostic(typeCheckErrors("""
+      import frame4s.*
+      def invalid[Origin](expression: ExprOf[String, Origin]) =
+        expression + "suffix"
+    """))
+    assertUserFacingFirst(message, "Arithmetic requires an Int, Long, Float, Double")
+
   test("concise and expanded forms have oracle result, ordering, and failure parity"):
     val reference = get(SourceRef.values("input", "input"))
     val frame = get(Frame.values[Input](reference))

@@ -81,6 +81,12 @@ termination, or cancellation.
 Integral arithmetic is checked and returns structured overflow or
 divide-by-zero failures. There are no implicit casts.
 
+`+`, `-`, and `*` accept `Int`, `Long`, `Float`, `Double`, and their
+`Option` forms. `/` accepts `Float`, `Double`, `Option[Float]`, and
+`Option[Double]`. Nullable arithmetic requires nullable operands explicitly
+and propagates null; frame4s does not install a global `Numeric[Option[A]]`
+instance or silently lift a non-null value.
+
 `sqrt` exists only for `Float`, `Double`, `Option[Float]`, and
 `Option[Double]`; it preserves width/nullability and follows IEEE behavior,
 including signed zero, NaN, negative inputs, and infinities.

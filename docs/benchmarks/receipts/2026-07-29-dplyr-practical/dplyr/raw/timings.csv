@@ -1,0 +1,3 @@
+benchmark,loops_per_sample,samples,median_ms,min_ms,max_ms,frame4s_ms,dplyr_over_frame4s
+filterWithColumnsSelect,256,9,1.33984375,1.29296875,1.69140625,0.487033066363791,2.75103240936663
+selectGroupSummarise,256,9,1.59375,1.546875,1.62890625,0.722191494159355,2.20682466200347
