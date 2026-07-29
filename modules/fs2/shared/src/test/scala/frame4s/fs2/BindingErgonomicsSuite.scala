@@ -226,7 +226,7 @@ class BindingErgonomicsSuite extends munit.FunSuite:
                 Left(RuntimeBindingFailure(RuntimeBindingError.Source(_, SourceError.Open(_)))),
                 Left(
                   RuntimeBindingFailure(
-                    RuntimeBindingError.Source(_, SourceError.Decode(_, _, _, _))
+                    RuntimeBindingError.Source(_, SourceError.Decode(_, _, _))
                   )
                 ),
                 Left(RuntimeBindingFailure(RuntimeBindingError.MissingSource(id))),

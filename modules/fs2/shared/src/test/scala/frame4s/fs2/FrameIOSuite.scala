@@ -7,11 +7,21 @@ import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import fs2.Stream
 import frame4s.*
+import scala.concurrent.duration.*
 
 class FrameIOSuite extends munit.FunSuite:
   type Input = (id: Int, label: String, score: Option[Double])
 
   private val schema = summon[SchemaDescriptor[Input]].schema
+
+  private def readLimits(
+      maxRecordChars: Int,
+      maxFieldChars: Int,
+      maxErrorExcerptChars: Int
+  ): DelimitedReadLimits =
+    DelimitedReadLimits
+      .create(maxRecordChars, maxFieldChars, maxErrorExcerptChars)
+      .fold(error => fail(error.message), identity)
 
   private def storage[A](result: Either[StorageError, A]): A =
     result.fold(error => fail(error.message), identity)
@@ -163,9 +173,53 @@ class FrameIOSuite extends munit.FunSuite:
             case Right(scan) => scan.batches.compile.drain
       .attempt
       .map:
-        case Left(SourceFailure(SourceError.Decode(2, 1, "not-an-int", DataType.Int32))) =>
+        case Left(
+              SourceFailure(
+                SourceError.Decode(
+                  SourceLocation(2L, 1, 15L),
+                  SourceExcerpt("not-an-int", 15L, false, false),
+                  DataType.Int32
+                )
+              )
+            ) =>
           ()
         case other => fail(s"expected structured CSV decode error, found $other")
+      .unsafeToFuture()
+
+  test("CSV decode failures retain a bounded value prefix"):
+    val limits =
+      readLimits(
+        maxRecordChars = 32,
+        maxFieldChars = 16,
+        maxErrorExcerptChars = 3
+      )
+    CsvFrameSource
+      .resource[IO](
+        "\"xxxxxx\",a,1.0\n",
+        CsvReadOptions(schema, header = false, limits = limits)
+      )
+      .use: source =>
+        source
+          .plan(ScanRequest())
+          .flatMap:
+            case Left(error) => IO.raiseError(SourceFailure(error))
+            case Right(scan) => scan.batches.compile.drain
+      .attempt
+      .map:
+        case Left(
+              SourceFailure(
+                SourceError.Decode(
+                  SourceLocation(1L, 1, 0L),
+                  excerpt,
+                  DataType.Int32
+                )
+              )
+            ) =>
+          assertEquals(excerpt.text, "\"xx")
+          assertEquals(excerpt.startOffset, 0L)
+          assert(!excerpt.truncatedBefore)
+          assert(excerpt.truncatedAfter)
+        case other => fail(s"expected bounded CSV decode error, found $other")
       .unsafeToFuture()
 
   test(
@@ -244,9 +298,216 @@ class FrameIOSuite extends munit.FunSuite:
             assert(detail.contains("id,label,score"))
           case other => fail(s"expected exact header mismatch, found $other")
         malformedResult match
-          case Left(SourceFailure(SourceError.MalformedCsv(2, detail))) =>
+          case Left(
+                SourceFailure(
+                  SourceError.MalformedDelimited(
+                    SourceLocation(2L, 3, 18L),
+                    detail,
+                    SourceExcerpt("1,a", 15L, false, false)
+                  )
+                )
+              ) =>
             assert(detail.contains("expected 3 fields but found 2"))
           case other => fail(s"expected logical row 2 malformed error, found $other")
+      .unsafeToFuture()
+
+  test("CSV rejects invalid finite bounds before source construction"):
+    assertEquals(
+      DelimitedReadLimits.create(
+        maxRecordChars = 2,
+        maxFieldChars = 3,
+        maxErrorExcerptChars = 1
+      ),
+      Left(DelimitedLimitError.FieldExceedsRecord(field = 3, record = 2))
+    )
+
+  test("field and record bounds are exact across arbitrary character chunking"):
+    def outcome(
+        text: String,
+        limits: DelimitedReadLimits,
+        chunkSize: Int
+    ): IO[Either[Throwable, Unit]] =
+      val input =
+        Stream
+          .emits(text.toVector)
+          .covary[IO]
+          .chunkN(chunkSize)
+          .flatMap(Stream.chunk)
+      CsvFrameSource
+        .characters[IO](
+          input,
+          CsvReadOptions(schema, header = false, limits = limits)
+        )
+        .use: source =>
+          source
+            .plan(ScanRequest())
+            .flatMap:
+              case Left(error) => IO.raiseError(SourceFailure(error))
+              case Right(scan) => scan.batches.compile.drain
+        .attempt
+
+    val fieldLimits =
+      readLimits(maxRecordChars = 32, maxFieldChars = 4, maxErrorExcerptChars = 3)
+    val recordLimits =
+      readLimits(maxRecordChars = 5, maxFieldChars = 5, maxErrorExcerptChars = 3)
+    val quotedRecordLimits =
+      readLimits(maxRecordChars = 9, maxFieldChars = 9, maxErrorExcerptChars = 3)
+
+    (1 to 5).toVector
+      .traverse: chunkSize =>
+        (
+          outcome("1,abcd,1", fieldLimits, chunkSize),
+          outcome("1,abcde,1", fieldLimits, chunkSize),
+          outcome("1,a,2", recordLimits, chunkSize),
+          outcome("1,a,20", recordLimits, chunkSize),
+          outcome(
+            "1,\"a\nb\",1\r\n",
+            quotedRecordLimits,
+            chunkSize
+          ),
+          outcome(
+            "1,\"a\nb\",10\r\n",
+            quotedRecordLimits,
+            chunkSize
+          )
+        ).tupled
+      .map: results =>
+        results.foreach:
+          (fieldExact, fieldOver, recordExact, recordOver, quotedExact, quotedOver) =>
+            assertEquals(fieldExact, Right(()))
+            fieldOver match
+              case Left(
+                    SourceFailure(
+                      SourceError.MalformedDelimited(location, detail, excerpt)
+                    )
+                  ) =>
+                assertEquals(location, SourceLocation(1L, 2, 6L))
+                assert(detail.contains("field exceeds 4 characters"))
+                assertEquals(excerpt.text, "cde")
+                assertEquals(excerpt.startOffset, 4L)
+                assert(excerpt.truncatedBefore)
+                assert(!excerpt.truncatedAfter)
+              case other => fail(s"expected bounded field failure, found $other")
+            assertEquals(recordExact, Right(()))
+            recordOver match
+              case Left(
+                    SourceFailure(
+                      SourceError.MalformedDelimited(location, detail, excerpt)
+                    )
+                  ) =>
+                assertEquals(location, SourceLocation(1L, 3, 5L))
+                assert(detail.contains("record exceeds 5 characters"))
+                assertEquals(excerpt.text, "a,2")
+                assertEquals(excerpt.startOffset, 2L)
+                assert(excerpt.truncatedBefore)
+                assert(!excerpt.truncatedAfter)
+              case other => fail(s"expected bounded record failure, found $other")
+            assertEquals(quotedExact, Right(()))
+            quotedOver match
+              case Left(
+                    SourceFailure(
+                      SourceError.MalformedDelimited(location, detail, excerpt)
+                    )
+                  ) =>
+                assertEquals(location, SourceLocation(1L, 3, 9L))
+                assert(detail.contains("record exceeds 9 characters"))
+                assertEquals(excerpt.startOffset, 6L)
+                assertEquals(excerpt.text.length, 3)
+                assert(excerpt.truncatedBefore)
+              case other => fail(s"expected bounded quoted-record failure, found $other")
+      .unsafeToFuture()
+
+  test("excess schema width fails at the offending delimiter without awaiting the source tail"):
+    Ref
+      .of[IO, Int](0)
+      .flatMap: finalized =>
+        val prefix = "id,label,score\n1,a,1.0,"
+        val input =
+          (Stream.emits(prefix.toVector).covary[IO] ++ Stream.never[IO])
+            .onFinalize(finalized.update(_ + 1))
+        CsvFrameSource
+          .characters[IO](input, CsvReadOptions(schema))
+          .use: source =>
+            source
+              .plan(ScanRequest())
+              .flatMap:
+                case Left(error) => IO.raiseError(SourceFailure(error))
+                case Right(scan) => scan.batches.compile.drain
+          .attempt
+          .timeout(2.seconds)
+          .flatMap(result => finalized.get.tupleLeft(result))
+          .map: (result, count) =>
+            result match
+              case Left(
+                    SourceFailure(
+                      SourceError.MalformedDelimited(location, detail, excerpt)
+                    )
+                  ) =>
+                assertEquals(location, SourceLocation(2L, 4, 22L))
+                assert(detail.contains("expected 3 fields but found more"))
+                assertEquals(excerpt.text, "1,a,1.0,")
+              case other => fail(s"expected prompt excess-width failure, found $other")
+            assertEquals(count, 1)
+      .unsafeToFuture()
+
+  test("quoted multiline syntax failures retain an exact location and bounded suffix"):
+    val input = "id,label,score\r\n1,\"abcdef\nxyz\"x,1.0\r\n"
+    val limits =
+      readLimits(
+        maxRecordChars = 64,
+        maxFieldChars = 32,
+        maxErrorExcerptChars = 7
+      )
+
+    CsvFrameSource
+      .characters[IO](
+        Stream.emits(input.toVector).covary[IO].chunkN(1).flatMap(Stream.chunk),
+        CsvReadOptions(schema, limits = limits)
+      )
+      .use: source =>
+        source
+          .plan(ScanRequest())
+          .flatMap:
+            case Left(error) => IO.raiseError(SourceFailure(error))
+            case Right(scan) => scan.batches.compile.drain
+      .attempt
+      .map:
+        case Left(
+              SourceFailure(
+                SourceError.MalformedDelimited(location, detail, excerpt)
+              )
+            ) =>
+          assertEquals(location, SourceLocation(2L, 2, input.lastIndexOf('x').toLong))
+          assert(detail.contains("unexpected 'x' after closing quote"))
+          assertEquals(excerpt.text.length, limits.maxErrorExcerptChars)
+          assert(excerpt.truncatedBefore)
+          assert(!excerpt.truncatedAfter)
+        case other => fail(s"expected bounded quoted-field failure, found $other")
+      .unsafeToFuture()
+
+  test("TSV forwards the shared finite field policy"):
+    val limits =
+      readLimits(maxRecordChars = 16, maxFieldChars = 2, maxErrorExcerptChars = 4)
+    TsvFrameSource
+      .resource[IO](
+        "1\tabc\t1.0\n",
+        TsvReadOptions(schema, header = false, limits = limits)
+      )
+      .use: source =>
+        source
+          .plan(ScanRequest())
+          .flatMap:
+            case Left(error) => IO.raiseError(SourceFailure(error))
+            case Right(scan) => scan.batches.compile.drain
+      .attempt
+      .map:
+        case Left(
+              SourceFailure(
+                SourceError.MalformedDelimited(SourceLocation(1L, 2, 4L), detail, _)
+              )
+            ) =>
+          assert(detail.contains("field exceeds 2 characters"))
+        case other => fail(s"expected shared TSV field failure, found $other")
       .unsafeToFuture()
 
   test("early termination finalizes the input and every emitted batch exactly once"):

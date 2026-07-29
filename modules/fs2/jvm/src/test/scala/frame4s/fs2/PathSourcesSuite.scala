@@ -10,6 +10,15 @@ import frame4s.*
 class PathSourcesSuite extends munit.FunSuite:
   type Input = (id: Int, label: String, score: Option[Double])
 
+  private def readLimits(
+      maxRecordChars: Int,
+      maxFieldChars: Int,
+      maxErrorExcerptChars: Int
+  ): DelimitedReadLimits =
+    DelimitedReadLimits
+      .create(maxRecordChars, maxFieldChars, maxErrorExcerptChars)
+      .fold(error => fail(error.message), identity)
+
   private def reference: SourceRef =
     SourceRef.scan("path-input", "path input").fold(error => fail(error.message), identity)
 
@@ -108,4 +117,46 @@ class PathSourcesSuite extends munit.FunSuite:
           assert(tsvText.contains("Ada"))
           assertEquals(csv.reference.kind, SourceKind.Scan)
           assertEquals(tsv.reference, csv.reference)
+      .unsafeToFuture()
+
+  test("JVM typed path bindings forward finite delimited limits"):
+    Resource
+      .make(
+        IO.blocking:
+          val path = java.nio.file.Files.createTempFile("frame4s-i1-limit-", ".tsv")
+          java.nio.file.Files.writeString(path, "1\tabcd\t1.0\n")
+          Path.fromNioPath(path)
+      )((path: Path) => IO.blocking(java.nio.file.Files.deleteIfExists(path.toNioPath)).void)
+      .use: path =>
+        val binding =
+          TsvPathSource.binding[IO, Input](
+            path,
+            TsvSettings(
+              header = false,
+              limits = readLimits(
+                maxRecordChars = 16,
+                maxFieldChars = 3,
+                maxErrorExcerptChars = 4
+              )
+            )
+          )
+        binding.collect(binding.frame).use_
+      .attempt
+      .map:
+        case Left(
+              RuntimeBindingFailure(
+                RuntimeBindingError.Source(
+                  _,
+                  SourceError.MalformedDelimited(
+                    SourceLocation(1L, 2, 5L),
+                    detail,
+                    excerpt
+                  )
+                )
+              )
+            ) =>
+          assert(detail.contains("field exceeds 3 characters"))
+          assertEquals(excerpt.text, "abcd")
+          assertEquals(excerpt.startOffset, 2L)
+        case other => fail(s"expected bounded TSV path failure, found $other")
       .unsafeToFuture()

@@ -67,27 +67,51 @@ final case class PushdownReceipt(
     columnsRead: Vector[String]
 )
 
+/** Exact position in decoded source text.
+  *
+  * Records and fields are one-based for diagnostics. `offset` is the zero-based number of decoded
+  * `Char` values consumed before this position.
+  */
+final case class SourceLocation(record: Long, field: Int, offset: Long)
+
+/** Finite diagnostic text retained from a source.
+  *
+  * `startOffset` locates the first retained `Char`. The truncation flags distinguish a complete
+  * excerpt from a bounded prefix or suffix without retaining the discarded source text.
+  */
+final case class SourceExcerpt(
+    text: String,
+    startOffset: Long,
+    truncatedBefore: Boolean,
+    truncatedAfter: Boolean
+)
+
 /** Structured source inspection, planning, decoding, storage, and lifecycle failures. */
 enum SourceError:
   case InvalidRequest(detail: String)
   case MissingColumn(name: String)
   case SchemaMismatch(detail: String)
-  case Decode(row: Int, column: Int, value: String, expected: DataType)
-  case MalformedCsv(row: Int, detail: String)
+  case Decode(location: SourceLocation, excerpt: SourceExcerpt, expected: DataType)
+  case MalformedDelimited(location: SourceLocation, detail: String, excerpt: SourceExcerpt)
   case Storage(error: StorageError)
   case Open(detail: String)
   case Close(detail: String)
 
   def message: String = this match
-    case InvalidRequest(value)                => value
-    case MissingColumn(name)                  => s"source column '$name' does not exist"
-    case SchemaMismatch(value)                => value
-    case Decode(row, column, value, expected) =>
-      s"row $row column $column value '$value' cannot be decoded as $expected"
-    case MalformedCsv(row, value) => s"malformed CSV row $row: $value"
-    case Storage(error)           => error.message
-    case Open(value)              => s"source open failed: $value"
-    case Close(value)             => s"source close failed: $value"
+    case InvalidRequest(value)               => value
+    case MissingColumn(name)                 => s"source column '$name' does not exist"
+    case SchemaMismatch(value)               => value
+    case Decode(location, excerpt, expected) =>
+      s"${renderLocation(location)} excerpt '${excerpt.text}' cannot be decoded as $expected"
+    case MalformedDelimited(location, detail, excerpt) =>
+      val context = Option.when(excerpt.text.nonEmpty)(s" near '${excerpt.text}'").getOrElse("")
+      s"malformed delimited input at ${renderLocation(location)}: $detail$context"
+    case Storage(error) => error.message
+    case Open(value)    => s"source open failed: $value"
+    case Close(value)   => s"source close failed: $value"
+
+  private def renderLocation(location: SourceLocation): String =
+    s"record ${location.record} field ${location.field} offset ${location.offset}"
 
 final case class SourceFailure(error: SourceError) extends RuntimeException(error.message)
 
@@ -362,6 +386,67 @@ enum CsvCoercion:
   case Strict
   case TrimWhitespace
 
+/** Construction failures for finite CSV and TSV reader bounds. */
+enum DelimitedLimitError:
+  case NonPositiveRecord(value: Int)
+  case NonPositiveField(value: Int)
+  case FieldExceedsRecord(field: Int, record: Int)
+  case NonPositiveErrorExcerpt(value: Int)
+
+  def message: String = this match
+    case NonPositiveRecord(value) =>
+      s"maximum record size must be positive, found $value"
+    case NonPositiveField(value) =>
+      s"maximum field size must be positive, found $value"
+    case FieldExceedsRecord(field, record) =>
+      s"maximum field size $field cannot exceed maximum record size $record"
+    case NonPositiveErrorExcerpt(value) =>
+      s"maximum error excerpt size must be positive, found $value"
+
+/** Finite state and diagnostic bounds for CSV and TSV readers.
+  *
+  * Bounds count decoded `Char` values rather than input bytes. Record size includes delimiters,
+  * quotes, and quoted line breaks but excludes the terminating line break. Field size counts the
+  * decoded field value. Use [[DelimitedReadLimits.create]] for custom validated bounds.
+  */
+final case class DelimitedReadLimits private (
+    maxRecordChars: Int,
+    maxFieldChars: Int,
+    maxErrorExcerptChars: Int
+)
+
+object DelimitedReadLimits:
+  final val DefaultMaxRecordChars: Int = 16 * 1024 * 1024
+  final val DefaultMaxFieldChars: Int = 4 * 1024 * 1024
+  final val DefaultMaxErrorExcerptChars: Int = 160
+
+  val default: DelimitedReadLimits =
+    new DelimitedReadLimits(
+      DefaultMaxRecordChars,
+      DefaultMaxFieldChars,
+      DefaultMaxErrorExcerptChars
+    )
+
+  def create(
+      maxRecordChars: Int = DefaultMaxRecordChars,
+      maxFieldChars: Int = DefaultMaxFieldChars,
+      maxErrorExcerptChars: Int = DefaultMaxErrorExcerptChars
+  ): Either[DelimitedLimitError, DelimitedReadLimits] =
+    if maxRecordChars <= 0 then Left(DelimitedLimitError.NonPositiveRecord(maxRecordChars))
+    else if maxFieldChars <= 0 then Left(DelimitedLimitError.NonPositiveField(maxFieldChars))
+    else if maxFieldChars > maxRecordChars then
+      Left(DelimitedLimitError.FieldExceedsRecord(maxFieldChars, maxRecordChars))
+    else if maxErrorExcerptChars <= 0 then
+      Left(DelimitedLimitError.NonPositiveErrorExcerpt(maxErrorExcerptChars))
+    else
+      Right(
+        new DelimitedReadLimits(
+          maxRecordChars,
+          maxFieldChars,
+          maxErrorExcerptChars
+        )
+      )
+
 /** Runtime CSV decoding options paired with an explicit [[Schema]]. */
 final case class CsvReadOptions(
     schema: Schema,
@@ -369,7 +454,8 @@ final case class CsvReadOptions(
     header: Boolean = true,
     nullTokens: Set[String] = Set("", "null"),
     coercion: CsvCoercion = CsvCoercion.Strict,
-    batchSize: Int = 1024
+    batchSize: Int = 1024,
+    limits: DelimitedReadLimits = DelimitedReadLimits.default
 )
 
 /** Typed CSV settings omit the runtime schema because it is derived from the named-tuple type. */
@@ -383,10 +469,19 @@ final case class CsvSettings(
     header: Boolean = true,
     nullTokens: Set[String] = Set("", "null"),
     coercion: CsvCoercion = CsvCoercion.Strict,
-    batchSize: Int = 1024
+    batchSize: Int = 1024,
+    limits: DelimitedReadLimits = DelimitedReadLimits.default
 ):
   private[fs2] def options(schema: Schema): CsvReadOptions =
-    CsvReadOptions(schema, delimiter, header, nullTokens, coercion, batchSize)
+    CsvReadOptions(
+      schema = schema,
+      delimiter = delimiter,
+      header = header,
+      nullTokens = nullTokens,
+      coercion = coercion,
+      batchSize = batchSize,
+      limits = limits
+    )
 
 /** Portable incremental CSV source for strings, bytes, or characters.
   *
@@ -589,7 +684,8 @@ final case class TsvReadOptions(
     header: Boolean = true,
     nullTokens: Set[String] = Set("", "null"),
     coercion: CsvCoercion = CsvCoercion.Strict,
-    batchSize: Int = 1024
+    batchSize: Int = 1024,
+    limits: DelimitedReadLimits = DelimitedReadLimits.default
 ):
   private[fs2] def csvOptions: CsvReadOptions =
     CsvReadOptions(
@@ -598,7 +694,8 @@ final case class TsvReadOptions(
       header = header,
       nullTokens = nullTokens,
       coercion = coercion,
-      batchSize = batchSize
+      batchSize = batchSize,
+      limits = limits
     )
 
 /** Typed TSV settings; semantics match [[CsvSettings]] with a tab delimiter. */
@@ -606,10 +703,18 @@ final case class TsvSettings(
     header: Boolean = true,
     nullTokens: Set[String] = Set("", "null"),
     coercion: CsvCoercion = CsvCoercion.Strict,
-    batchSize: Int = 1024
+    batchSize: Int = 1024,
+    limits: DelimitedReadLimits = DelimitedReadLimits.default
 ):
   private[fs2] def csvSettings: CsvSettings =
-    CsvSettings('\t', header, nullTokens, coercion, batchSize)
+    CsvSettings(
+      delimiter = '\t',
+      header = header,
+      nullTokens = nullTokens,
+      coercion = coercion,
+      batchSize = batchSize,
+      limits = limits
+    )
 
 /** Portable TSV source implemented by the same incremental parser and ownership rules as CSV. */
 final class TsvFrameSource[F[_]] private (
@@ -730,20 +835,44 @@ trait ArrowIpcPlatform[F[_]] extends FrameSource[F]:
       batches: Stream[F, RecordBatch]
   ): F[Either[SinkError, SinkReceipt]]
 
-final private case class CsvRecord(number: Int, values: Vector[String])
+final private case class CsvCell(
+    value: String,
+    location: SourceLocation,
+    excerpt: SourceExcerpt
+)
+
+final private case class CsvRecord(
+    number: Long,
+    cells: Vector[CsvCell],
+    excerpt: SourceExcerpt,
+    endOffset: Long
+):
+  def values: Vector[String] = cells.map(_.value)
 
 /** Per-compilation CSV state machine. It retains only the current record plus completed records
-  * from the current input chunk, so retained input is bounded by the largest in-progress record and
-  * the downstream batch size.
+  * from the current input chunk. Explicit record, field, excerpt, and downstream batch limits bound
+  * all retained input independently of upstream chunking.
   */
-final private class CsvParser(delimiter: Char):
-  private val fields = ArrayBuffer.empty[String]
+final private class CsvParser(
+    delimiter: Char,
+    expectedFields: Int,
+    limits: DelimitedReadLimits
+):
+  private val fields = ArrayBuffer.empty[CsvCell]
   private val field = new StringBuilder
+  private val fieldContext = new StringBuilder
+  private val context = new StringBuilder
   private var quoted = false
   private var afterQuote = false
   private var rowStarted = false
   private var skipLineFeed = false
-  private var recordNumber = 1
+  private var recordNumber = 1L
+  private var offset = 0L
+  private var fieldStartOffset = 0L
+  private var contextStartOffset = 0L
+  private var contextTruncated = false
+  private var fieldContextTruncated = false
+  private var recordChars = 0
 
   def feed(chunk: Chunk[Char]): Either[SourceError, Vector[CsvRecord]] =
     val completed = Vector.newBuilder[CsvRecord]
@@ -753,7 +882,10 @@ final private class CsvParser(delimiter: Char):
       val current = iterator.next()
       if skipLineFeed then
         skipLineFeed = false
-        if current != '\n' then
+        if current == '\n' then
+          fieldStartOffset = offset + 1L
+          contextStartOffset = offset + 1L
+        else
           consume(current, completed) match
             case Some(value) => error = Some(value)
             case None        => ()
@@ -761,92 +893,174 @@ final private class CsvParser(delimiter: Char):
         consume(current, completed) match
           case Some(value) => error = Some(value)
           case None        => ()
+      offset += 1L
     error.toLeft(completed.result())
 
   def finish(): Either[SourceError, Vector[CsvRecord]] =
-    if quoted then Left(SourceError.MalformedCsv(recordNumber, "unterminated quoted field"))
+    if quoted then Left(malformed("unterminated quoted field"))
     else if rowStarted || fields.nonEmpty || field.nonEmpty || afterQuote then
-      Right(Vector(finishRecord()))
+      Right(Vector(finishRecord(offset)))
     else Right(Vector.empty)
 
   private def consume(
       current: Char,
       completed: scala.collection.mutable.Builder[CsvRecord, Vector[CsvRecord]]
   ): Option[SourceError] =
-    if quoted then
-      if current == '"' then
-        quoted = false
-        afterQuote = true
+    val terminatesRecord = !quoted && (current == '\n' || current == '\r')
+    val terminatesField =
+      !quoted && (current == delimiter || current == '\n' || current == '\r')
+    val sizeError =
+      if terminatesRecord then None
+      else appendRecord(current)
+
+    sizeError.orElse:
+      if !terminatesField then appendFieldContext(current)
+      if quoted then
+        if current == '"' then
+          quoted = false
+          afterQuote = true
+          None
+        else
+          appendField(current) match
+            case error @ Some(_) => error
+            case None            =>
+              rowStarted = true
+              None
+      else if afterQuote then
+        current match
+          case '"' =>
+            appendField('"') match
+              case error @ Some(_) => error
+              case None            =>
+                quoted = true
+                afterQuote = false
+                rowStarted = true
+                None
+          case value if value == delimiter =>
+            excessField().orElse:
+              finishField()
+              afterQuote = false
+              None
+          case '\n' =>
+            completed += finishRecord(offset)
+            None
+          case '\r' =>
+            completed += finishRecord(offset)
+            skipLineFeed = true
+            None
+          case value =>
+            Some(malformed(s"unexpected '$value' after closing quote"))
       else
-        field.append(current)
-        rowStarted = true
-      None
-    else if afterQuote then
-      current match
-        case '"' =>
-          field.append('"')
-          quoted = true
-          afterQuote = false
-          rowStarted = true
-          None
-        case value if value == delimiter =>
-          finishField()
-          afterQuote = false
-          None
-        case '\n' =>
-          completed += finishRecord()
-          None
-        case '\r' =>
-          completed += finishRecord()
-          skipLineFeed = true
-          None
-        case value =>
-          Some(
-            SourceError.MalformedCsv(
-              recordNumber,
-              s"unexpected '$value' after closing quote"
-            )
-          )
+        current match
+          case '"' if field.isEmpty =>
+            quoted = true
+            rowStarted = true
+            None
+          case '"' =>
+            Some(malformed("quote inside unquoted field"))
+          case value if value == delimiter =>
+            excessField().orElse:
+              finishField()
+              rowStarted = true
+              None
+          case '\n' =>
+            completed += finishRecord(offset)
+            None
+          case '\r' =>
+            completed += finishRecord(offset)
+            skipLineFeed = true
+            None
+          case value =>
+            appendField(value) match
+              case error @ Some(_) => error
+              case None            =>
+                rowStarted = true
+                None
+
+  private def appendRecord(current: Char): Option[SourceError] =
+    if recordChars >= limits.maxRecordChars then
+      Some(malformed(s"record exceeds ${limits.maxRecordChars} characters"))
     else
-      current match
-        case '"' if field.isEmpty =>
-          quoted = true
-          rowStarted = true
-          None
-        case '"' =>
-          Some(SourceError.MalformedCsv(recordNumber, "quote inside unquoted field"))
-        case value if value == delimiter =>
-          finishField()
-          rowStarted = true
-          None
-        case '\n' =>
-          completed += finishRecord()
-          None
-        case '\r' =>
-          completed += finishRecord()
-          skipLineFeed = true
-          None
-        case value =>
-          field.append(value)
-          rowStarted = true
-          None
+      if context.length >= limits.maxErrorExcerptChars then
+        context.deleteCharAt(0)
+        contextStartOffset += 1L
+        contextTruncated = true
+      context.append(current)
+      recordChars += 1
+      None
+
+  private def appendField(current: Char): Option[SourceError] =
+    if field.length >= limits.maxFieldChars then
+      Some(malformed(s"field exceeds ${limits.maxFieldChars} characters"))
+    else
+      field.append(current)
+      None
+
+  private def appendFieldContext(current: Char): Unit =
+    if fieldContext.length < limits.maxErrorExcerptChars then fieldContext.append(current)
+    else fieldContextTruncated = true
+
+  private def excessField(): Option[SourceError] =
+    if fields.length + 1 >= expectedFields then
+      Some(
+        SourceError.MalformedDelimited(
+          SourceLocation(recordNumber, expectedFields + 1, offset),
+          s"expected $expectedFields fields but found more",
+          currentExcerpt
+        )
+      )
+    else None
+
+  private def malformed(detail: String): SourceError =
+    SourceError.MalformedDelimited(
+      SourceLocation(recordNumber, fields.length + 1, offset),
+      detail,
+      currentExcerpt
+    )
+
+  private def currentExcerpt: SourceExcerpt =
+    SourceExcerpt(
+      context.result(),
+      contextStartOffset,
+      truncatedBefore = contextTruncated,
+      truncatedAfter = false
+    )
 
   private def finishField(): Unit =
-    fields += field.result()
+    fields += CsvCell(
+      field.result(),
+      SourceLocation(recordNumber, fields.length + 1, fieldStartOffset),
+      SourceExcerpt(
+        fieldContext.result(),
+        fieldStartOffset,
+        truncatedBefore = false,
+        truncatedAfter = fieldContextTruncated
+      )
+    )
     field.clear()
+    fieldContext.clear()
+    fieldContextTruncated = false
+    fieldStartOffset = offset + 1L
 
-  private def finishRecord(): CsvRecord =
+  private def finishRecord(endOffset: Long): CsvRecord =
     finishField()
-    val result = CsvRecord(recordNumber, fields.toVector)
+    val result = CsvRecord(recordNumber, fields.toVector, currentExcerpt, endOffset)
     fields.clear()
     field.clear()
+    context.clear()
     quoted = false
     afterQuote = false
     rowStarted = false
-    recordNumber += 1
+    contextTruncated = false
+    recordChars = 0
+    recordNumber += 1L
+    fieldStartOffset = offset + 1L
+    contextStartOffset = offset + 1L
     result
 
 private object CsvStreaming:
+  private val MaxParserChunkChars = 4096
+
   def batches[F[_]](
       input: Stream[F, Char],
       options: CsvReadOptions,
@@ -854,10 +1068,19 @@ private object CsvStreaming:
   )(using F: Async[F]): Stream[F, RecordBatch] =
     val records =
       Stream
-        .eval(F.delay(new CsvParser(options.delimiter)))
+        .eval(
+          F.delay(
+            new CsvParser(
+              options.delimiter,
+              options.schema.size,
+              options.limits
+            )
+          )
+        )
         .flatMap: parser =>
           val chunks =
-            input.chunks
+            input
+              .chunkLimit(MaxParserChunkChars)
               .evalMap(chunk => F.fromEither(parser.feed(chunk).leftMap(SourceFailure.apply)))
               .flatMap(Stream.emits)
           chunks ++ Stream
@@ -891,7 +1114,15 @@ private object CsvStreaming:
     records.pull.uncons1
       .flatMap:
         case None =>
-          Pull.raiseError(SourceFailure(SourceError.MalformedCsv(1, "missing header")))
+          Pull.raiseError(
+            SourceFailure(
+              SourceError.MalformedDelimited(
+                SourceLocation(1L, 1, 0L),
+                "missing header",
+                SourceExcerpt("", 0L, truncatedBefore = false, truncatedAfter = false)
+              )
+            )
+          )
         case Some((header, tail)) =>
           val expected = schema.fields.map(_.name)
           if header.values == expected then tail.pull.echo
@@ -915,31 +1146,38 @@ private object CsvCodec:
   ): Either[SourceError, RecordBatch] =
     rows.find(_.values.length != options.schema.size) match
       case Some(row) =>
+        val field =
+          if row.cells.length < options.schema.size then row.cells.length + 1
+          else options.schema.size + 1
         Left(
-          SourceError.MalformedCsv(
-            row.number,
-            s"expected ${options.schema.size} fields but found ${row.values.length}"
+          SourceError.MalformedDelimited(
+            SourceLocation(row.number, field, row.endOffset),
+            s"expected ${options.schema.size} fields but found ${row.cells.length}",
+            row.excerpt
           )
         )
       case None =>
         val columns = options.schema.fields.zipWithIndex.map: (field, column) =>
           val values = rows.map: row =>
-            val raw = row.values(column)
+            val cell = row.cells(column)
             val value =
-              if options.coercion == CsvCoercion.TrimWhitespace then raw.trim
-              else raw
-            (value, row.number)
-          decodeColumn(field, column, values, options.nullTokens)
+              if options.coercion == CsvCoercion.TrimWhitespace then cell.value.trim
+              else cell.value
+            cell.copy(value = value)
+          decodeColumn(
+            field,
+            values,
+            options.nullTokens
+          )
         sequence(columns).flatMap: decoded =>
           RecordBatch(options.schema, decoded).leftMap(SourceError.Storage.apply)
 
   private def decodeColumn(
       field: Field,
-      column: Int,
-      values: Vector[(String, Int)],
+      values: Vector[CsvCell],
       nullTokens: Set[String]
   ): Either[SourceError, ColumnArray] =
-    val valid = values.map((value, _) => !nullTokens.contains(value)).toArray
+    val valid = values.map(cell => !nullTokens.contains(cell.value)).toArray
     def decode[A: ClassTag](
         expected: DataType
     )(parser: String => Option[A]): Either[SourceError, Array[A]] =
@@ -947,11 +1185,18 @@ private object CsvCodec:
       var index = 0
       var error: Option[SourceError] = None
       while index < values.length && error.isEmpty do
-        val (value, row) = values(index)
+        val cell = values(index)
         if valid(index) then
-          parser(value) match
+          parser(cell.value) match
             case Some(decoded) => output(index) = decoded
-            case None          => error = Some(SourceError.Decode(row, column + 1, value, expected))
+            case None          =>
+              error = Some(
+                SourceError.Decode(
+                  cell.location,
+                  cell.excerpt,
+                  expected
+                )
+              )
         index += 1
       error match
         case Some(value) => Left(value)
@@ -977,7 +1222,7 @@ private object CsvCodec:
         decode(DataType.Float64)(_.toDoubleOption)
           .flatMap(values => ColumnArray.float64(values, valid).leftMap(SourceError.Storage.apply))
       case DataType.Utf8 =>
-        val decoded = values.map(_._1).toArray
+        val decoded = values.map(_.value).toArray
         ColumnArray.utf8(decoded, valid).leftMap(SourceError.Storage.apply)
       case DataType.Timestamp(unit) =>
         decode(DataType.Timestamp(unit))(_.toLongOption)

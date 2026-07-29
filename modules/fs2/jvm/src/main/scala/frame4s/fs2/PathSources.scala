@@ -81,11 +81,12 @@ object TsvPathSource:
       resource(
         path,
         TsvReadOptions(
-          descriptor.schema,
-          settings.header,
-          settings.nullTokens,
-          settings.coercion,
-          settings.batchSize
+          schema = descriptor.schema,
+          header = settings.header,
+          nullTokens = settings.nullTokens,
+          coercion = settings.coercion,
+          batchSize = settings.batchSize,
+          limits = settings.limits
         )
       )
     )
@@ -111,11 +112,12 @@ object TsvPathSource:
       resource(
         path,
         TsvReadOptions(
-          descriptor.schema,
-          settings.header,
-          settings.nullTokens,
-          settings.coercion,
-          settings.batchSize
+          schema = descriptor.schema,
+          header = settings.header,
+          nullTokens = settings.nullTokens,
+          coercion = settings.coercion,
+          batchSize = settings.batchSize,
+          limits = settings.limits
         )
       )
     )
