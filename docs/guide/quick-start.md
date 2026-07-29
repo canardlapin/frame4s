@@ -55,4 +55,5 @@ string, and closes the materialized table before the `IO` completes. The raw
 `label` column keeps its existing name; the computed square root needs the new
 name `root`.
 
-Next, [read typed CSV or TSV data](csv-tsv.md).
+Next, [build a practical dataframe pipeline](practical-pipelines.md) or
+[read typed CSV or TSV data](csv-tsv.md).

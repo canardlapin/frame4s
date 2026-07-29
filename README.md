@@ -40,7 +40,8 @@ It uses no handwritten runtime schema, source identity, runtime setup, manual
 batch, internal API, or unsafe cast.
 
 Read the executable [three-minute quick start](docs/guide/quick-start.md), then
-continue to [typed CSV and TSV](docs/guide/csv-tsv.md) or
+continue to [practical dataframe pipelines](docs/guide/practical-pipelines.md),
+[typed CSV and TSV](docs/guide/csv-tsv.md), or
 [execution and ownership](docs/guide/execution-and-ownership.md).
 
 The central types are:
@@ -50,6 +51,23 @@ Frame[Schema] // immutable typed logical plan
 Expr[A]       // typed column expression
 Table[Schema] // materialized columnar data
 ```
+
+## Practical pipelines
+
+`Frame` supports the common local-dataframe workflow without introducing a
+mutable dataframe API:
+
+- `filter` keeps rows selected by a typed Boolean expression;
+- `select` computes an exact output schema from named expressions;
+- `withColumn` appends a derived column to a new `Frame`;
+- `replace` derives a new value for an existing column; and
+- `groupBy(...).aggregate(...)` computes typed summaries.
+
+Nullable columns use `Option[A]`. Nullable arithmetic requires an explicit
+nullable operand, so `row.col("height") / Some(100.0)` returns
+`Option[Double]` and propagates missing values. See the
+[practical-pipelines guide](docs/guide/practical-pipelines.md) for a complete
+filter, derived-column, projection, and grouped-summary example.
 
 ## Modules
 
@@ -62,14 +80,16 @@ Table[Schema] // materialized columnar data
   deterministic generators, shrinkers, backend-conformance laws, and
   compile-time specimens.
 - `frame4s-benchmarks`: a non-published JVM JMH court with raw versioned
-  receipts and honest Saddle/specialized-baseline comparisons.
+  receipts and matched comparisons with Saddle, Pandas, data.table, and dplyr.
 - `frame4s-first-contact`: a non-published downstream-package specimen that
   continuously proves the public typed-source-to-query-to-bounded-output path.
 
 The reference interpreter defines semantics and provides a small useful local
-backend. It is not intended to become a new production columnar engine.
-Production integrations such as Polars, DuckDB, or Parquet belong in optional
-adapters.
+backend. It remains the backend used by the public `FrameRuntime`. A separate
+internal columnar candidate now covers general typed expression pipelines and
+projected nullable grouping, but it is benchmark and conformance evidence for
+future backend work, not a public runtime selection. Production integrations
+such as Polars, DuckDB, or Parquet still belong in optional adapters.
 
 ## Status
 
@@ -114,6 +134,14 @@ Performance claims are governed by the
 [measurement court](docs/benchmarks/court.md) and
 [ratified budgets](docs/benchmarks/budgets.md); the published receipt includes
 the workloads frame4s currently loses.
+
+The current 10,000-row
+[practical-pipeline receipt](docs/benchmarks/receipts/2026-07-29-dplyr-practical/dplyr/summary.md)
+records the internal columnar candidate at `0.487 ms/op` for
+filter/derived-column/projection and `0.722 ms/op` for projected nullable
+grouping. The corresponding dplyr medians were `1.340 ms` and `1.594 ms` in a
+separate R process. These descriptive ratios do not imply that public
+`FrameRuntime` calls use the candidate.
 
 The semantic contract, resource ownership rules, and deliberate scope boundary
 are described in [the architecture](docs/design/architecture.md).
