@@ -178,6 +178,9 @@ class IndexLookupState extends IndexScanState:
   def indexedBatch(): Int32LookupResult =
     materialize(indexValue.lookup(batchTargets))
 
+  def indexedSortedBatchControl(): Int32LookupResult =
+    materialize(indexValue.lookupSortedBatchControl(batchTargets))
+
   def buildIndex(): Long =
     val built = build(sourcesValue, referenceValue, tableValue.schema)
     try built.ownedBytes
@@ -412,6 +415,10 @@ class ExtendedIndexLookupCourt:
   @Benchmark
   def batch32Lookup(state: ExtendedIndexLookupState): Long =
     state.indexedBatch().checksum
+
+  @Benchmark
+  def sortedBatchControl(state: ExtendedIndexLookupState): Long =
+    state.indexedSortedBatchControl().checksum
 
 @BenchmarkMode(Array(Mode.AverageTime))
 @OutputTimeUnit(TimeUnit.MILLISECONDS)

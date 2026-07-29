@@ -79,5 +79,3 @@ ExtendedIndexLookupCourt.singleLookup	1000000	7813	14591963101091370202	exact pa
 ExtendedIndexLookupCourt.batch32Lookup	1000000	7842	16398796646659458615	exact parity with stable linear scan; query unchanged	grouped-hash	skewed
 ExtendedIndexLookupCourt.sortedBatchControl	1000000	7842	16398796646659458615	same-counting-pass primitive-sort control; exact parity with stable linear scan	grouped-hash	skewed
 ExtendedIndexBuildCourt.build	1000000	1000000	10614600	owned index bytes	grouped-hash	skewed
-FlatAllEqualBuildCourt.build	1000000	1000000	10666672	all-equal build; exact lookup parity with stable scan	flat-hash-rows	all-equal
-FlatAllEqualBuildCourt.build	1000000	1000000	4000132	all-equal build; exact lookup parity with stable scan	grouped-hash	all-equal

@@ -453,8 +453,13 @@ class SecondaryIndexSuite extends munit.FunSuite:
         val index = build(sources, reference, table.schema, layout)
         try
           val selection = lookup(index, queries)
+          val sortedControl =
+            index
+              .lookupSortedBatchControl(queries)
+              .fold(error => fail(error.message), identity)
           assert(selection.size >= 128, layout.label)
           assertEquals(ordinals(selection), expected.toVector, layout.label)
+          assertEquals(ordinals(sortedControl), expected.toVector, layout.label)
         finally index.close()
     finally table.close()
 

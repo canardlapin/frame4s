@@ -135,6 +135,14 @@ sealed private[frame4s] trait Int32IndexBackend:
   def dominantBatchStrategy: SecondaryIndexBatchStrategy =
     SecondaryIndexBatchStrategy.DominantMerge
 
+  def streamLength(firstToken: Int): Int =
+    var matches = 0
+    var token = firstToken
+    while token >= 0 do
+      matches += 1
+      token = next(token)
+    matches
+
   def mergeBalancedStreams(
       tokens: Array[Int],
       tokenCount: Int,
@@ -234,6 +242,14 @@ final private class FastHashBackend(
   override val balancedBatchStrategy: SecondaryIndexBatchStrategy =
     SecondaryIndexBatchStrategy.HeapMerge
 
+  override def streamLength(firstToken: Int): Int =
+    var matches = 0
+    var row = firstToken
+    while row >= 0 do
+      matches += 1
+      row = nextRows(row)
+    matches
+
   override def mergeDominantStreams(
       tokens: Array[Int],
       tokenCount: Int,
@@ -332,6 +348,12 @@ final private class CompactSortedBackend(
 
   override val balancedBatchStrategy: SecondaryIndexBatchStrategy =
     SecondaryIndexBatchStrategy.HeapMerge
+
+  override def streamLength(firstToken: Int): Int =
+    val key = keys(firstToken)
+    var following = firstToken + 1
+    while following < keys.length && keys(following) == key do following += 1
+    following - firstToken
 
   override def mergeBalancedStreams(
       tokens: Array[Int],
@@ -480,6 +502,12 @@ final private class PackedSortedBackend(
   val ownedBytes: Long =
     keys.length.toLong * 4L + rows.ownedBytes
 
+  override def streamLength(firstToken: Int): Int =
+    val key = keys(firstToken)
+    var following = firstToken + 1
+    while following < keys.length && keys(following) == key do following += 1
+    following - firstToken
+
   def first(key: Int): Int =
     var low = 0
     var high = keys.length
@@ -538,6 +566,14 @@ final private class FlatHashRowsBackend(
 
   val ownedBytes: Long =
     (keys.length.toLong + rows.length.toLong) * 4L
+
+  override def streamLength(firstToken: Int): Int =
+    var matches = 1
+    var token = next(firstToken)
+    while token >= 0 do
+      matches += 1
+      token = next(token)
+    matches
 
   def first(key: Int): Int =
     if rows.isEmpty then Int32SecondaryIndex.MissingRow
@@ -632,6 +668,15 @@ final private class GroupedHashBackend(
         duplicateStarts.length.toLong +
         duplicateRows.length.toLong
     ) * 4L
+
+  override def streamLength(firstToken: Int): Int =
+    val entry = entries(firstToken)
+    if !isDuplicateEntry(entry) then 1
+    else
+      val start = duplicateStarts(payload(entry))
+      var end = start
+      while !isLastOverflowRow(duplicateRows(end)) do end += 1
+      end - start + 1
 
   def first(key: Int): Int =
     if entries.isEmpty then Int32SecondaryIndex.MissingRow
@@ -806,16 +851,15 @@ final private[frame4s] class Int32SecondaryIndex private (
         var longestStreamIndex = Int32SecondaryIndex.MissingRow
         var query = 0
         while query < distinctCount do
-          var token = backend.first(distinct(query))
+          val token = backend.first(distinct(query))
           val streamIndex = streams
           if token >= 0 then
             distinct(streamIndex) = token
             streams += 1
-          var streamMatches = 0
-          while token >= 0 do
-            matches += 1
-            streamMatches += 1
-            token = backend.next(token)
+          val streamMatches =
+            if token >= 0 then backend.streamLength(token)
+            else 0
+          matches += streamMatches
           if streamMatches > longestStream then
             longestStream = streamMatches
             longestStreamIndex = streamIndex
@@ -850,6 +894,43 @@ final private[frame4s] class Int32SecondaryIndex private (
                 token = backend.next(token)
               query += 1
             java.util.Arrays.sort(ordinals)
+        Right(Int32RowSelection.fromOwned(ordinals))
+
+  /** Same-counting-pass primitive-sort control used by the benchmark court.
+    *
+    * Keeping this control in the same binary isolates the adaptive merge decision from JVM, host,
+    * and fixture drift. It is package-private and is not part of prepared execution.
+    */
+  private[frame4s] def lookupSortedBatchControl(
+      queryKeys: Array[Int]
+  ): Either[SecondaryIndexError, Int32RowSelection] =
+    synchronized:
+      if closed then Left(SecondaryIndexError.Closed)
+      else
+        val distinct = queryKeys.clone()
+        val distinctCount = compactDistinctSorted(distinct)
+        var matches = 0
+        var streams = 0
+        var query = 0
+        while query < distinctCount do
+          val token = backend.first(distinct(query))
+          if token >= 0 then
+            distinct(streams) = token
+            streams += 1
+            matches += backend.streamLength(token)
+          query += 1
+
+        val ordinals = new Array[Int](matches)
+        var output = 0
+        query = 0
+        while query < streams do
+          var token = distinct(query)
+          while token >= 0 do
+            ordinals(output) = backend.row(token)
+            output += 1
+            token = backend.next(token)
+          query += 1
+        java.util.Arrays.sort(ordinals)
         Right(Int32RowSelection.fromOwned(ordinals))
 
   private[frame4s] def withView[A](

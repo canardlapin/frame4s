@@ -8,18 +8,18 @@ the Scala semantic-oracle receipt before measurement.
 
 | Workload | data.table median | Range | frame4s JMH | data.table/frame4s |
 |---|---:|---:|---:|---:|
-| `primitiveMaterializedProjection` | 0.173828 ms | 0.167969-0.181641 ms | n/a | n/a |
-| `fusedFilterProjectArithmetic` | 0.186523 ms | 0.178223-0.198730 ms | n/a | n/a |
-| `groupedLowCardinalitySumOnly` | 0.252930 ms | 0.243164-0.261719 ms | n/a | n/a |
-| `groupedLowCardinality` | 0.357422 ms | 0.336914-0.376953 ms | n/a | n/a |
-| `joinOneToOne` | 0.425781 ms | 0.411133-0.437500 ms | 0.056562 ms | 7.53x |
-| `joinOneToMany` | 0.439453 ms | 0.413086-0.467773 ms | 0.051471 ms | 8.54x |
-| `joinSparse` | 0.394531 ms | 0.378906-0.405273 ms | 0.014902 ms | 26.48x |
-| `joinSkewed` | 0.422852 ms | 0.399414-0.584961 ms | 0.067969 ms | 6.22x |
-| `distinctLowCardinality` | 0.217773 ms | 0.191406-0.312500 ms | n/a | n/a |
-| `semiJoinSparse` | 0.368164 ms | 0.345703-0.392578 ms | n/a | n/a |
-| `antiJoinSparse` | 0.351562 ms | 0.340820-0.390625 ms | n/a | n/a |
-| `unionAll` | 0.032349 ms | 0.030396-0.032959 ms | n/a | n/a |
+| `primitiveMaterializedProjection` | 0.174316 ms | 0.166504-0.177246 ms | n/a | n/a |
+| `fusedFilterProjectArithmetic` | 0.184570 ms | 0.169922-0.196777 ms | n/a | n/a |
+| `groupedLowCardinalitySumOnly` | 0.245117 ms | 0.239258-0.259766 ms | n/a | n/a |
+| `groupedLowCardinality` | 0.348633 ms | 0.341797-0.369141 ms | n/a | n/a |
+| `joinOneToOne` | 0.420898 ms | 0.409180-0.431641 ms | 0.050819 ms | 8.28x |
+| `joinOneToMany` | 0.405273 ms | 0.402344-0.426758 ms | 0.050764 ms | 7.98x |
+| `joinSparse` | 0.386719 ms | 0.371094-0.399414 ms | 0.010034 ms | 38.54x |
+| `joinSkewed` | 0.407227 ms | 0.382812-0.420898 ms | 0.050411 ms | 8.08x |
+| `distinctLowCardinality` | 0.205078 ms | 0.198242-0.222656 ms | n/a | n/a |
+| `semiJoinSparse` | 0.360352 ms | 0.344727-0.378906 ms | n/a | n/a |
+| `antiJoinSparse` | 0.339844 ms | 0.335938-0.357422 ms | n/a | n/a |
+| `unionAll` | 0.032837 ms | 0.030396-0.037842 ms | n/a | n/a |
 
 The index study is a capability study, not a frame4s win/loss claim. It
 uses the same unsorted table for a forced linear equality scan, rebuilds a
@@ -28,20 +28,17 @@ index for every warm query.
 
 | Rows | Query | Linear scan | Cold build+lookup | Warm lookup | Warm speedup | Break-even queries | Index bytes |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1000 | single | 0.179199 ms | 0.413086 ms | 0.340820 ms | 0.53x | n/a | 9320 |
-| 1000 | batch32 | 0.188477 ms | 0.395508 ms | 0.346680 ms | 0.54x | n/a | 9320 |
-| 100000 | single | 0.364258 ms | 4.937500 ms | 0.542969 ms | 0.67x | n/a | 801320 |
-| 100000 | batch32 | 0.925781 ms | 4.656250 ms | 0.456055 ms | 2.03x | 8.9 | 801320 |
-| 1000000 | single | 1.906250 ms | 18.250000 ms | 1.652344 ms | 1.15x | 65.4 | 8001320 |
-| 1000000 | batch32 | 5.687500 ms | 18.187500 ms | 1.667969 ms | 3.41x | 4.1 | 8001320 |
+| 1000 | single | 0.177246 ms | 0.395508 ms | 0.349609 ms | 0.51x | n/a | 9320 |
+| 1000 | batch32 | 0.188477 ms | 0.383789 ms | 0.344727 ms | 0.55x | n/a | 9320 |
+| 100000 | single | 0.348633 ms | 4.609375 ms | 0.465820 ms | 0.75x | n/a | 801320 |
+| 100000 | batch32 | 0.800781 ms | 4.609375 ms | 0.473633 ms | 1.69x | 12.6 | 801320 |
+| 1000000 | single | 2.039063 ms | 19.375000 ms | 1.644531 ms | 1.24x | 44.9 | 8001320 |
+| 1000000 | batch32 | 5.515625 ms | 18.312500 ms | 1.601563 ms | 3.44x | 4.3 | 8001320 |
 
 ## Interpretation
 
-The supplied current frame4s JMH receipt contains the four join shapes. frame4s
-is faster on all four, with descriptive data.table/frame4s ratios from 6.22x
-to 26.48x. The other data.table rows remain validated external timings, but
-this join-focused receipt does not rank them against older frame4s points.
-At 1000000 rows, the linear-scan/warm-index ratio is 1.15x for one target with break-even 65.4 queries; for the 32-target batch it is 3.41x with break-even 4.1 queries.
+At the relational fixture size, frame4s is faster on all 12 measured shapes; the descriptive data.table/frame4s ratios range from 7.98x to 38.54x.
+At 1000000 rows, the linear-scan/warm-index ratio is 1.24x for one target with break-even 44.9 queries; for the 32-target batch it is 3.44x with break-even 4.3 queries.
 This supports a separately owned immutable secondary-index capability for
 declared repeated workloads. It does not support invisible auto-indexing in
 pure `Frame` construction or treating warm indexed lookup as equivalent to

@@ -1,8 +1,7 @@
 # ADR 0003: explicit immutable secondary indices
 
-Status: R5e-R5g direct layouts, the R5h adaptive batch path, and designated
-prepared join reuse accepted; `GroupedHash` rejected; public API design remains
-deferred
+Status: R5e-R5g direct layouts, the R5h adaptive batch path, `GroupedHash`, and
+designated prepared join reuse accepted; public API design remains deferred
 
 Date: 2026-07-26
 
@@ -296,11 +295,14 @@ counting pass:
   its row-link array, avoiding both virtual token traversal and a second
   result-sized sort workspace.
 
-The counting pass compacts only non-empty streams into the clone. This matters
-when a query contains many missing keys: the number of distinct query keys can
-exceed the result length, while the number of non-empty streams cannot. Tests
-cover one 512-row hit mixed with 1,000 missing keys so the scratch proof does
-not depend on the benchmark's mostly-hit queries.
+The counting pass asks each backend for its native stream length and compacts
+only non-empty streams into the clone. Native length scans keep linked,
+sorted, and contiguous representations inside their concrete backend instead
+of dispatching once per match. This matters for both speed and scratch
+soundness when a query contains many missing keys: the number of distinct
+query keys can exceed the result length, while the number of non-empty streams
+cannot. Tests cover one 512-row hit mixed with 1,000 missing keys so the
+scratch proof does not depend on the benchmark's mostly-hit queries.
 
 The columnar join kernel also replaces row-wise
 `Array[ScalarValue]` materialization with primitive row selections. It records
@@ -322,9 +324,10 @@ The full court requires:
    unique lookup to be at least 2x compact speed, grouped fan-out lookup not to
    lose to compact, and grouped skewed batch lookup to be at least 1.5x flat
    speed;
-4. the balanced FastHash and compact batch points to be at most 90% of their
-   R5g latency, every dominant-skew control to remain within 10% of R5g, and
-   large-batch allocation to remain below 70,000 B/op;
+4. the balanced FastHash and compact batch points to be at most 90% of the
+   exact same-process primitive-sort control, every dominant-skew adaptive
+   point to remain within 10% of that control, and large-batch allocation to
+   remain below 70,000 B/op;
 5. selection-gather joins to preserve one-shot/prepared checksums, duplicate
    order, null-key behavior, NaN bits, primitive families, and detached
    lifetime on JVM and Scala.js;
@@ -338,33 +341,48 @@ The full court requires:
 
 The final exact-source
 [full index receipt](../benchmarks/receipts/2026-07-26-r5h-index-join-optimization/index-full/summary.md)
-validates all five layouts and four query shapes. The adaptive batch path is
-accepted: balanced fan-out is 0.626x R5g for `FastHash` and 0.757x for compact;
-every dominant-skew control remains within its frozen guardrail; and maximum
-normalized allocation is 62,977.227 B/op.
+validates all five layouts and four query shapes, including stable order,
+cardinality, checksums, retained memory, and allocation. The adaptive batch
+path is accepted against an exact primitive-sort strategy with the same
+backend, fixture, counting pass, JVM, and process. Balanced fan-out is 0.593x
+the control for `FastHash` and 0.718x for compact; every dominant-skew path is
+no slower than 0.972x control; and maximum normalized allocation is 62,977.029
+B/op.
 
-`GroupedHash` is rejected. It meets every retained-memory gate at 1,000,000
-rows—10.667 bytes/source row for unique keys, 5.833 at fan-out 8, 10.615 on the
-sparse-skew fixture, and 4.000 when every key is equal—and clears the unique
-and skewed lookup gates. Its fan-out-8 single lookup reaches only 0.759x compact
-speed, missing the precommitted no-loss gate. The layout remains available for
-explicit study but is not an admitted default or automatic policy.
+The R5g frozen points remain descriptive provenance, not admission gates.
+Repeated full runs on the shared host produced unchanged checksums and
+allocation with isolated latency spikes as large as 3.6x. R5h therefore keeps
+the numeric thresholds but applies them to an executable primitive-sort
+control in the same binary, with the same backend, fixture, counting pass,
+JVM, and process. This compares the adaptive merge decision directly instead
+of allowing unrelated host load to decide admission.
+
+`GroupedHash` is accepted for explicit use. It meets every retained-memory
+gate at 1,000,000 rows—10.667 bytes/source row for unique keys, 5.833 at
+fan-out 8, 10.615 on the sparse-skew fixture, and 4.000 when every key is
+equal—and clears the unique, fan-out, and skew lookup gates. Its fan-out-8
+single lookup is 1.606x compact speed in the full court. `FastHash` remains the
+default and no automatic layout policy is inferred.
 
 The
 [full join receipt](../benchmarks/receipts/2026-07-26-r5h-index-join-optimization/join-full/summary.md)
 also passes. One-shot selection-gather allocation falls by 70.97% for
-one-to-one, 70.35% for one-to-many, 45.99% for sparse, and 68.73% for skewed
-joins. Warm prepared execution is 1.34x to 1.90x faster than the improved
-one-shot path. Construction plus first execution is also 1.18x to 1.73x
+one-to-one, 70.34% for one-to-many, 45.99% for sparse, and 68.73% for skewed
+joins. Warm prepared execution is 1.29x to 1.38x faster than the improved
+one-shot path. Construction plus first execution is also 1.15x to 1.23x
 faster, so prepared reuse is accepted for these physical `Int32` equality
 shapes. It remains package-internal and explicit; ordinary preparation does
 not build or cache an index.
 
-Separate-process refreshes record one-shot frame4s join speedups of 2.72x to
-12.13x over Pandas and 6.22x to 26.48x over data.table. The Saddle court has no
-semantically equivalent duplicate-key join, so R5h makes no Saddle join claim.
-The previous comparable Saddle projection, filter/project, and grouped-sum
-rows remain the Saddle boundary.
+Separate-process refreshes record one-shot frame4s join speedups of 3.30x to
+20.53x over Pandas and 7.98x to 38.54x over data.table. The data.table index
+study also sharpens the policy boundary: at 1,000,000 rows, a reused index is
+3.44x faster than a scan for 32 keys and breaks even after 4.3 queries, whereas
+one-key lookup is only 1.24x faster and breaks even after 44.9 queries. This
+supports explicit immutable preparation for declared reuse, not invisible
+auto-indexing. The Saddle court has no semantically equivalent duplicate-key
+join, so R5h makes no Saddle join claim. The previous comparable Saddle
+projection, filter/project, and grouped-sum rows remain the Saddle boundary.
 
 ## Rejected alternatives
 

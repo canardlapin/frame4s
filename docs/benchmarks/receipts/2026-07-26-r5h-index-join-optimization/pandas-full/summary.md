@@ -7,18 +7,18 @@ through JMH, and Python allocation is not compared with JVM GC allocation.
 
 | Workload | Pandas median | Range | frame4s JMH | Pandas/frame4s |
 |---|---:|---:|---:|---:|
-| `primitiveMaterializedProjection` | 0.101517 ms | 0.100269–0.102539 ms | n/a | n/a |
-| `fusedFilterProjectArithmetic` | 0.284184 ms | 0.280374–0.286855 ms | n/a | n/a |
-| `groupedLowCardinalitySumOnly` | 0.186845 ms | 0.185384–0.188701 ms | n/a | n/a |
-| `groupedLowCardinality` | 0.627466 ms | 0.612314–0.643969 ms | n/a | n/a |
-| `joinOneToOne` | 0.154100 ms | 0.151671–0.155322 ms | 0.056562 ms | 2.72x |
-| `joinOneToMany` | 0.192051 ms | 0.188286–0.196667 ms | 0.051471 ms | 3.73x |
-| `joinSparse` | 0.180704 ms | 0.176118–0.181737 ms | 0.014902 ms | 12.13x |
-| `joinSkewed` | 0.191589 ms | 0.187468–0.193788 ms | 0.067969 ms | 2.82x |
-| `distinctLowCardinality` | 0.204144 ms | 0.199511–0.205866 ms | n/a | n/a |
-| `semiJoinSparse` | 0.082511 ms | 0.081823–0.083830 ms | n/a | n/a |
-| `antiJoinSparse` | 0.097541 ms | 0.096359–0.099380 ms | n/a | n/a |
-| `unionAll` | 0.020298 ms | 0.020157–0.020527 ms | n/a | n/a |
+| `primitiveMaterializedProjection` | 0.112096 ms | 0.105095–0.139951 ms | n/a | n/a |
+| `fusedFilterProjectArithmetic` | 0.406045 ms | 0.286046–0.516251 ms | n/a | n/a |
+| `groupedLowCardinalitySumOnly` | 0.222239 ms | 0.195820–0.285558 ms | n/a | n/a |
+| `groupedLowCardinality` | 0.706184 ms | 0.663638–0.740288 ms | n/a | n/a |
+| `joinOneToOne` | 0.167506 ms | 0.158707–0.213831 ms | 0.050819 ms | 3.30x |
+| `joinOneToMany` | 0.209757 ms | 0.197113–0.424082 ms | 0.050764 ms | 4.13x |
+| `joinSparse` | 0.205953 ms | 0.194907–0.238682 ms | 0.010034 ms | 20.53x |
+| `joinSkewed` | 0.210589 ms | 0.200587–0.249168 ms | 0.050411 ms | 4.18x |
+| `distinctLowCardinality` | 0.205709 ms | 0.203009–0.210647 ms | n/a | n/a |
+| `semiJoinSparse` | 0.084655 ms | 0.082076–0.086736 ms | n/a | n/a |
+| `antiJoinSparse` | 0.099138 ms | 0.096451–0.099663 ms | n/a | n/a |
+| `unionAll` | 0.020181 ms | 0.019951–0.020245 ms | n/a | n/a |
 
 Exact checksum comparisons include primitive materialized projection, fused
 filter/project, grouped sum, joins, distinct, semi/anti join, and unionAll.
