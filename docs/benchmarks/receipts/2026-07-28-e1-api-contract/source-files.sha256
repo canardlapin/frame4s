@@ -1,0 +1,10 @@
+e04db047081c0b77d0013ad719b70d44bd81e7be62e6a6c5e77958c381cd82e1  docs/design/adr-0004-ergonomic-api.md
+45f592a35e31a86a0978f27f32589c96d4206efd3e24973de4dd9c7705c83ba0  modules/core/shared/src/main/scala/frame4s/Expression.scala
+b625a3825b955af8327b797f3632a17a01a545b7fca8208f6b69e47573644e91  modules/core/shared/src/main/scala/frame4s/Frame.scala
+c168489e57f0ba7eab16ce50d937258fa68339629474943929e1fe76e5edb57d  modules/core/shared/src/main/scala/frame4s/Schema.scala
+f438dd3f87e0ac4505dd2080a9c3328607d8a946be3b8ccc0ac6c21dacd1e270  modules/fs2/shared/src/main/scala/frame4s/fs2/FrameIO.scala
+d73ddc3f8d82b9c288a78b3df91320bd18542d860f4f2626304b298d2c87ea8b  modules/fs2/shared/src/main/scala/frame4s/fs2/FrameRuntime.scala
+c7fdfeab6ff307d01d9deb72a9381bbce83f0f2ee8e84a363c31a983a29bef9e  modules/fs2/jvm/src/main/scala/frame4s/fs2/PathSources.scala
+b2826f4218196ee82bb3d2a7a6978e7a82649f81acc6a9b38aecae0ec3e85a49  modules/first-contact/src/main/scala/example/ApiContractCourt.scala
+b25548b11520d306cbbdb520f8a8f590fed6eff076fecd7ab2d7ef89d2651bff  modules/first-contact/src/test/scala/example/ApiContractCourtSuite.scala
+d3a51fddc9d487ddaa0ebfaccc585f9e4e50354fe088d1010187147e4907069d  scripts/api-contract-court.sh

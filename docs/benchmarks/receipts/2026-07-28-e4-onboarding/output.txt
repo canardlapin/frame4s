@@ -1,0 +1,92 @@
+[info] welcome to sbt 1.10.5 (Oracle Corporation Java 22)
+[info] loading settings for project frame4s-build from plugins.sbt ...
+[info] loading project definition from <workspace>/project
+[info] loading settings for project root from build.sbt ...
+[info] resolving key references (11943 settings) ...
+[info] set current project to frame4s (in build file:<workspace>/)
+[success] Total time: 0 s, completed Jul 28, 2026, 10:02:26 p.m.
+[info] compiling 10 Scala sources to <workspace>/modules/core/jvm/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] compiling 6 Scala sources to <workspace>/modules/fs2/jvm/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] compiling 2 Scala sources to <workspace>/modules/first-contact/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] compiling 1 Scala source to <workspace>/modules/first-contact/target/scala-3.7.4/test-classes ...
+[info] done compiling
+Test run example.ApiContractCourtSuite started
+example.ApiContractCourtSuite: finished 0.024s
+Test run example.ApiContractCourtSuite finished: 0 failed, 0 ignored, 10 total 0.039s
+[info] Passed: Total 10, Failed 0, Errors 0, Passed 10
+[success] Total time: 15 s, completed Jul 28, 2026, 10:02:41 p.m.
+[info] running (fork) example.FirstContact
+[info] |name|score|
+[info] |----|-----|
+[info] |Ada |9.5  |
+[info] |Lin |null |
+[success] Total time: 1 s, completed Jul 28, 2026, 10:02:42 p.m.
+[warn] multiple main classes detected: run 'show discoveredMainClasses' to see the list
+[info] running mdoc.SbtMain
+[34minfo[39m: Compiling 11 files to <workspace>/modules/docs/target/mdoc
+[34minfo[39m: Compiled in 5.59s (0 errors)
+[info] Delete API dir
+[info] Parsing 10 markup documents, 0 templates, 1 configuration, 0 stylesheets ...
+[info] Rendering 10 html documents, copying 14 static files ...
+[info] Generated html in <workspace>/modules/docs/target/docs/site
+[success] Total time: 8 s, completed Jul 28, 2026, 10:02:50 p.m.
+[info] Main Scala API documentation to <workspace>/modules/core/jvm/target/scala-3.7.4/api...
+[info] Skipping unused scalacOptions: -Werror, -Wvalue-discard, -Wnonunit-statement, -Xmax-inlines
+[warn] Flag -classpath set repeatedly
+[warn] one warning found
+[info] Main Scala API documentation successful.
+[success] Total time: 3 s, completed Jul 28, 2026, 10:02:53 p.m.
+[info] compiling 10 Scala sources to <workspace>/modules/core/js/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] Main Scala API documentation to <workspace>/modules/core/js/target/scala-3.7.4/api...
+[info] Skipping unused scalacOptions: -Werror, -Wvalue-discard, -Wnonunit-statement, -Xmax-inlines
+[warn] Flag -classpath set repeatedly
+[warn] one warning found
+[info] Main Scala API documentation successful.
+[success] Total time: 12 s, completed Jul 28, 2026, 10:03:05 p.m.
+[info] Main Scala API documentation to <workspace>/modules/fs2/jvm/target/scala-3.7.4/api...
+[info] Skipping unused scalacOptions: -Werror, -Wvalue-discard, -Wnonunit-statement, -Xmax-inlines
+[warn] Flag -classpath set repeatedly
+[warn] one warning found
+[info] Main Scala API documentation successful.
+[success] Total time: 2 s, completed Jul 28, 2026, 10:03:07 p.m.
+[info] compiling 2 Scala sources to <workspace>/modules/fs2/js/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] Main Scala API documentation to <workspace>/modules/fs2/js/target/scala-3.7.4/api...
+[info] Skipping unused scalacOptions: -Werror, -Wvalue-discard, -Wnonunit-statement, -Xmax-inlines
+[warn] Flag -classpath set repeatedly
+[warn] one warning found
+[info] Main Scala API documentation successful.
+[success] Total time: 5 s, completed Jul 28, 2026, 10:03:12 p.m.
+[success] Total time: 0 s, completed Jul 28, 2026, 10:03:12 p.m.
+[info] compiling 2 Scala sources to <workspace>/modules/testkit/jvm/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] compiling 5 Scala sources to <workspace>/modules/fs2/jvm/target/scala-3.7.4/test-classes ...
+[info] done compiling
+Test run frame4s.fs2.FrameIOSuite started
+frame4s.fs2.FrameIOSuite: finished 1.362s
+Test run frame4s.fs2.FrameIOSuite finished: 0 failed, 0 ignored, 10 total 1.393s
+Test run frame4s.fs2.BindingErgonomicsSuite started
+frame4s.fs2.BindingErgonomicsSuite: finished 0.163s
+Test run frame4s.fs2.BindingErgonomicsSuite finished: 0 failed, 0 ignored, 7 total 0.165s
+Test run frame4s.fs2.PathSourcesSuite started
+frame4s.fs2.PathSourcesSuite: finished 0.044s
+Test run frame4s.fs2.PathSourcesSuite finished: 0 failed, 0 ignored, 3 total 0.044s
+[info] Passed: Total 20, Failed 0, Errors 0, Passed 20
+[success] Total time: 5 s, completed Jul 28, 2026, 10:03:18 p.m.
+[info] compiling 2 Scala sources to <workspace>/modules/testkit/js/target/scala-3.7.4/classes ...
+[info] done compiling
+[info] compiling 3 Scala sources to <workspace>/modules/fs2/js/target/scala-3.7.4/test-classes ...
+[info] done compiling
+[info] Fast optimizing <workspace>/modules/fs2/js/target/scala-3.7.4/frame4s-fs2-test-fastopt
+Test run frame4s.fs2.FrameIOSuite started
+Test run frame4s.fs2.BindingErgonomicsSuite started
+frame4s.fs2.BindingErgonomicsSuite: finished 0.161s
+Test run frame4s.fs2.BindingErgonomicsSuite finished: 0 failed, 0 ignored, 7 total 0.161s
+frame4s.fs2.FrameIOSuite: finished 3.675s
+Test run frame4s.fs2.FrameIOSuite finished: 0 failed, 0 ignored, 10 total 3.675s
+[info] Passed: Total 17, Failed 0, Errors 0, Passed 17
+[success] Total time: 14 s, completed Jul 28, 2026, 10:03:32 p.m.

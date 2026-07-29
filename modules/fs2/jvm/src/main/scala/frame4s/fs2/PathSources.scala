@@ -39,6 +39,27 @@ object CsvPathSource:
       resource(path, settings.options(descriptor.schema))
     )
 
+  /** Describe one typed CSV path without choosing a multi-source identity. */
+  def binding[
+      F[_]: Async,
+      S <: NamedTuple.AnyNamedTuple
+  ](
+      path: Path
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    binding(path, CsvSettings())
+
+  def binding[
+      F[_]: Async,
+      S <: NamedTuple.AnyNamedTuple
+  ](
+      path: Path,
+      settings: CsvSettings
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    SourceBinding.singleSource(
+      SourceRef.singleSourceScan,
+      resource(path, settings.options(descriptor.schema))
+    )
+
 /** JVM-only, resource-safe TSV path adapter with the same lifecycle as [[CsvPathSource]]. */
 object TsvPathSource:
   def resource[F[_]: Async](
@@ -57,6 +78,36 @@ object TsvPathSource:
   )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
     SourceBinding(
       reference,
+      resource(
+        path,
+        TsvReadOptions(
+          descriptor.schema,
+          settings.header,
+          settings.nullTokens,
+          settings.coercion,
+          settings.batchSize
+        )
+      )
+    )
+
+  /** Describe one typed TSV path without choosing a multi-source identity. */
+  def binding[
+      F[_]: Async,
+      S <: NamedTuple.AnyNamedTuple
+  ](
+      path: Path
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    binding(path, TsvSettings())
+
+  def binding[
+      F[_]: Async,
+      S <: NamedTuple.AnyNamedTuple
+  ](
+      path: Path,
+      settings: TsvSettings
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    SourceBinding.singleSource(
+      SourceRef.singleSourceScan,
       resource(
         path,
         TsvReadOptions(

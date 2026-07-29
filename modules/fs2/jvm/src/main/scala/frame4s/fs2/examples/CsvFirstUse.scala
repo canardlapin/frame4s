@@ -5,7 +5,7 @@ import fs2.io.file.Path
 import frame4s.*
 import frame4s.fs2.*
 
-/** Release-gate first contact: typed CSV path to pure query to bounded output in one visible
+/** Receipt-bearing CSV example: typed path to pure query to bounded output in one visible
   * `Resource` scope.
   *
   * The specimen intentionally uses no handwritten runtime `Schema`, manual batch,
@@ -42,11 +42,11 @@ object CsvFirstUse extends IOApp.Simple:
         CsvSettings(batchSize = 2)
       )
       query = binding.frame
-        .filter(row => row.col("id") > Expr.literal(1))
+        .filter(row => row.col("id") > 1)
         .select: row =>
           (
-            row.col("label").as("label"),
-            row.col("score").as("score")
+            row.col("label"),
+            row.col("score")
           )
       runtime <- FrameRuntime.resource(binding)
       result <- runtime.collectWithReceipt(query)

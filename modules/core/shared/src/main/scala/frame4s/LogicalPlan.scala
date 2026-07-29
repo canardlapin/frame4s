@@ -40,6 +40,22 @@ final case class SourceRef private (
 )
 
 object SourceRef:
+  private[frame4s] val singleSourceValues: SourceRef =
+    SourceRef(
+      SourceId.unsafe("frame4s.single-source.values"),
+      "single in-memory source",
+      SourceKind.Values,
+      OrderGuarantee.Stable
+    )
+
+  private[frame4s] val singleSourceScan: SourceRef =
+    SourceRef(
+      SourceId.unsafe("frame4s.single-source.scan"),
+      "single scan source",
+      SourceKind.Scan,
+      OrderGuarantee.Unspecified
+    )
+
   def scan(
       id: String,
       displayName: String,

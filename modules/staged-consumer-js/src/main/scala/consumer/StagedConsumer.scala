@@ -8,30 +8,25 @@ object StagedConsumer extends IOApp.Simple:
   type Input = (id: Int, label: String, score: Option[Double])
   type Output = (label: String, root: Option[Double])
 
-  private def checked[A](result: Either[FrameError, A]): IO[A] =
-    IO.fromEither(result.left.map(error => new IllegalArgumentException(error.message)))
-
   def run: IO[Unit] =
+    val binding = InMemoryFrameSource.rows[IO, Input](
+      Vector(
+        (id = 1, label = "alpha", score = Some(9.0)),
+        (id = 2, label = "東京", score = None)
+      ),
+      batchSize = 1
+    )
+    val query: Frame[Output] = binding.frame
+      .filter(row => row.col("id") > 0)
+      .select: row =>
+        (
+          row.col("label"),
+          row.col("score").sqrt.as("root")
+        )
+
     for
-      reference <- checked(SourceRef.values("staged-js", "staged-js"))
-      binding = InMemoryFrameSource.rowsBinding[IO, Input](
-        reference,
-        Vector(
-          (id = 1, label = "alpha", score = Some(9.0)),
-          (id = 2, label = "東京", score = None)
-        ),
-        batchSize = 1
-      )
-      query: Frame[Output] = binding.frame
-        .filter(row => row.col("id") > Expr.literal(0))
-        .select: row =>
-          (
-            row.col("label").as("label"),
-            row.col("score").sqrt.as("root")
-          )
-      labels <- FrameRuntime
-        .resource(binding)
-        .flatMap(_.collect(query))
+      labels <- binding
+        .collect(query)
         .use(table =>
           IO.fromEither(
             table.column("label").left.map(TableReadFailure.apply)

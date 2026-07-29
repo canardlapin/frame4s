@@ -4,42 +4,44 @@ frame4s is an immutable, typed local dataframe library for Scala 3. A schema is
 a type, a query is a pure value, and execution is one explicit resource scope.
 
 ```scala
-import cats.effect.{IO, IOApp, Resource}
-import fs2.io.file.Path
+import cats.effect.{IO, IOApp}
 import frame4s.*
 import frame4s.fs2.*
 
 object Example extends IOApp.Simple:
   type People = (id: Int, name: String, score: Option[Double])
-  type Selected = (name: String, score: Option[Double])
 
-  private def checked[A](value: Either[FrameError, A]): IO[A] =
-    IO.fromEither(value.left.map(error => new IllegalArgumentException(error.message)))
+  val source = InMemoryFrameSource.rows[IO, People](
+    Vector(
+      (id = 1, name = "Ada", score = Some(9.5)),
+      (id = 2, name = "Lin", score = None)
+    )
+  )
 
-  def run: IO[Unit] =
-    (for
-      reference <- Resource.eval(checked(SourceRef.scan("people", "people.csv")))
-      source = CsvPathSource.binding[IO, People](reference, Path("people.csv"))
-      query: Frame[Selected] = source.frame
-        .filter(row => row.col("id") > Expr.literal(0))
-        .select(row =>
-          (
-            row.col("name").as("name"),
-            row.col("score").as("score")
-          )
-        )
-      runtime <- FrameRuntime.resource(source)
-      table <- runtime.collect(query)
-      rendered <- Resource.eval(
-        IO.fromEither(table.show().left.map(TableReadFailure.apply))
-      )
-    yield rendered).use(IO.println)
+  val query = source.frame
+    .filter(row => row.col("id") > 0)
+    .select(row => (row.col("name"), row.col("score")))
+
+  def run: IO[Unit] = source.render(query).flatMap(IO.println)
+```
+
+The result is a bounded table:
+
+```text
+|name|score|
+|----|-----|
+|Ada |9.5  |
+|Lin |null |
 ```
 
 The compiled downstream-package version of this workflow is
 [FirstContact.scala](modules/first-contact/src/main/scala/example/FirstContact.scala).
-It uses no handwritten runtime schema, manual batch, internal API, unsafe cast,
-or `ReferenceSources`.
+It uses no handwritten runtime schema, source identity, runtime setup, manual
+batch, internal API, or unsafe cast.
+
+Read the executable [three-minute quick start](docs/guide/quick-start.md), then
+continue to [typed CSV and TSV](docs/guide/csv-tsv.md) or
+[execution and ownership](docs/guide/execution-and-ownership.md).
 
 The central types are:
 
@@ -62,7 +64,7 @@ Table[Schema] // materialized columnar data
 - `frame4s-benchmarks`: a non-published JVM JMH court with raw versioned
   receipts and honest Saddle/specialized-baseline comparisons.
 - `frame4s-first-contact`: a non-published downstream-package specimen that
-  continuously proves the public CSV-to-typed-query-to-bounded-output path.
+  continuously proves the public typed-source-to-query-to-bounded-output path.
 
 The reference interpreter defines semantics and provides a small useful local
 backend. It is not intended to become a new production columnar engine.

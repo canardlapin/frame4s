@@ -8,7 +8,7 @@ type Grouped = (name: String, n: Long, mean: Option[Double])
 
 def grouped(input: Frame[Person]): Frame[Grouped] =
   input
-    .groupBy(row => Tuple1(row.col("name").as("name")))
+    .groupBy(row => Tuple1(row.col("name")))
     .aggregate(row =>
       (
         Aggregate.count.as("n"),

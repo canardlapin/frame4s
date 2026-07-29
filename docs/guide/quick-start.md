@@ -19,37 +19,25 @@ import frame4s.*
 import frame4s.fs2.*
 
 type Observation = (id: Int, label: String, score: Option[Double])
-type Selected = (label: String, root: Option[Double])
 
-def checked[A](result: Either[FrameError, A]): IO[A] =
-  IO.fromEither(
-    result.left.map(error => new IllegalArgumentException(error.message))
+val source = InMemoryFrameSource.rows[IO, Observation](
+  Vector(
+    (id = 1, label = "alpha", score = Some(4.0)),
+    (id = 2, label = "東京", score = None)
+  )
+)
+
+val query = source.frame
+  .filter(row => row.col("id") > 0)
+  .select(row =>
+    (
+      row.col("label"),
+      row.col("score").sqrt.as("root")
+    )
   )
 
 def queryProgram: IO[String] =
-  checked(SourceRef.values("observations", "observations")).flatMap: reference =>
-    val source = InMemoryFrameSource.rowsBinding[IO, Observation](
-      reference,
-      Vector(
-        (id = 1, label = "alpha", score = Some(4.0)),
-        (id = 2, label = "東京", score = None)
-      )
-    )
-    val query: Frame[Selected] = source.frame
-      .filter(row => row.col("id") > Expr.literal(0))
-      .select(row =>
-        (
-          row.col("label").as("label"),
-          row.col("score").sqrt.as("root")
-        )
-      )
-
-    FrameRuntime
-      .resource(source)
-      .flatMap(_.collect(query))
-      .use(table =>
-        IO.fromEither(table.show().left.map(TableReadFailure.apply))
-      )
+  source.render(query, TableRenderOptions(maxRows = 5, maxWidth = 60))
 
 object QuickStart extends IOApp.Simple:
   def run: IO[Unit] = queryProgram.flatMap(IO.println)
@@ -61,8 +49,10 @@ The documentation build runs the same `IO` value and records its result:
 queryProgram.unsafeRunSync()
 ```
 
-`Frame[Selected]` is an immutable logical query. Constructing it performs no
-I/O. `FrameRuntime.resource` acquires the source, validates its schema, and
-closes the materialized table after `use` finishes.
+The query is an immutable `Frame` value. Constructing it performs no I/O.
+`render` acquires the source, validates its schema, renders a bounded detached
+string, and closes the materialized table before the `IO` completes. The raw
+`label` column keeps its existing name; the computed square root needs the new
+name `root`.
 
 Next, [read typed CSV or TSV data](csv-tsv.md).

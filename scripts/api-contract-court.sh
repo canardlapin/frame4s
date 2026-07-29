@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-receipt="${1:-docs/benchmarks/receipts/$(date +%F)-first-use}"
+receipt="${1:-docs/benchmarks/receipts/$(date +%F)-e1-api-contract}"
 if [[ "$receipt" != /* ]]; then
   receipt="$(pwd)/$receipt"
 fi
+
 mkdir -p "$receipt"
-export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
+
 workspace_path="$(pwd)"
 user_root="${HOME:-}"
 if [[ -z "${JAVA_HOME:-}" ]]; then
@@ -15,7 +16,7 @@ if [[ -z "${JAVA_HOME:-}" ]]; then
 fi
 java_command="$JAVA_HOME/bin/java"
 
-sanitize_receipt_paths() {
+sanitize() {
   for output in "$@"; do
     sed -i.bak \
       -e "s|$workspace_path|<workspace>|g" \
@@ -40,30 +41,29 @@ sanitize_receipt_paths() {
 } >"$receipt/environment.properties"
 
 shasum -a 256 \
-  README.md \
-  build.sbt \
-  docs/guide/*.md \
-  docs/guide/directory.conf \
-  modules/core/shared/src/main/scala/frame4s/RowCodec.scala \
-  modules/core/shared/src/main/scala/frame4s/Storage.scala \
+  docs/design/adr-0004-ergonomic-api.md \
+  modules/core/shared/src/main/scala/frame4s/Expression.scala \
+  modules/core/shared/src/main/scala/frame4s/Frame.scala \
+  modules/core/shared/src/main/scala/frame4s/Schema.scala \
   modules/fs2/shared/src/main/scala/frame4s/fs2/FrameIO.scala \
   modules/fs2/shared/src/main/scala/frame4s/fs2/FrameRuntime.scala \
   modules/fs2/jvm/src/main/scala/frame4s/fs2/PathSources.scala \
-  modules/first-contact/src/main/scala/example/FirstContact.scala \
-  modules/staged-consumer-jvm/src/main/scala/consumer/StagedConsumer.scala \
-  modules/staged-consumer-js/src/main/scala/consumer/StagedConsumer.scala \
-  scripts/first-use-court.sh \
+  modules/first-contact/src/main/scala/example/ApiContractCourt.scala \
+  modules/first-contact/src/test/scala/example/ApiContractCourtSuite.scala \
+  scripts/api-contract-court.sh \
   >"$receipt/source-files.sha256"
 
 /usr/bin/time -p -o "$receipt/timing.txt" \
   sbt \
   clean \
+  firstContact/compile \
   firstContact/test \
-  'firstContact/runMain example.FirstContact' \
-  docsCheck \
-  apiDocs \
-  'fs2JVM/testOnly frame4s.fs2.FrameIOSuite frame4s.fs2.BindingErgonomicsSuite frame4s.fs2.PathSourcesSuite' \
-  'fs2JS/testOnly frame4s.fs2.FrameIOSuite frame4s.fs2.BindingErgonomicsSuite' \
+  'coreJVM/testOnly frame4s.ErgonomicExpressionSuite frame4s.TypeDisciplineRegressionSuite' \
+  'coreJS/testOnly frame4s.ErgonomicExpressionSuite frame4s.TypeDisciplineRegressionSuite' \
+  'testkitJVM/testOnly frame4s.testkit.CompileTimeCourtSuite' \
+  'testkitJS/testOnly frame4s.testkit.CompileTimeCourtSuite' \
+  'fs2JVM/testOnly frame4s.fs2.BindingErgonomicsSuite frame4s.fs2.PathSourcesSuite' \
+  'fs2JS/testOnly frame4s.fs2.BindingErgonomicsSuite' \
   2>&1 | tee "$receipt/output.txt"
 
-sanitize_receipt_paths "$receipt/output.txt"
+sanitize "$receipt/output.txt"

@@ -14,13 +14,17 @@ final case class ExecutionFailure(error: ExecutionError) extends RuntimeExceptio
 
 enum RuntimeBindingError:
   case DuplicateSource(id: SourceId)
+  case SingleSourceIdentityInMultiBinding(ids: Vector[SourceId])
   case MissingSource(id: SourceId)
   case ConflictingPlanSchema(id: SourceId, first: Schema, second: Schema)
   case SourceSchema(id: SourceId, expected: Schema, actual: Schema)
   case Source(id: SourceId, error: SourceError)
 
   def message: String = this match
-    case DuplicateSource(id)                      => s"source '${id.value}' is bound more than once"
+    case DuplicateSource(id)                     => s"source '${id.value}' is bound more than once"
+    case SingleSourceIdentityInMultiBinding(ids) =>
+      val rendered = ids.map(id => s"'${id.value}'").mkString(", ")
+      s"single-source bindings $rendered cannot be combined; construct each source with an explicit SourceRef"
     case MissingSource(id)                        => s"no source is bound for '${id.value}'"
     case ConflictingPlanSchema(id, first, second) =>
       s"source '${id.value}' is used with conflicting schemas $first and $second"
@@ -31,6 +35,10 @@ enum RuntimeBindingError:
 final case class RuntimeBindingFailure(error: RuntimeBindingError)
     extends RuntimeException(error.message)
 
+private[fs2] enum BindingIdentity:
+  case Explicit
+  case SingleSource
+
 /** One pure, typed source description.
   *
   * `frame` is an immutable logical value and acquiring it performs no I/O. The `Resource`
@@ -40,9 +48,37 @@ final case class RuntimeBindingFailure(error: RuntimeBindingError)
 final class SourceBinding[F[_], S <: NamedTuple.AnyNamedTuple] private[fs2] (
     val reference: SourceRef,
     private[fs2] val acquire: Resource[F, FrameSource[F]],
-    private[fs2] val descriptor: SchemaDescriptor[S]
+    private[fs2] val descriptor: SchemaDescriptor[S],
+    private[fs2] val identity: BindingIdentity
 ):
   val frame: Frame[S] = Frame.scan[S](reference)(using descriptor)
+
+  /** Collect through this binding while keeping the owned table inside `Resource`.
+    *
+    * This expands exactly to `FrameRuntime.resource(this).flatMap(_.collect(query))`.
+    */
+  def collect[O <: NamedTuple.AnyNamedTuple](
+      query: Frame[O]
+  )(using F: Async[F]): Resource[F, Table[O]] =
+    FrameRuntime.resource(this).flatMap(_.collect(query))
+
+  /** Stream through this binding while keeping runtime and batch ownership inside `Stream`.
+    *
+    * This expands exactly to
+    * `Stream.resource(FrameRuntime.resource(this)).flatMap(_.stream(query))`.
+    */
+  def stream[O <: NamedTuple.AnyNamedTuple](
+      query: Frame[O]
+  )(using F: Async[F]): Stream[F, RecordBatch] =
+    Stream.resource(FrameRuntime.resource(this)).flatMap(_.stream(query))
+
+  /** Render a bounded detached string and close all owned storage before returning. */
+  def render[O <: NamedTuple.AnyNamedTuple](
+      query: Frame[O],
+      options: TableRenderOptions = TableRenderOptions()
+  )(using F: Async[F]): F[String] =
+    collect(query).use: table =>
+      F.fromEither(table.show(options).left.map(TableReadFailure.apply))
 
 object SourceBinding:
   def apply[
@@ -53,7 +89,33 @@ object SourceBinding:
       reference: SourceRef,
       source: Resource[F, A]
   )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
-    new SourceBinding(reference, source.map(value => value: FrameSource[F]), descriptor)
+    create(reference, source, BindingIdentity.Explicit)
+
+  private[fs2] def singleSource[
+      F[_],
+      S <: NamedTuple.AnyNamedTuple,
+      A <: FrameSource[F]
+  ](
+      reference: SourceRef,
+      source: Resource[F, A]
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    create(reference, source, BindingIdentity.SingleSource)
+
+  private def create[
+      F[_],
+      S <: NamedTuple.AnyNamedTuple,
+      A <: FrameSource[F]
+  ](
+      reference: SourceRef,
+      source: Resource[F, A],
+      identity: BindingIdentity
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    new SourceBinding(
+      reference,
+      source.map(value => value: FrameSource[F]),
+      descriptor,
+      identity
+    )
 
 final case class SourceExecutionReceipt(
     reference: SourceRef,
@@ -465,6 +527,11 @@ object FrameRuntime:
       rest: SourceBinding[F, ? <: NamedTuple.AnyNamedTuple]*
   )(using F: Async[F]): Resource[F, FrameRuntime[F]] =
     val requested = (first +: rest).toVector
+    val singleSourceIds =
+      requested.flatMap: binding =>
+        binding.identity match
+          case BindingIdentity.Explicit     => Vector.empty
+          case BindingIdentity.SingleSource => Vector(binding.reference.id)
     val duplicate =
       requested
         .groupBy(_.reference.id.value)
@@ -474,12 +541,19 @@ object FrameRuntime:
 
     Resource
       .eval:
-        duplicate match
-          case Some(id) =>
-            F.raiseError[Unit](
-              RuntimeBindingFailure(RuntimeBindingError.DuplicateSource(id))
+        if requested.lengthCompare(1) > 0 && singleSourceIds.nonEmpty then
+          F.raiseError[Unit](
+            RuntimeBindingFailure(
+              RuntimeBindingError.SingleSourceIdentityInMultiBinding(singleSourceIds)
             )
-          case None => F.unit
+          )
+        else
+          duplicate match
+            case Some(id) =>
+              F.raiseError[Unit](
+                RuntimeBindingFailure(RuntimeBindingError.DuplicateSource(id))
+              )
+            case None => F.unit
       .flatMap: _ =>
         requested
           .foldLeft(

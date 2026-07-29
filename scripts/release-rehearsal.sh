@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source_root="$(pwd)"
+user_root="${HOME:-}"
 candidate_commit="$(git rev-parse HEAD)"
 version="${FRAME4S_REHEARSAL_VERSION:-0.1.0-RC1}"
 receipt="${1:-docs/benchmarks/receipts/$(date +%F)-r6-release-rehearsal}"
@@ -13,15 +14,21 @@ mkdir -p "$receipt"
 repository="$(mktemp -d /tmp/frame4s-release-rehearsal.XXXXXX)"
 gpg_home="$(mktemp -d /tmp/frame4s-release-signing.XXXXXX)"
 workspace="$(mktemp -d /tmp/frame4s-release-workspace.XXXXXX)"
+repository_real="$(cd "$repository" && pwd -P)"
+workspace_real="$(cd "$workspace" && pwd -P)"
 chmod 700 "$gpg_home"
 cleanup() {
   rm -rf "$repository" "$gpg_home" "$workspace"
 }
 trap cleanup EXIT
 export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  echo "JAVA_HOME must name the JDK used by sbt so the receipt records the actual toolchain." >&2
+  exit 2
+fi
+java_command="$JAVA_HOME/bin/java"
 
 {
-  java_command="${JAVA_HOME:+$JAVA_HOME/bin/}java"
   echo "java.version=$("$java_command" -version 2>&1 | head -1)"
   echo "node.version=$(node --version)"
   echo "sbt.version=$(sed -n 's/^sbt.version=//p' project/build.properties)"
@@ -38,7 +45,11 @@ export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
 } >"$receipt/environment.properties"
 
 {
-  printf '%s\n' build.sbt project/build.properties project/plugins.sbt
+  printf '%s\n' \
+    build.sbt \
+    project/build.properties \
+    project/plugins.sbt \
+    scripts/release-rehearsal.sh
   find \
     modules/core \
     modules/fs2 \
@@ -56,6 +67,11 @@ export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
 rsync -a \
   --exclude .git \
   --exclude .mote \
+  --exclude .bloop \
+  --exclude .bsp \
+  --exclude .idea \
+  --exclude .metals \
+  --exclude .scala-build \
   --exclude target \
   --exclude vendor \
   --exclude docs/benchmarks/receipts \
@@ -85,9 +101,12 @@ sbt \
   stagedConsumerJS/run \
   2>&1 |
   sed \
+    -e "s|$repository_real|<rehearsal-repository>|g" \
     -e "s|$repository|<rehearsal-repository>|g" \
     -e "s|$source_root|<workspace>|g" \
+    -e "s|$workspace_real|<workspace>|g" \
     -e "s|$workspace|<workspace>|g" |
+  sed -e "s|$user_root|<user-home>|g" |
   tee "$receipt/publish-and-consumer-output.txt"
 
 rehearsal_uid="frame4s release rehearsal <rehearsal@frame4s.invalid>"

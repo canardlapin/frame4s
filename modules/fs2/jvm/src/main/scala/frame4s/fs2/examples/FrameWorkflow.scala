@@ -60,10 +60,10 @@ object FrameWorkflow extends IOApp.Simple:
       val query: Frame[Result] = people
         .filter: row =>
           row.col("score").isNull ||
-            (row.col("score") > Expr.literal(Option(1.0))).isTrue
-        .withColumn("nextId")(row => row.col("id") + Expr.literal(1))
+            (row.col("score") > Some(1.0)).isTrue
+        .withColumn("nextId")(row => row.col("id") + 1)
         .innerJoinUsing(teams, "team")
-        .groupBy(row => Tuple1(row.col("region").as("region")))
+        .groupBy(row => Tuple1(row.col("region")))
         .aggregate: row =>
           (
             Aggregate.count.as("n"),
@@ -74,8 +74,8 @@ object FrameWorkflow extends IOApp.Simple:
         .leftJoinUsing(teams, "team")
         .select: row =>
           (
-            row.col("id").as("id"),
-            row.col("region").as("region")
+            row.col("id"),
+            row.col("region")
           )
 
       for

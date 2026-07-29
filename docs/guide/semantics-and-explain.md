@@ -15,10 +15,10 @@ type Row = (id: Int, value: Option[Double])
 
 def explanation(input: Frame[Row]): String =
   input
-    .filter(row => row.col("id") > Expr.literal(0))
+    .filter(row => row.col("id") > 0)
     .select(row =>
       (
-        row.col("id").as("id"),
+        row.col("id"),
         row.col("value").sqrt.as("root")
       )
     )

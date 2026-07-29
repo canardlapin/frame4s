@@ -22,33 +22,17 @@ val sampleCsv =
     |2,東京,
     |""".stripMargin
 
-def checkedCsv[A](result: Either[FrameError, A]): IO[A] =
-  IO.fromEither(
-    result.left.map(error => new IllegalArgumentException(error.message))
-  )
+def selected(frame: Frame[CsvObservation]): Frame[CsvSelected] =
+  frame
+    .filter(row => row.col("id") > 0)
+    .select(row => (row.col("label"), row.col("score")))
 
-def csvProgram: IO[String] =
-  checkedCsv(SourceRef.scan("observations", "sample.csv")).flatMap: reference =>
-    val source = CsvFrameSource.binding[IO, CsvObservation](
-      reference,
-      sampleCsv,
-      CsvSettings(batchSize = 256)
-    )
-    val query: Frame[CsvSelected] = source.frame
-      .filter(row => row.col("id") > Expr.literal(0))
-      .select(row =>
-        (
-          row.col("label").as("label"),
-          row.col("score").as("score")
-        )
-      )
+val csvSource = CsvFrameSource.binding[IO, CsvObservation](
+  sampleCsv,
+  CsvSettings(batchSize = 256)
+)
 
-    FrameRuntime
-      .resource(source)
-      .flatMap(_.collect(query))
-      .use(table =>
-        IO.fromEither(table.show().left.map(TableReadFailure.apply))
-      )
+def csvProgram: IO[String] = csvSource.render(selected(csvSource.frame))
 ```
 
 ```scala mdoc
@@ -61,24 +45,19 @@ On the JVM, use the same schema and query with a filesystem path:
 import _root_.fs2.io.file.Path
 
 def csvFileProgram(path: Path): IO[String] =
-  checkedCsv(SourceRef.scan("observations", path.toString)).flatMap: reference =>
-    val source = CsvPathSource.binding[IO, CsvObservation](
-      reference,
-      path,
-      CsvSettings(batchSize = 256)
-    )
-    FrameRuntime
-      .resource(source)
-      .flatMap(_.collect(source.frame))
-      .use(table =>
-        IO.fromEither(table.show().left.map(TableReadFailure.apply))
-      )
+  val source = CsvPathSource.binding[IO, CsvObservation](
+    path,
+    CsvSettings(batchSize = 256)
+  )
+  source.render(selected(source.frame))
 ```
 
 `CsvFrameSource` incrementally parses strings, byte streams, or character
 streams on both supported platforms. `CsvPathSource` owns the opened JVM file
 inside the runtime resource. Use `TsvFrameSource`, `TsvPathSource`, and
-`TsvSettings` for tab-delimited input.
+`TsvSettings` for tab-delimited input. These constructors are for a source used
+alone. A join supplies an explicit `SourceRef` for each input, as described in
+[execution and ownership](execution-and-ownership.md).
 
 Next, learn how [schemas, nullability, and column errors](schemas-and-errors.md)
 are represented.

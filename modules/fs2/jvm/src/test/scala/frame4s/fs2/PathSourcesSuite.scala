@@ -3,6 +3,7 @@ package frame4s.fs2
 import cats.effect.IO
 import cats.effect.Resource
 import cats.effect.unsafe.implicits.global
+import cats.syntax.all.*
 import fs2.io.file.Path
 import frame4s.*
 
@@ -82,4 +83,29 @@ class PathSourcesSuite extends munit.FunSuite:
             ) =>
           assert(detail.contains("label,id,score"))
         case other => fail(s"expected structured path header mismatch, found $other")
+      .unsafeToFuture()
+
+  test("JVM CSV and TSV path constructors support single-binding execution"):
+    val tsvFile =
+      Resource.make(
+        IO.blocking:
+          val path = java.nio.file.Files.createTempFile("frame4s-e3-", ".tsv")
+          java.nio.file.Files.writeString(
+            path,
+            "id\tlabel\tscore\n1\tAda\t1.5\n2\tLin\t\n"
+          )
+          Path.fromNioPath(path)
+      )((path: Path) => IO.blocking(java.nio.file.Files.deleteIfExists(path.toNioPath)).void)
+
+    (csvFile, tsvFile).tupled
+      .use: (csvPath, tsvPath) =>
+        val csv = CsvPathSource.binding[IO, Input](csvPath)
+        val tsv = TsvPathSource.binding[IO, Input](tsvPath)
+        val csvQuery = csv.frame.filter(_.col("id") > 0)
+        val tsvQuery = tsv.frame.filter(_.col("id") > 0)
+        (csv.render(csvQuery), tsv.render(tsvQuery)).tupled.map: (csvText, tsvText) =>
+          assert(csvText.contains("東京"))
+          assert(tsvText.contains("Ada"))
+          assertEquals(csv.reference.kind, SourceKind.Scan)
+          assertEquals(tsv.reference, csv.reference)
       .unsafeToFuture()

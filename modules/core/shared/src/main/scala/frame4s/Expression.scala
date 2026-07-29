@@ -2,6 +2,7 @@ package frame4s
 
 import scala.NamedTuple
 import scala.annotation.implicitNotFound
+import scala.compiletime.error
 
 private[frame4s] enum InputRef:
   case Current
@@ -104,16 +105,29 @@ sealed private[frame4s] trait OriginInScope[Origin, Allowed]
 private[frame4s] object OriginInScope:
   given [Origin, Allowed](using Origin <:< Allowed): OriginInScope[Origin, Allowed] with {}
 
+@implicitNotFound(
+  "Scalar operand has type ${Found}; expected ${Expected}. Convert the value explicitly before using it in this expression"
+)
+sealed private[frame4s] trait ExactScalarOperand[Expected, Found]:
+  def widen(value: Found): Expected
+
+private[frame4s] object ExactScalarOperand:
+  given [Expected, Found](using subtype: Found <:< Expected): ExactScalarOperand[Expected, Found]
+  with
+    def widen(value: Found): Expected = subtype(value)
+
 /** A typed logical expression whose originating frame scope is intentionally hidden. */
 type Expr[A] = ExprOf[A, ?]
 type ScopedExpr[A, Origin] = ExprOf[A, Origin]
 
 /** A typed, immutable expression in a frame query.
   *
-  * Construct column expressions inside a [[Frame]] callback and constants with [[Expr.literal]].
-  * The hidden `Origin` prevents a column expression from being reused with another frame. An
-  * operation on `Option[A]` remains nullable unless the operation, such as `isNull`, is total by
-  * definition.
+  * Construct column expressions inside a [[Frame]] callback. Comparison and arithmetic methods
+  * accept an exact Scala value directly; use [[Expr.literal]] when the same literal expression is
+  * reused. These methods do not perform numeric widening or implicit conversion, and an un-ascribed
+  * raw `null` is rejected at compile time. The hidden `Origin` prevents a column expression from
+  * being reused with another frame. An operation on `Option[A]` remains nullable unless the
+  * operation, such as `isNull`, is total by definition.
   *
   * Constructing an expression performs no I/O and reads no table data.
   *
@@ -140,6 +154,15 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   def ===(other: LiteralExpr[A]): ExprOf[ComparisonResult[A], Origin] =
     Expr.comparison(BinaryOperator.Equal, this, other)
 
+  def ===[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A]
+  ): ExprOf[ComparisonResult[A], Origin] =
+    this === Expr.literal(exact.widen(value))
+
+  transparent inline def ===(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def =!=[OtherOrigin](
       other: ExprOf[A, OtherOrigin]
   ): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
@@ -148,6 +171,15 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   def =!=(other: LiteralExpr[A]): ExprOf[ComparisonResult[A], Origin] =
     Expr.comparison(BinaryOperator.NotEqual, this, other)
 
+  def =!=[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A]
+  ): ExprOf[ComparisonResult[A], Origin] =
+    this =!= Expr.literal(exact.widen(value))
+
+  transparent inline def =!=(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def nullSafeEq[OtherOrigin](
       other: ExprOf[A, OtherOrigin]
   ): ExprOf[Boolean, Origin | OtherOrigin] =
@@ -155,6 +187,15 @@ sealed class ExprOf[A, Origin] private[frame4s] (
 
   def nullSafeEq(other: LiteralExpr[A]): ExprOf[Boolean, Origin] =
     Expr.nullSafeComparison(this, other)
+
+  def nullSafeEq[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A]
+  ): ExprOf[Boolean, Origin] =
+    nullSafeEq(Expr.literal(exact.widen(value)))
+
+  transparent inline def nullSafeEq(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def <[OtherOrigin](
       other: ExprOf[A, OtherOrigin]
@@ -166,6 +207,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   ): ExprOf[ComparisonResult[A], Origin] =
     Expr.comparison(BinaryOperator.LessThan, this, other)
 
+  def <[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      ordering: Ordering[A]
+  ): ExprOf[ComparisonResult[A], Origin] =
+    this < Expr.literal(exact.widen(value))
+
+  transparent inline def <(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def <=[OtherOrigin](
       other: ExprOf[A, OtherOrigin]
   )(using Ordering[A]): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
@@ -175,6 +226,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
       Ordering[A]
   ): ExprOf[ComparisonResult[A], Origin] =
     Expr.comparison(BinaryOperator.LessThanOrEqual, this, other)
+
+  def <=[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      ordering: Ordering[A]
+  ): ExprOf[ComparisonResult[A], Origin] =
+    this <= Expr.literal(exact.widen(value))
+
+  transparent inline def <=(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def >[OtherOrigin](
       other: ExprOf[A, OtherOrigin]
@@ -186,6 +247,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   ): ExprOf[ComparisonResult[A], Origin] =
     Expr.comparison(BinaryOperator.GreaterThan, this, other)
 
+  def >[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      ordering: Ordering[A]
+  ): ExprOf[ComparisonResult[A], Origin] =
+    this > Expr.literal(exact.widen(value))
+
+  transparent inline def >(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def >=[OtherOrigin](
       other: ExprOf[A, OtherOrigin]
   )(using Ordering[A]): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
@@ -196,6 +267,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   ): ExprOf[ComparisonResult[A], Origin] =
     Expr.comparison(BinaryOperator.GreaterThanOrEqual, this, other)
 
+  def >=[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      ordering: Ordering[A]
+  ): ExprOf[ComparisonResult[A], Origin] =
+    this >= Expr.literal(exact.widen(value))
+
+  transparent inline def >=(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def +[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
       Numeric[A]
   ): ExprOf[A, Origin | OtherOrigin] =
@@ -203,6 +284,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
 
   def +(other: LiteralExpr[A])(using Numeric[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Add, this, other)
+
+  def +[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      numeric: Numeric[A]
+  ): ExprOf[A, Origin] =
+    this + Expr.literal(exact.widen(value))
+
+  transparent inline def +(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def -[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
       Numeric[A]
@@ -212,6 +303,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   def -(other: LiteralExpr[A])(using Numeric[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Subtract, this, other)
 
+  def -[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      numeric: Numeric[A]
+  ): ExprOf[A, Origin] =
+    this - Expr.literal(exact.widen(value))
+
+  transparent inline def -(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def *[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
       Numeric[A]
   ): ExprOf[A, Origin | OtherOrigin] =
@@ -220,6 +321,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   def *(other: LiteralExpr[A])(using Numeric[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Multiply, this, other)
 
+  def *[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      numeric: Numeric[A]
+  ): ExprOf[A, Origin] =
+    this * Expr.literal(exact.widen(value))
+
+  transparent inline def *(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   def /[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
       Fractional[A]
   ): ExprOf[A, Origin | OtherOrigin] =
@@ -227,6 +338,16 @@ sealed class ExprOf[A, Origin] private[frame4s] (
 
   def /(other: LiteralExpr[A])(using Fractional[A]): ExprOf[A, Origin] =
     Expr.sameType(BinaryOperator.Divide, this, other)
+
+  def /[Value](value: Value)(using
+      exact: ExactScalarOperand[A, Value],
+      columnType: ColumnType[A],
+      fractional: Fractional[A]
+  ): ExprOf[A, Origin] =
+    this / Expr.literal(exact.widen(value))
+
+  transparent inline def /(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
 
   def isNull: ExprOf[Boolean, Origin] =
     Expr.unary(UnaryOperator.IsNull, this, DataType.Bool, nullable = false)
@@ -241,6 +362,10 @@ final class LiteralExpr[A] private[frame4s] (
 
 /** Constructors for scope-independent typed expressions. */
 object Expr:
+  /** Reject an un-ascribed raw null before it can resolve to a reference-typed overload. */
+  transparent inline def literal(inline value: Null): Nothing =
+    error("Raw null is not a typed column value. Use None for a nullable column.")
+
   /** Construct a literal whose physical type and nullability come from [[ColumnType]].
     *
     * `None` is represented as a typed null. A raw `null` is not accepted as a typed column value.
@@ -355,6 +480,23 @@ final case class NamedExprOf[
     expression: ExprOf[A, Origin]
 ) extends NamedExpr[Name, A]
 
+/** A checked source-column expression that retains its existing singleton field name.
+  *
+  * [[Scope.col]] is the only constructor. Projection and grouping may therefore reuse `name`
+  * without an alias while preserving the same frame-origin proof as [[ExprOf]]. Computed
+  * expressions return `ExprOf` and still require [[ExprOf.as]] before they become output fields.
+  */
+final class ColumnExprOf[
+    Name <: String & Singleton,
+    A,
+    Origin
+] private[frame4s] (
+    val name: Name,
+    resolved: ResolvedExpr
+) extends ExprOf[A, Origin](resolved)
+    with NamedExpr[Name, A]:
+  def expression: ExprOf[A, Origin] = this
+
 object NamedExpr:
   def apply[Name <: String & Singleton, A, Origin](
       name: Name,
@@ -364,27 +506,59 @@ object NamedExpr:
 
 final private[frame4s] case class NamedExpression(name: String, expression: ResolvedExpr)
 
-private[frame4s] trait ExpressionSelection[Expressions <: Tuple]:
+@implicitNotFound(
+  "A projection or grouping may contain raw columns or explicitly named computed expressions. Add .as(\"name\") to each computed expression."
+)
+private[frame4s] trait ExpressionSelection[
+    Expressions <: Tuple,
+    Names <: Tuple,
+    Values <: Tuple
+]:
   def expressions(value: Expressions): Vector[NamedExpression]
 
 private[frame4s] object ExpressionSelection:
-  given ExpressionSelection[EmptyTuple] with
+  given ExpressionSelection[EmptyTuple, EmptyTuple, EmptyTuple] with
     def expressions(value: EmptyTuple): Vector[NamedExpression] = Vector.empty
 
-  given [
+  given namedSelection[
       Name <: String & Singleton,
       Value,
       Origin,
-      Tail <: Tuple
+      Tail <: Tuple,
+      TailNames <: Tuple,
+      TailValues <: Tuple
   ](using
-      tail: ExpressionSelection[Tail]
-  ): ExpressionSelection[NamedExprOf[Name, Value, Origin] *: Tail] with
+      tail: ExpressionSelection[Tail, TailNames, TailValues]
+  ): ExpressionSelection[
+    NamedExprOf[Name, Value, Origin] *: Tail,
+    Name *: TailNames,
+    Value *: TailValues
+  ] with
     def expressions(
         value: NamedExprOf[Name, Value, Origin] *: Tail
     ): Vector[NamedExpression] =
       NamedExpression(value.head.name, value.head.expression.resolved) +: tail.expressions(
         value.tail
       )
+
+  given columnSelection[
+      Name <: String & Singleton,
+      Value,
+      Origin,
+      Tail <: Tuple,
+      TailNames <: Tuple,
+      TailValues <: Tuple
+  ](using
+      tail: ExpressionSelection[Tail, TailNames, TailValues]
+  ): ExpressionSelection[
+    ColumnExprOf[Name, Value, Origin] *: Tail,
+    Name *: TailNames,
+    Value *: TailValues
+  ] with
+    def expressions(
+        value: ColumnExprOf[Name, Value, Origin] *: Tail
+    ): Vector[NamedExpression] =
+      NamedExpression(value.head.name, value.head.resolved) +: tail.expressions(value.tail)
 
 @implicitNotFound(
   "One or more expressions were created for a different frame scope. Build every column expression from this callback's scope."
@@ -394,7 +568,7 @@ sealed private[frame4s] trait ExpressionsInScope[Expressions <: Tuple, Allowed]
 private[frame4s] object ExpressionsInScope:
   given [Allowed]: ExpressionsInScope[EmptyTuple, Allowed] with {}
 
-  given [
+  given namedInScope[
       Name <: String & Singleton,
       Value,
       Origin,
@@ -405,14 +579,31 @@ private[frame4s] object ExpressionsInScope:
       tail: ExpressionsInScope[Tail, Allowed]
   ): ExpressionsInScope[NamedExprOf[Name, Value, Origin] *: Tail, Allowed] with {}
 
+  given columnInScope[
+      Name <: String & Singleton,
+      Value,
+      Origin,
+      Tail <: Tuple,
+      Allowed
+  ](using
+      head: OriginInScope[Origin, Allowed],
+      tail: ExpressionsInScope[Tail, Allowed]
+  ): ExpressionsInScope[ColumnExprOf[Name, Value, Origin] *: Tail, Allowed] with {}
+
 final class Scope[S <: NamedTuple.AnyNamedTuple, Origin] private[frame4s] (
     input: InputRef,
     schema: Schema,
     scopeId: ExprScopeId
 ):
+  /** Select one existing field by its singleton name.
+    *
+    * The result retains both the checked field name and this callback's frame provenance. Raw
+    * columns can therefore be projected or grouped without repeating `.as`; a computed expression
+    * still requires an explicit output name.
+    */
   def col[Name <: String & Singleton](name: Name)(using
       at: ColumnLookup[NamedTuple.Names[S], NamedTuple.DropNames[S], Name]
-  ): ExprOf[SchemaFieldType[S, Name], Origin] =
+  ): ColumnExprOf[Name, SchemaFieldType[S, Name], Origin] =
     val field = schema.fields(at.index)
     val resolved = ResolvedExpr(
       ExprId.derived(s"column:${input.qualifier}:${field.id.value}"),
@@ -420,7 +611,7 @@ final class Scope[S <: NamedTuple.AnyNamedTuple, Origin] private[frame4s] (
       field.nullable,
       ExprNode.Column(input, scopeId, field.id, field.name, at.index)
     )
-    new ExprOf(resolved)
+    new ColumnExprOf(name, resolved)
 
 object Scope:
   private[frame4s] def current[S <: NamedTuple.AnyNamedTuple, Origin](

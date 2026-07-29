@@ -888,19 +888,23 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
         )
       )
 
-  def select[Expressions <: Tuple](
+  def select[
+      Expressions <: Tuple,
+      Names <: Tuple,
+      Values <: Tuple
+  ](
       expressions: Scope[S, this.Origin] => Expressions
   )(using
+      selection: ExpressionSelection[Expressions, Names, Values],
       inScope: ExpressionsInScope[Expressions, this.Origin],
-      selection: ExpressionSelection[Expressions],
-      output: SchemaDescriptor[SelectedSchema[Expressions]],
-      unique: UniqueNames[SelectionNames[Expressions]]
-  ): Frame[SelectedSchema[Expressions]] =
+      unique: UniqueNames[Names],
+      output: SchemaDescriptor[NamedTuple.NamedTuple[Names, Values]]
+  ): Frame[NamedTuple.NamedTuple[Names, Values]] =
     val selected =
       selection.expressions(
         expressions(Scope.current[S, this.Origin](scopeToken, schema))
       )
-    new Frame[SelectedSchema[Expressions]](
+    new Frame[NamedTuple.NamedTuple[Names, Values]](
       LogicalPlan.Project(plan, selected, output.schema),
       output.schema,
       output
@@ -1296,12 +1300,16 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
     )
     new Frame(dynamic.plan, output.schema, output)
 
-  def groupBy[Keys <: Tuple](
+  def groupBy[
+      Keys <: Tuple,
+      KeyNames <: Tuple,
+      KeyValues <: Tuple
+  ](
       keys: Scope[S, this.Origin] => Keys
   )(using
+      selection: ExpressionSelection[Keys, KeyNames, KeyValues],
       inScope: ExpressionsInScope[Keys, this.Origin],
-      selection: ExpressionSelection[Keys],
-      unique: UniqueNames[SelectionNames[Keys]]
+      unique: UniqueNames[KeyNames]
   ): GroupedFrame[S, Keys, this.Origin] =
     val selected = keys(Scope.current[S, this.Origin](scopeToken, schema))
     new GroupedFrame(this, selection.expressions(selected))

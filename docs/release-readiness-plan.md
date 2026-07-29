@@ -1,9 +1,12 @@
 # frame4s 0.1 release-readiness plan
 
-Status: accepted
+Status: accepted; E0 ergonomic API amendment active
 
 Ratified: 2026-07-26 through Mote issue
 `bd-01KYF1PJC3K8NRGDNNT47QJFF2`
+
+E0 amendment: 2026-07-26 through Mote epic
+`bd-01KYG47EQY15E3XQB9EWDZ3WXG`
 
 Normative companion records:
 
@@ -13,6 +16,10 @@ Normative companion records:
   fixes the source-binding, backend-selection, pushdown, and ownership boundary.
 - [`design/adr-0002-expression-provenance.md`](design/adr-0002-expression-provenance.md)
   fixes typed and dynamic expression ownership.
+- [`design/adr-0004-ergonomic-api.md`](design/adr-0004-ergonomic-api.md)
+  records which one-source conveniences may derive redundant evidence and
+  which schema, nullability, ownership, naming, and source-identity decisions
+  remain explicit.
 
 Target: first public `0.1.0` release
 
@@ -35,15 +42,20 @@ dead ends, and whose optimized execution is governed by the semantic oracle.
 
 1. the public API cannot construct any currently known constitution-violating
    plan;
-2. a new user can construct or read typed data, inspect it, build a query, and
-   execute that query without internal APIs or manual source rebinding;
-3. every supported operation has explicit null, NaN, overflow, ordering, and
+2. a routine one-source program does not require the caller to restate a
+   literal wrapper, an unchanged source-column name, a source identity that
+   cannot conflict, runtime acquisition, or error lifting that frame4s can derive
+   without changing semantics;
+3. a new user can construct or read typed data, inspect it, build a reusable
+   query value, and execute that query without internal APIs or manual source
+   rebinding;
+4. every supported operation has explicit null, NaN, overflow, ordering, and
    failure semantics in the reference interpreter;
-4. every optimized path included in the release is differentially checked
+5. every optimized path included in the release is differentially checked
    against that interpreter;
-5. performance and compile-time claims have reproducible receipts, including
+6. performance and compile-time claims have reproducible receipts, including
    losses;
-6. the JVM and Scala.js artifacts, documentation, security policy, provenance,
+7. the JVM and Scala.js artifacts, documentation, security policy, provenance,
    and publication process have all been rehearsed from a clean checkout.
 
 ## Product and scope rules
@@ -126,9 +138,9 @@ planned after `0.1.0`. Any such facility must emit or embed an inspectable
 schema receipt and validate the runtime header/fingerprint before typed
 binding.
 
-## Current baseline
+## Baseline at ratification
 
-The current checkout already has several strong foundations:
+At ratification, the checkout already had several strong foundations:
 
 - a portable named-tuple schema, expression, and closed-plan core;
 - exact typed-to-dynamic rebinding checks;
@@ -163,19 +175,14 @@ The release blockers visible at plan ratification were:
 ## Dependency order
 
 ```text
-R0 Release contract
- |
- v
-R1 Constitution closure
- |
- +--> R2 Laws and measurement court --------+
- |                                          |
- +--> R3 Execution boundary and first use --+--> R6 API freeze --> R7 Release candidate
- |                                          |
- +--> R4 Small algebra completion -----------+
+R0 -> R1
+R1 -> R2 Laws and measurement court
+R1 -> R3 Execution boundary and first use
+R1 -> R4 Small algebra completion
+R2 + R3 + R4 -> E0 Ergonomic API gate -> R6 API freeze -> R7 Release candidate
 
-R2 -----------> R5a Existing-algebra optimized kernels and claim gate
-R2 + R4 ------> R5b Union/distinct/semi/anti optimized kernels
+R2 -> R5a Existing-algebra optimized kernels and claim gate
+R2 + R4 -> R5b Union/distinct/semi/anti optimized kernels
 ```
 
 Release plumbing that does not freeze public APIs may proceed in parallel, but
@@ -863,12 +870,276 @@ impact/complexity sequence.
   the `0.1.0` artifacts/documentation describe only the semantic reference
   backend.
 
+## E0 — Close the ergonomic public API gap before the API freeze
+
+R1 through R4 established the sound typed algebra, semantic oracle, execution
+boundary, materialized read view, documentation machinery, and small relational
+surface. E0 removes proof bookkeeping from routine use without changing any of
+those contracts. It is a release gate because `0.1.0` establishes the first
+public compatibility baseline.
+
+Mote issue `bd-01KYG47EQY15E3XQB9EWDZ3WXG` is the governing epic. Its children
+E1 through E5 are the implementation and certification sequence. E2 and E3 may
+proceed in parallel only after E1 closes. E4 depends on both implementations.
+E5 certifies the combined public API and blocks R6.
+
+### Governing rule
+
+Remove syntax only when frame4s already possesses the information. Keep syntax
+when the caller chooses schema, nullability, conversion, ownership, an output
+name for a computation, a multi-source identity, backend selection, or receipt
+behavior.
+
+Every convenience must have one tested expansion into the existing public
+primitives. The concise and expanded forms must agree on types, logical plans,
+schemas, explain output, values, structured failures, ordering, pushdown,
+effects, finalization, and material execution work.
+
+The following remain prohibited:
+
+- an implicit conversion from Scala values to expressions;
+- numeric widening or hidden casts;
+- a `Dataset`, `FrameInput`, eager `Table`, or source-bound transformation
+  dialect;
+- transformation methods on `SourceBinding`;
+- hidden ownership for an escaping `Table`, batch, cursor, or stream;
+- random, content-derived, object-identity, or magic-string source identity;
+- user-facing diagnostics led by match types, origin unions, helper builders,
+  or internal evidence.
+
+### Effort and dependency plan
+
+| Work | Size | Depends on | Release result |
+| --- | --- | --- | --- |
+| E1 contract and complete specimen court | S | R1–R4 | Ratified signatures, diagnostics, and ownership boundaries |
+| E2 expression and projection implementation | M | E1 | Direct exact operands, raw-column name preservation, and closed direct-null hole |
+| E3 single-source execution facade | M | E1 | Concise acquisition and execution with unchanged `Frame` algebra |
+| E4 first-contact and guide rewrite | S–M | E2 and E3 | Documentation teaches only the landed progressive API |
+| E5 combined release certification | M | E4 | Clean supported-toolchain receipt and R6 API-freeze approval |
+
+### E1 — Ratify the complete contract
+
+E1 is not complete merely because a signature experiment compiles or because
+the same experiment passes on JDK 21. Close it only when the decision record,
+downstream specimens, diagnostics, and supported-toolchain receipt cover the
+whole matrix below.
+
+Required positive specimens:
+
+1. typed in-memory rows through exact scalar filtering, raw-column projection,
+   and detached bounded rendering;
+2. typed CSV with an optional field through nullable filtering, grouping or
+   aggregation, and scoped collection;
+3. one named `Frame` transformation applied independently to two same-schema
+   bindings;
+4. a query value conditionally extended and executed more than once;
+5. an explicit two-source join with distinct stable identities and a receipt;
+6. the proposed no-reference in-memory, CSV, TSV, and JVM path constructor
+   signatures, including the transition to explicit identities for
+   multi-source execution.
+
+Required negative specimens:
+
+- unknown fields;
+- wrong exact scalar types and attempted numeric widening;
+- duplicate raw or explicitly named outputs;
+- an unnamed computed projection;
+- foreign-frame expression reuse;
+- invalid nullable predicates and operations;
+- join output-name collisions;
+- direct raw `null` through every proposed operand family and literal entry
+  point that the API claims to reject.
+
+E1 must state the attainable null guarantee under Scala's default nullability.
+Direct `null` syntax must not resolve to `LiteralExpr` or reach a dereference.
+The ADR must separately decide how explicit type arguments or a value already
+typed as a non-null reference are treated; it must not imply that a downstream
+compiler without explicit-nulls can prove more than Scala's type system
+provides.
+
+E1 acceptance criteria:
+
+- every proposed signature appears in a compiling downstream-package specimen;
+- every convenience has a written canonical expansion and ownership boundary;
+- the first diagnostic for every ordinary invalid call names the caller's
+  field, value, computation, scope, or identity mistake;
+- no prototype uses a cast, broad conversion, Boolean identity flag, sentinel,
+  global runtime, or second algebra;
+- the positive and negative matrices pass under Scala 3.7.4, sbt 1.10.5, and
+  the supported Temurin JDK 21;
+- the receipt records line and concept counts only as observations and does not
+  use them to waive a safety or diagnostic failure.
+
+### E2 — Implement expression and projection conveniences
+
+Close the known direct-null hole before admitting any new convenience. Then add
+the selected exact operand and raw-column projection forms.
+
+Implementation requirements:
+
+- implement the ratified null contract at every affected expression and
+  literal boundary;
+- add exact-`A` equality, inequality, null-safe equality, ordering, arithmetic,
+  and division overloads that construct `Expr.literal(value)` and call the
+  existing expression-to-expression operation;
+- retain `LiteralExpr[A]` for named or reusable literals;
+- make checked `Scope.col` return a private-constructor
+  `ColumnExprOf[Name, A, Origin]` that retains the singleton field name and
+  provenance;
+- allow projection and group-key selection to consume raw `ColumnExprOf` values
+  or explicitly named expressions;
+- continue requiring `.as("name")` after arithmetic, functions, aggregates, or
+  any other computation that does not already possess an output name.
+
+E2 acceptance criteria:
+
+- concise and expanded calls produce identical resolved expressions, plans,
+  schemas, explain output, oracle results, structured failures, and ordering;
+- direct raw `null` fails at compile time with the ratified `Option` guidance
+  rather than compiling to a later exception;
+- wrong scalar types and widening attempts fail with the expected and found
+  Scala types before internal evidence appears;
+- duplicate raw-column projections, missing fields, unnamed computations, and
+  foreign-frame columns fail at compile time with actionable diagnostics;
+- an inferred projected query retains a concrete named-tuple output type across
+  a downstream artifact boundary, so typed table decoding needs no redundant
+  result annotation;
+- no implicit `Conversion`, cast, new expression node, or runtime lookup of a
+  type-level field name is introduced;
+- narrow, 32-column, and 48-column specimens pass on JVM and Scala.js within
+  the ratified compile-time budgets.
+
+### E3 — Implement the single-source execution facade
+
+Add acquisition and execution conveniences to `SourceBinding`; do not add
+query transformations to it.
+
+Required public forms:
+
+```scala
+binding.collect(query)         // Resource[F, Table[O]]
+binding.stream(query)          // Stream[F, RecordBatch]
+binding.render(query, options) // F[String]
+```
+
+Their only canonical expansions are
+`FrameRuntime.resource(binding).flatMap(_.collect(query))`,
+`Stream.resource(FrameRuntime.resource(binding)).flatMap(_.stream(query))`, and
+scoped collection followed by `Table.show` for the detached string.
+
+No-reference constructors use a private `BindingIdentity` ADT with `Explicit`
+and `SingleSource` cases. A runtime containing more than one binding must reject
+any `SingleSource` identity with a dedicated `RuntimeBindingError` that directs
+the caller to the explicit-`SourceRef` constructors. Code must not recover this
+state by inspecting a reserved string or Boolean.
+
+E3 acceptance criteria:
+
+- `collect` keeps `Table` ownership in `Resource`, `stream` keeps runtime and
+  batch ownership in `Stream`, and only detached `render` brackets internally;
+- the same immutable query value can be named, passed, conditionally composed,
+  reused across acquisitions, and executed through concise or explicit forms;
+- concise and explicit forms have identical source inspection, schema
+  validation, pushdown, plans, values, errors, ordering, receipts where
+  applicable, and finalization;
+- success, acquisition failure, decode failure, render failure, early
+  termination, and cancellation close every owner exactly once;
+- explicit multi-source construction, backend selection, and receipt-bearing
+  execution remain unchanged;
+- `SourceBinding` exposes no filter, projection, grouping, aggregation, join,
+  sort, union, distinct, or expression method;
+- portable behavior passes on JVM and Scala.js, and path acquisition remains a
+  JVM-only scoped convenience.
+
+### E4 — Rewrite first contact after E2 and E3 land
+
+Do not publish hypothetical syntax. Rewrite documentation only against the
+merged public API.
+
+Documentation order:
+
+1. README first screen: named-tuple schema, in-memory rows, reusable `Frame`
+   query, detached bounded rendering, and the result;
+2. quick start: the same program with explanation of schema, query purity, and
+   execution;
+3. CSV/TSV guide: replace only source construction and retain the same query;
+4. ownership guide: show `Resource[F, Table[S]]`, streaming, explicit runtime,
+   multi-source identity, backend selection, and receipts;
+5. API Scaladoc: document exact operands, retained raw-column names, computed
+   names, nullability, identity, and ownership at the relevant public types.
+
+E4 acceptance criteria:
+
+- the simple detached examples contain no `SourceRef`, `FrameRuntime`,
+  `Resource` import, manual `Either` lifting, redundant unchanged-column
+  aliases, internal API, partial `.get`, or unsafe cast;
+- owned and multi-source examples retain every meaningful scope and identity;
+- README, mdoc guides, Scaladoc, first-contact program, and staged consumers use
+  the same terminology and progression;
+- every example compiles, executable examples run, and expected output is
+  recorded;
+- the guide states that the `0.1.0` runtime is reference-only unless a public
+  optimized backend is separately admitted.
+
+### E5 — Certify the combined public API
+
+Run the complete E0 court from a clean checkout of the exact candidate commit.
+Local dirty-worktree or unsupported-JDK runs may be retained as development
+evidence but cannot close E5.
+
+Required receipts:
+
+- positive downstream-program matrix;
+- negative compilation and first-diagnostic matrix;
+- concise-versus-expanded semantic and plan parity;
+- ownership and exact-once lifecycle outcomes;
+- clean and incremental narrow/32/48-column compilation;
+- mdoc/Laika, Scaladoc, staged JVM, and staged Scala.js consumers;
+- complete release command and sanitized environment/source hashes.
+
+E5 acceptance criteria:
+
+- every E0 positive and negative case passes using only public API;
+- `sbt formatCheck docsCheck apiDocs versionPolicyCheck compileAll testAll
+  benchmarkSmoke` passes on the supported toolchain;
+- the release rehearsal and staged consumers pass from the same clean commit;
+- no receipt or artifact contains an absolute local path, secret, snapshot
+  dependency, `.mote`, `vendor`, or `target` payload;
+- public docs and artifacts contain no prototype package or uncommitted syntax;
+- the released `FrameRuntime` is described as reference-only unless a public
+  optimized backend has independently passed R5 packaging, conformance,
+  explain, lifecycle, and performance admission;
+- E0 closes before R6 freezes the public compatibility surface.
+
+### E0 release exit criteria
+
+- There is one `Frame` transformation algebra from the shortest example through
+  explicit multi-source and receipt-bearing execution.
+- Invalid ordinary programs remain unconstructable at the intended boundary,
+  including the ratified direct-null cases.
+- Valid ordinary one-source programs do not restate evidence frame4s already
+  possesses.
+- Owned values keep visible scopes; detached values may outlive them.
+- Every convenience is a tested expansion rather than a second semantics.
+- The user-facing guides teach landed behavior, and the full clean JDK 21 court
+  proves it.
+
+### Performance posture after E0
+
+E0 does not route ordinary execution to the package-internal columnar
+candidate. `0.1.0` may remain reference-only and publish no comparative runtime
+claim. A later public optimized backend is a separate R5 admission decision and
+must expose backend selection, explain and fallback behavior, conformance,
+ownership, and supported-platform limits without changing the E0 query API.
+
 ## R6 — Freeze the API and make the repository releasable
 
 ### R6.1 Compiler, formatting, and CI
 
 Acceptance criteria:
 
+- E0 is closed and the ergonomic public API has passed its combined downstream
+  and diagnostic court before the compatibility freeze.
 - `-deprecation`, `-feature`, `-unchecked`, existing unused/value-discard
   checks, and `-Werror` remain enabled.
 - Deterministic formatting is configured and checked without broad
@@ -929,7 +1200,10 @@ Acceptance criteria:
 - Every code example is compiled in CI through mdoc or an equivalent executable
   documentation mechanism.
 - Quick starts contain no internal APIs, manual buffers, unsafe casts, hidden
-  global runtime, or partial `.get`.
+  global runtime, partial `.get`, or redundant proof bookkeeping that E0
+  committed to derive.
+- Examples that return an owned table or stream keep `Resource` or `Stream`
+  visible; only detached results may hide the completed ownership scope.
 - API Scaladoc is warning-clean and published with the release.
 - The README describes only capabilities present in the candidate artifacts.
 - Benchmark pages link raw receipts and state workload/environment limitations.
@@ -976,6 +1250,9 @@ commit. The candidate is acceptable only when all of the following are true:
 - [ ] The normal source-to-query execution path and first-use consumer pass.
 - [ ] Every committed R4 operation satisfies its typed, dynamic, oracle, and
       cross-platform criteria.
+- [ ] E0 is closed: direct-null regressions, concise/expanded parity,
+      ownership, diagnostics, documentation, and downstream programs pass on
+      the frozen public API.
 - [ ] If an optimized path is included, it satisfies the ratified R5
       conformance/performance criteria; otherwise the artifacts and docs are
       explicitly reference-only and make no comparative speed claim.
@@ -1007,7 +1284,7 @@ commit. The candidate is acceptable only when all of the following are true:
 
 ## Assurance baseline and required exit state
 
-| Assurance dimension | Current rating | Current evidence/gap | `0.1.0` exit state |
+| Assurance dimension | Rating at ratification | Evidence/gap at ratification | `0.1.0` exit state |
 | --- | --- | --- | --- |
 | ScalaCheck use and generator quality | Missing | MUnit examples exist; no property dependency, generators, shrinkers, or seed policy | Meaningful cross-built generators and reproducible properties from R2 |
 | Reusable law-test module | Missing | Semantic tests are tied to current suites | Shared normalization, storage, and backend conformance laws |
@@ -1055,6 +1332,12 @@ merged:
   complexity under the ratified performance policy.
 - Do not admit a new plan concept under the label of convenience.
 - Do not let a materialized operation create a second transformation algebra.
+- Do not close E1 on a supported-JDK rerun while any required positive,
+  negative, constructor, or ownership specimen is missing.
+- Do not publish a public operand API through which direct raw `null` resolves
+  as a reusable literal expression or fails later by dereference.
+- Do not document a concise form until that exact public form is merged and
+  executable in the documentation court.
 - Do not call configured CI, publication, security, or benchmark machinery
   verified until it has run successfully on the candidate.
 - Do not publish while an expected-failure marker documents a known
@@ -1078,3 +1361,21 @@ not wait behind an unexplored type-system design. The selected provenance
 implementation remains the R1 exit gate, but the spike produces an explicit
 fallback and re-estimate instead of allowing the whole program to hang on an
 unbounded experiment.
+
+## Current release tranche
+
+E1's full specimen and first-diagnostic matrix, E2's expression conveniences,
+E3's single-source execution facade, and E4's first-contact/documentation
+rewrite pass on the development JDK. Their receipts remain provisional because
+they were produced from a dirty JDK 22 checkout.
+
+The remaining public-API critical path is:
+
+1. review and land E1-E4 as a coherent public-API change;
+2. run E5 from the clean exact candidate on Temurin JDK 21, including the full
+   release command and staged consumers;
+3. close E0 only if that supported-toolchain court passes;
+4. freeze the API in R6 and produce the R7 candidate.
+
+The package-internal index/layout work remains a separate reviewable change and
+does not alter the E0 public API.

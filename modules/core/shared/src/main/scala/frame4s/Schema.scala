@@ -179,6 +179,16 @@ private[frame4s] object SchemaFields:
   given SchemaFields[EmptyTuple, EmptyTuple] with
     val fields = Vector.empty
 
+  transparent inline given missingField[
+      Name <: String & Singleton,
+      Names <: Tuple,
+      Values <: Tuple
+  ]: SchemaFields[Name *: Names, Nothing *: Values] =
+    error(
+      "Column '" + constValue[Name] +
+        "' does not exist in this schema. Check the spelling or project the column before this operation."
+    )
+
   given [
       Name <: String & Singleton,
       Names <: Tuple,
@@ -268,6 +278,7 @@ type FieldType[
 ] = (Names, Values) match
   case (Name *: names, value *: values) => value
   case (_ *: names, _ *: values)        => FieldType[names, values, Name]
+  case (EmptyTuple, EmptyTuple)         => Nothing
 
 private[frame4s] trait ColumnLookup[
     Names <: Tuple,
@@ -526,6 +537,9 @@ type LeftUsingJoinSchema[
   ]
 ]
 
+@implicitNotFound(
+  "Join output column names overlap between ${LeftNames} and ${RightNames}. Rename or drop the duplicated fields before joining."
+)
 private[frame4s] trait DisjointNames[
     LeftNames <: Tuple,
     RightNames <: Tuple,
@@ -533,15 +547,31 @@ private[frame4s] trait DisjointNames[
 ]
 
 private[frame4s] object DisjointNames:
-  given empty[RightNames <: Tuple, RightValues <: Tuple]
-      : DisjointNames[EmptyTuple, RightNames, RightValues] with {}
-
-  given [
-      Head <: String,
-      Tail <: Tuple,
+  final class Evidence[
+      LeftNames <: Tuple,
       RightNames <: Tuple,
       RightValues <: Tuple
-  ](using
-      absent: scala.util.NotGiven[ColumnAt[RightNames, RightValues, Head]],
-      next: DisjointNames[Tail, RightNames, RightValues]
-  ): DisjointNames[Head *: Tail, RightNames, RightValues] with {}
+  ] extends DisjointNames[LeftNames, RightNames, RightValues]
+
+  transparent inline given derived[
+      LeftNames <: Tuple,
+      RightNames <: Tuple,
+      RightValues <: Tuple
+  ]: DisjointNames[LeftNames, RightNames, RightValues] =
+    check[LeftNames, RightNames]
+    new Evidence
+
+  private inline def check[
+      LeftNames <: Tuple,
+      RightNames <: Tuple
+  ]: Unit =
+    inline erasedValue[LeftNames] match
+      case _: EmptyTuple     => ()
+      case _: (head *: tail) =>
+        inline erasedValue[ContainsName[RightNames, head & String]] match
+          case _: true =>
+            error(
+              "Join output column '" + constValue[head & String] +
+                "' occurs on both sides. Rename or drop it before joining."
+            )
+          case _: false => check[tail, RightNames]

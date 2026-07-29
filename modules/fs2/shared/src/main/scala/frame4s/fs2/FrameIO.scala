@@ -295,6 +295,40 @@ object InMemoryFrameSource:
       descriptor: SchemaDescriptor[S],
       codec: RowCodec[S]
   ): SourceBinding[F, S] =
+    SourceBinding(reference, rowsResource(rows, batchSize))
+
+  /** Bind detached named-tuple rows for one-source execution.
+    *
+    * Use [[rowsBinding]] with an explicit [[SourceRef]] when the binding will participate in a
+    * multi-source runtime.
+    */
+  def rows[
+      F[_],
+      S <: scala.NamedTuple.AnyNamedTuple
+  ](
+      rows: Iterable[S],
+      batchSize: Int = 1024
+  )(using
+      F: Async[F],
+      descriptor: SchemaDescriptor[S],
+      codec: RowCodec[S]
+  ): SourceBinding[F, S] =
+    SourceBinding.singleSource(
+      SourceRef.singleSourceValues,
+      rowsResource(rows, batchSize)
+    )
+
+  private def rowsResource[
+      F[_],
+      S <: scala.NamedTuple.AnyNamedTuple
+  ](
+      rows: Iterable[S],
+      batchSize: Int
+  )(using
+      F: Async[F],
+      descriptor: SchemaDescriptor[S],
+      codec: RowCodec[S]
+  ): Resource[F, InMemoryFrameSource[F]] =
     val table =
       Resource.make(
         F.delay(Table.fromRows(rows, batchSize))
@@ -304,7 +338,7 @@ object InMemoryFrameSource:
       FrameSource.owningResource(
         F.delay(InMemoryFrameSource[F](value.schema, value.batches))
       )
-    SourceBinding(reference, source)
+    source
 
   /** Borrow an existing table for the runtime scope; the caller remains its owner. */
   def borrowedBinding[
@@ -468,6 +502,27 @@ object CsvFrameSource:
   )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
     SourceBinding(reference, resource(input, settings.options(descriptor.schema)))
 
+  /** Describe one typed in-memory CSV source without choosing a multi-source identity. */
+  def binding[
+      F[_]: Async,
+      S <: scala.NamedTuple.AnyNamedTuple
+  ](
+      input: String
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    binding(input, CsvSettings())
+
+  def binding[
+      F[_]: Async,
+      S <: scala.NamedTuple.AnyNamedTuple
+  ](
+      input: String,
+      settings: CsvSettings
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    SourceBinding.singleSource(
+      SourceRef.singleSourceScan,
+      resource(input, settings.options(descriptor.schema))
+    )
+
   def byteBinding[
       F[_]: Async,
       S <: scala.NamedTuple.AnyNamedTuple
@@ -600,6 +655,24 @@ object TsvFrameSource:
       settings: TsvSettings = TsvSettings()
   )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
     CsvFrameSource.binding(reference, input, settings.csvSettings)
+
+  /** Describe one typed in-memory TSV source without choosing a multi-source identity. */
+  def binding[
+      F[_]: Async,
+      S <: scala.NamedTuple.AnyNamedTuple
+  ](
+      input: String
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    binding(input, TsvSettings())
+
+  def binding[
+      F[_]: Async,
+      S <: scala.NamedTuple.AnyNamedTuple
+  ](
+      input: String,
+      settings: TsvSettings
+  )(using descriptor: SchemaDescriptor[S]): SourceBinding[F, S] =
+    CsvFrameSource.binding(input, settings.csvSettings)
 
   def byteBinding[
       F[_]: Async,
