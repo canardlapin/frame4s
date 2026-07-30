@@ -562,7 +562,7 @@ final private class FlatHashRowsBackend(
       size
   private var cachedKeys = new Array[Int](buildCacheSize)
   private var cachedLastSlots =
-    Array.fill(buildCacheSize)(Int32SecondaryIndex.MissingRow)
+    filledIntArray(buildCacheSize, Int32SecondaryIndex.MissingRow)
 
   val ownedBytes: Long =
     (keys.length.toLong + rows.length.toLong) * 4L
@@ -1088,8 +1088,8 @@ private[frame4s] object Int32SecondaryIndex:
     val capacity = capacityFor(rows)
     val backend = new FastHashBackend(
       new Array[Int](capacity),
-      Array.fill(capacity)(MissingRow),
-      Array.fill(rows)(MissingRow)
+      filledIntArray(capacity, MissingRow),
+      filledIntArray(rows, MissingRow)
     )
     val index = new Int32SecondaryIndex(
       sources,
@@ -1203,7 +1203,7 @@ private[frame4s] object Int32SecondaryIndex:
     val capacity = flatCapacityFor(indexedRows)
     val backend = new FlatHashRowsBackend(
       new Array[Int](capacity),
-      Array.fill(capacity)(MissingRow)
+      filledIntArray(capacity, MissingRow)
     )
     val index = new Int32SecondaryIndex(
       sources,
@@ -1303,7 +1303,7 @@ private[frame4s] object Int32SecondaryIndex:
 
         val backend = new GroupedHashBackend(
           new Array[Int](flatCapacityFor(distinctKeys)),
-          Array.fill(flatCapacityFor(distinctKeys))(MissingRow),
+          filledIntArray(flatCapacityFor(distinctKeys), MissingRow),
           new Array[Int](duplicateGroups),
           new Array[Int](duplicateRows)
         )

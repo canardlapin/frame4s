@@ -128,12 +128,14 @@ final private[frame4s] class ColumnarResult private (
       var error: Option[ExecutionError] = None
       while batchIndex < batches.length && error.isEmpty do
         val batch = batches(batchIndex)
+        // Same reason as `checksum`: this indexed a Vector once per cell.
+        val columns = batch.columns.toArray
         var row = 0
         while row < batch.rowCount && error.isEmpty do
           val values = Vector.newBuilder[ScalarValue]
           var column = 0
-          while column < batch.columns.length && error.isEmpty do
-            batch.columns(column).scalar(row) match
+          while column < columns.length && error.isEmpty do
+            columns(column).scalar(row) match
               case Right(value) => values += value
               case Left(value)  => error = Some(value)
             column += 1
@@ -151,11 +153,16 @@ final private[frame4s] class ColumnarResult private (
         val batch = batches(batchIndex)
         if batch.columns.length == 1 then hash = batch.columns.head.foldHash(hash)
         else
+          // `columns` is a Vector, so indexing it inside the cell loop walked a radix trie
+          // once per cell. Hoisting to an array keeps the row-major fold order, and so the
+          // checksum value, exactly as ratified in the committed receipts.
+          val columns = batch.columns.toArray
+          val width = columns.length
           var row = 0
           while row < batch.rowCount do
             var column = 0
-            while column < batch.columns.length do
-              hash = hash * 31L + batch.columns(column).unsafeScalarHash(row)
+            while column < width do
+              hash = hash * 31L + columns(column).unsafeScalarHash(row)
               column += 1
             row += 1
         batchIndex += 1
@@ -2749,7 +2756,7 @@ private enum StoredGroupKey:
   */
 final private class CompositeGroupIndex(keys: Vector[AggregateKey]):
   private var hashes = new Array[Int](32)
-  private var groups = Array.fill(32)(-1)
+  private var groups = filledIntArray(32, -1)
   private var retained = new Array[Array[StoredGroupKey]](32)
   private var size = 0
 
@@ -2838,7 +2845,7 @@ final private class CompositeGroupIndex(keys: Vector[AggregateKey]):
     val oldHashes = hashes
     val oldGroups = groups
     hashes = new Array[Int](oldHashes.length * 2)
-    groups = Array.fill(oldGroups.length * 2)(-1)
+    groups = filledIntArray(oldGroups.length * 2, -1)
     var oldSlot = 0
     while oldSlot < oldGroups.length do
       if oldGroups(oldSlot) >= 0 then
@@ -2913,7 +2920,7 @@ final private class MultiMeasureState(requirements: AggregateRequirements):
           group += 1
         Float64Values(output, valid)
       case AggregateSpec.Count =>
-        Int64Values(Array.fill(size)(0L))
+        Int64Values(new Array[Long](size))
 
 /** General grouped reduction for arbitrary Int32/UTF-8 key vectors and Float64 measure vectors.
   *
@@ -3095,7 +3102,7 @@ private object AggregateRequirements:
 
 final private class IntGroupIndex:
   private var keys = new Array[Int](32)
-  private var groups = Array.fill(32)(-1)
+  private var groups = filledIntArray(32, -1)
   private var size = 0
 
   def find(key: Int): Int =
@@ -3115,7 +3122,7 @@ final private class IntGroupIndex:
     val oldKeys = keys
     val oldGroups = groups
     keys = new Array[Int](oldKeys.length * 2)
-    groups = Array.fill(oldGroups.length * 2)(-1)
+    groups = filledIntArray(oldGroups.length * 2, -1)
     var index = 0
     while index < oldGroups.length do
       if oldGroups(index) >= 0 then
@@ -3137,7 +3144,7 @@ final private class Utf8GroupIndex:
   private var hashes = new Array[Int](32)
   private var packedKeys = new Array[Long](32)
   private var packedSlots = new Array[Boolean](32)
-  private var groups = Array.fill(32)(-1)
+  private var groups = filledIntArray(32, -1)
   private val keys = ArrayBuffer.empty[Array[Byte]]
   private var size = 0
 
@@ -3182,7 +3189,7 @@ final private class Utf8GroupIndex:
     hashes = new Array[Int](oldHashes.length * 2)
     packedKeys = new Array[Long](oldPackedKeys.length * 2)
     packedSlots = new Array[Boolean](oldPackedSlots.length * 2)
-    groups = Array.fill(oldGroups.length * 2)(-1)
+    groups = filledIntArray(oldGroups.length * 2, -1)
     var index = 0
     while index < oldGroups.length do
       if oldGroups(index) >= 0 then
@@ -3320,7 +3327,7 @@ final private class Utf8SumAccumulator:
 
 final private class Utf8SumIndex:
   private var packedKeys = new Array[Long](32)
-  private var groups = Array.fill(32)(-1)
+  private var groups = filledIntArray(32, -1)
   private var longKeys: scala.collection.mutable.HashMap[String, Int] | Null = null
 
   def findOrPut(column: RawUtf8Vector, row: Int, newGroup: Int): Int =
@@ -3350,7 +3357,7 @@ final private class Utf8SumIndex:
     val oldKeys = packedKeys
     val oldGroups = groups
     packedKeys = new Array[Long](oldKeys.length * 2)
-    groups = Array.fill(oldGroups.length * 2)(-1)
+    groups = filledIntArray(oldGroups.length * 2, -1)
     var index = 0
     while index < oldGroups.length do
       if oldGroups(index) >= 0 then
@@ -3912,9 +3919,9 @@ final private class JoinIntIndex(expectedRows: Int):
     while value < math.max(16, expectedRows * 2) do value *= 2
     value
   private val keys = new Array[Int](capacity)
-  private val heads = Array.fill(capacity)(-1)
-  private val tails = Array.fill(capacity)(-1)
-  val next: Array[Int] = Array.fill(expectedRows)(-1)
+  private val heads = filledIntArray(capacity, -1)
+  private val tails = filledIntArray(capacity, -1)
+  val next: Array[Int] = filledIntArray(expectedRows, -1)
 
   def add(key: Int, row: Int): Unit =
     var slot = mix(key) & (capacity - 1)
@@ -4734,6 +4741,18 @@ final private case class FusedInt32(
       if result < Int.MinValue.toLong || result > Int.MaxValue.toLong then return offset
       offset += 1
     Int.MaxValue
+
+/** Allocate an `Int` array pre-filled with a sentinel.
+  *
+  * `Array.fill` takes a by-name element and compiles to a closure call per slot, which the
+  * JIT does not turn into a vectorized fill. `java.util.Arrays.fill` is intrinsified. The
+  * difference is invisible on a 32-slot hash table and worth several percent of a join once
+  * the arrays are sized by the input, where it showed up as 4.0% of runnable time.
+  */
+private[frame4s] def filledIntArray(length: Int, value: Int): Array[Int] =
+  val array = new Array[Int](length)
+  if value != 0 then java.util.Arrays.fill(array, value)
+  array
 
 private def readInt(bytes: Array[Byte], offset: Int): Int =
   (bytes(offset) & 0xff) |
