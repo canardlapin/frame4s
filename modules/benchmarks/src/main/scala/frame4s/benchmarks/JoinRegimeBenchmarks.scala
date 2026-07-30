@@ -70,7 +70,11 @@ class JoinRegimeState:
   private var rightTable: Table[Right] = scala.compiletime.uninitialized
   private[benchmarks] var execution: ColumnarExecution =
     scala.compiletime.uninitialized
+  private[benchmarks] var plan: LogicalPlan = scala.compiletime.uninitialized
+  private[benchmarks] var sources: ReferenceSources =
+    scala.compiletime.uninitialized
   private[benchmarks] var expectedChecksum: Long = 0L
+  private[benchmarks] var expectedColumnSum: Long = 0L
   private[benchmarks] var leftDigest: String = ""
   private[benchmarks] var rightDigest: String = ""
 
@@ -128,9 +132,9 @@ class JoinRegimeState:
     val right = frame(Frame.values[Right](rightRef))
     val joined: Frame[Joined] =
       left.innerJoin(right)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
-    val sources =
-      ReferenceSources.empty.bind(leftRef, leftTable).bind(rightRef, rightTable)
-    execution = ColumnarInterpreter.prepare(joined.plan, sources)
+    sources = ReferenceSources.empty.bind(leftRef, leftTable).bind(rightRef, rightTable)
+    plan = joined.plan
+    execution = ColumnarInterpreter.prepare(plan, sources)
 
     var hash = rows.toLong
     var index = 0
@@ -142,6 +146,7 @@ class JoinRegimeState:
       hash = hash * 31L + key * 2L
       index += 1
     expectedChecksum = hash
+    expectedColumnSum = rows.toLong * (rows.toLong - 1L) / 2L * 5L
 
   @TearDown(Level.Trial)
   def tearDown(): Unit =
@@ -158,3 +163,19 @@ class JoinRegimeBenchmarks:
   @Benchmark
   def joinExecutionOnly(state: JoinRegimeState, blackhole: Blackhole): Long =
     ColumnarBenchmarkSupport.executionOnly(state.execution, blackhole)
+
+  @Benchmark
+  def joinDeepMaterialized(state: JoinRegimeState, blackhole: Blackhole): Long =
+    ColumnarBenchmarkSupport.deepMaterialized(state.execution, blackhole)
+
+  @Benchmark
+  def joinMatchedConsumption(state: JoinRegimeState): Long =
+    ColumnarBenchmarkSupport.deepMaterializedSum(state.execution)
+
+  @Benchmark
+  def joinPrepare(state: JoinRegimeState, blackhole: Blackhole): Long =
+    val execution = ColumnarInterpreter.prepare(state.plan, state.sources)
+    try
+      blackhole.consume(execution)
+      1L
+    finally execution.close()

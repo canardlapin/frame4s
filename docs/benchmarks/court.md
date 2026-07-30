@@ -468,6 +468,39 @@ The final consumption court keeps construction and checksum endpoints separate.
 At 1M the checksum share ranges from 5.0% for skew to 72.3% for one-to-one.
 Comparator ratios use construction only.
 
+## R5k correction: gathered views are not eager dataframe results
+
+The
+[R5k.1 matched endpoint court](receipts/2026-07-30-r5k1-matched-endpoints/admission.md)
+supersedes the R5j pandas and Polars join ratios above. R5j timed frame4s after
+it constructed lazy gathered columns, but pandas and Polars returned physical
+dataframe columns. The frame4s result was valid, but the endpoints were not
+equivalent.
+
+R5k.1 gives every engine the same four required primitive columns and exact
+stable-left order. It validates ordered output bytes, not only sums, across
+three interleaved process-level rounds. Cross-runtime construction ratios now
+use deeply materialized frame4s record batches. The old gather timing remains
+a frame4s-only kernel diagnostic.
+
+At 1M sorted rows, frame4s takes 119.920 ms to construct physical output,
+pandas 2.253 ms, pinned Polars 52.173 ms, and default Polars 13.997 ms. The
+paired process ratios are 42.62x, 1.82x, and 8.21x. At 4M sorted rows,
+frame4s takes 454.436 ms versus 8.214, 285.326, and 76.856 ms; the paired
+ratios are 47.37x, 1.40x, and 6.28x.
+
+Shuffled joins also lose on the corrected endpoint. At 1M the frame4s/pandas
+paired ratio is 2.43--3.81x, the pinned-Polars ratio is 1.42--1.69x, and the
+default-Polars ratio is 2.94--5.73x. At 4M those ranges are 1.73--1.91x,
+1.66--1.74x, and 5.76--6.77x.
+
+The distinction is large because generic gathered-vector conversion boxes
+scalars. Sorted deep materialization allocates 204.02 MB at 1M and 816.03 MB
+at 4M, compared with 32.01 MB and 128.01 MB for the gathered view and useful
+primitive payloads of approximately 24 MB and 96 MB. Future join parity claims
+must report gather-view construction, deep materialization, and matched
+consumption separately.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than

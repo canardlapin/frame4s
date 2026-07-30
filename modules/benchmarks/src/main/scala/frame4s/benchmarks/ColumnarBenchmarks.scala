@@ -25,6 +25,73 @@ private[benchmarks] object ColumnarBenchmarkSupport:
       result.rowCount
     finally result.close()
 
+  /** Execute and convert every result column to owned storage buffers.
+    *
+    * `executionOnly` stops at frame4s' internal gathered-vector representation. This endpoint
+    * crosses the same boundary an external eager dataframe result crosses: every output value has a
+    * physical `ColumnArray` buffer owned by the returned batches. Cross-runtime dataframe ratios
+    * must use this endpoint, not `executionOnly`.
+    */
+  def deepMaterialized(execution: ColumnarExecution, blackhole: Blackhole): Long =
+    withMaterialized(execution): batches =>
+      blackhole.consume(batches)
+      batches.foldLeft(0L)(_ + _.rowCount.toLong)
+
+  /** Deeply materialize and then read every primitive output value into one commutative sum.
+    *
+    * Comparator courts perform the same four-column reduction after their eager join. Exact ordered
+    * content is validated out of band; this timed endpoint measures downstream consumption without
+    * imposing frame4s' private row-major checksum algorithm on other engines.
+    */
+  def deepMaterializedSum(execution: ColumnarExecution): Long =
+    withMaterialized(execution): batches =>
+      var total = 0L
+      var batchIndex = 0
+      while batchIndex < batches.length do
+        val columns = batches(batchIndex).columns
+        var columnIndex = 0
+        while columnIndex < columns.length do
+          columns(columnIndex) match
+            case column: Int32Array =>
+              var row = 0
+              while row < column.length do
+                total += column
+                  .value(row)
+                  .fold(error => throw new IllegalStateException(error.message), _.toLong)
+                row += 1
+            case column: Int64Array =>
+              var row = 0
+              while row < column.length do
+                total += column
+                  .value(row)
+                  .fold(error => throw new IllegalStateException(error.message), identity)
+                row += 1
+            case column =>
+              throw new IllegalStateException(
+                s"matched join consumption does not support ${column.dataType}"
+              )
+          columnIndex += 1
+        batchIndex += 1
+      total
+
+  private def withMaterialized[A](
+      execution: ColumnarExecution
+  )(operation: Vector[RecordBatch] => A): A =
+    val run = execution.run()
+    if run.receipt.fallback.nonEmpty then
+      throw new IllegalStateException(
+        s"benchmark unexpectedly fell back: ${run.receipt.fallback.getOrElse("unknown")}"
+      )
+    val result = run.result.fold(error => throw new IllegalStateException(error.message), identity)
+    try
+      val batches = result.recordBatches.fold(
+        reason => throw new IllegalStateException(reason),
+        identity
+      )
+      try operation(batches)
+      finally batches.foreach(_.close())
+    finally result.close()
+
   def checksum(execution: ColumnarExecution): Long =
     val run = execution.run()
     if run.receipt.fallback.nonEmpty then

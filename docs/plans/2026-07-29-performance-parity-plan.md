@@ -318,6 +318,36 @@ where the workload scans 4M left rows to emit 1K. The program therefore exits
 with its pinned, shuffled-pandas, and one-to-one default-thread targets met and
 the remaining default-thread losses explicit.
 
+## R5k resets join parity to matched materialization
+
+The
+[R5k.1 court](../benchmarks/receipts/2026-07-30-r5k1-matched-endpoints/admission.md)
+shows that R5j compared unlike construction endpoints. frame4s stopped at
+lazy gathered columns; pandas and Polars returned physical dataframe columns.
+The gathered-view timings remain useful kernel measurements, but their
+cross-runtime ratios no longer support dataframe parity.
+
+R5k.1 measures three named endpoints over identical four-column, stable-left
+results:
+
+1. frame4s-only gathered-view construction;
+2. deeply materialized physical output, used for construction ratios;
+3. deep output plus the same four-column sum in every engine.
+
+Exact ordered SHA-256 output digests match across three interleaved
+process-level rounds at 1M and 4M. The corrected sorted construction ratio is
+42.62x pandas at 1M and 47.37x at 4M. It is 1.82x and 1.40x pinned Polars, and
+8.21x and 6.28x default Polars. Shuffled frame4s is also slower on the
+corrected endpoint.
+
+The stage target therefore changes. Sorted merge detection and selection still
+matter, but physical output dominates the end-to-end gap. Sorted deep
+materialization allocates 204.02 MB at 1M and 816.03 MB at 4M for useful
+primitive payloads of approximately 24 MB and 96 MB. R5k.3 must produce typed
+physical output without scalar boxing while retaining range-based sorted
+selection. R5k.2 establishes the anti-fitting and fallback matrix before that
+implementation is judged.
+
 ## Earlier standing, at 1,000,000 rows
 
 Single-threaded frame4s candidate, milliseconds per operation, against the
