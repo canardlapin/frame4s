@@ -295,6 +295,29 @@ Each receipt records whether its frame4s oracle row came from the semantic
 reference interpreter or from the candidate-only scale tier, so a weaker
 validation can never be mistaken for the oracle-backed one.
 
+## The join fixture flatters pandas, not Polars
+
+The relational fixtures build join keys with `arange` on both sides, so both
+inputs are monotonically increasing. Measured at 1,000,000 rows, one thread,
+with the same key multiset and output cardinality and only the ordering changed:
+
+| Key order | pandas | Polars |
+|---|---:|---:|
+| sorted, as the committed fixture | 2.08 ms | 48.7 ms |
+| left sorted, right shuffled | 31.8 ms | 45.0 ms |
+| both shuffled | 28.5 ms | 47.1 ms |
+
+pandas is 15x faster on the sorted case, so it is reaching a monotonic-key merge
+path rather than executing a hash join. Any published frame4s-versus-pandas join
+ratio on this fixture compares a hash join against a merge and should not be
+read as a hash-join comparison. Polars is flat across all three, so its number is
+a genuine hash join and the frame4s-versus-Polars join ratio stands.
+
+This also constrains what frame4s may do about it. Detecting sorted keys and
+switching to a merge join is a legitimate technique, but adding it against this
+fixture would be indistinguishable from fitting the benchmark. A scattered-key
+join fixture has to exist first, so the optimization can be shown to generalize.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than
