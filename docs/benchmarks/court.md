@@ -423,6 +423,28 @@ This result must stay labelled as sorted merge performance. It does not revise
 the shuffled hash-join ratios or make the sorted pandas comparison a hash-join
 comparison.
 
+## Parallel probe closes the default-thread gap
+
+The
+[R5j.5 parallel receipt](receipts/2026-07-30-r5j-parallel-probe/admission.md)
+admits segmented, allocation-safe hash probing on the JVM. Workers own
+contiguous left-row segments and the result retains those segments as ordered
+columnar batches. Low-output inner and semi joins count their segment first, so
+they allocate exact selection arrays instead of growing power-of-two buffers.
+Scala.js uses the same code through its sequential scheduler.
+
+At 1M, shuffled one-to-one construction improves 1.82--1.88x to
+10.25--10.34 ms and allocates 48.81 MB/op. At 4M it improves 1.69--1.80x to
+70.04--73.17 ms. The 1K and 64K guards do not regress. Sparse, skewed, semi,
+and anti joins improve 2.39--5.30x at 1M and 4M, with allocation within 0.2% of
+their sequential paths.
+
+Against the previously recorded comparator runs, shuffled one-to-one is
+0.19--0.20x pinned Polars at 1M and 0.20--0.27x at 4M. Against default Polars
+it is 0.99--1.09x at 1M and 1.18--1.30x at 4M. These cross-receipt ratios state
+the current standing; the final publication court reruns the comparators before
+certification.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than

@@ -1044,8 +1044,10 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       val key = ((pair * 16411) & rightMask) * 2
       (rightKey = Some(key), rightValue = key.toLong * 5L + duplicate.toLong)
 
-    val leftInput = table[Left](leftRows, batchSize = rowCount)
-    val rightInput = table[Right](rightRows, batchSize = rowCount)
+    val leftInput =
+      table[Left](leftRows, batchSize = Parallelism.MinimumChunkRows + 3)
+    val rightInput =
+      table[Right](rightRows, batchSize = Parallelism.MinimumChunkRows - 1)
     val left = value(Frame.values[Left](leftRef))
     val right = value(Frame.values[Right](rightRef))
     val condition = (lhs: Scope[Left, left.Origin], rhs: Scope[Right, right.Origin]) =>

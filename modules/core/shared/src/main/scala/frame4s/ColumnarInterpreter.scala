@@ -4263,6 +4263,13 @@ final private case class SortedJoinKeys(
     unique: Boolean
 )
 
+final private case class JoinProbeUnit(
+    batch: Int,
+    from: Int,
+    until: Int,
+    expectedOutput: Int
+)
+
 final private class JoinIntIndex(expectedRows: Int):
   private val capacity =
     var value = 16
@@ -4379,12 +4386,21 @@ final private case class HashJoin(
             timed("build")(build(right)) match
               case Left(error)  => KernelAttempt.Completed(Left(error))
               case Right(built) =>
-                timed("probe")(probe(left, built)) match
-                  case Left(error)       => KernelAttempt.Completed(Left(error))
-                  case Right(selections) =>
-                    KernelAttempt.Completed(
-                      timed("materialize")(materialize(left, right, selections, None))
-                    )
+                if shouldParallelProbe(left) then
+                  timed("parallel-probe")(parallelProbe(left, built)) match
+                    case Left(error)       => KernelAttempt.Completed(Left(error))
+                    case Right(selections) =>
+                      KernelAttempt.Completed(
+                        timed("materialize"):
+                          materializeSegments(left, right, selections)
+                      )
+                else
+                  timed("probe")(probe(left, built)) match
+                    case Left(error)       => KernelAttempt.Completed(Left(error))
+                    case Right(selections) =>
+                      KernelAttempt.Completed(
+                        timed("materialize")(materialize(left, right, selections, None))
+                      )
     KernelProfile(attempt, stages.result())
 
   def decode(
@@ -4419,10 +4435,19 @@ final private case class HashJoin(
       case Some(keys) =>
         mergeProbe(keys).flatMap: selections =>
           materialize(left, right, selections, None)
-      case None =>
-        build(right).flatMap: built =>
-          probe(left, built).flatMap: selections =>
-            materialize(left, right, selections, None)
+      case None => hashJoin(left, right)
+
+  private def hashJoin(
+      left: Vector[DecodedBatch],
+      right: Vector[DecodedBatch]
+  ): Either[ExecutionError, ColumnarResult] =
+    build(right).flatMap: built =>
+      if shouldParallelProbe(left) then
+        parallelProbe(left, built).flatMap: selections =>
+          materializeSegments(left, right, selections)
+      else
+        probe(left, built).flatMap: selections =>
+          materialize(left, right, selections, None)
 
   private def sortedJoinKeys(
       left: Vector[DecodedBatch],
@@ -4685,13 +4710,10 @@ final private case class HashJoin(
       built: HashJoinBuild
   ): Either[ExecutionError, JoinSelectionBuilder] =
     val leftRows = left.foldLeft(0)(_ + _.rowCount)
-    val expectedOutput = kind match
-      case JoinKind.LeftOuter | JoinKind.LeftAnti => leftRows
-      case JoinKind.Inner | JoinKind.LeftSemi     => math.min(leftRows, built.rightRows)
     val selections =
       new JoinSelectionBuilder(
         RightSelectionMode.forJoin(columns, kind),
-        expectedOutput,
+        expectedOutput(leftRows, built.rightRows),
         leftSingleBatch = left.length == 1,
         rightSingleBatch = built.singleBatch
       )
@@ -4710,6 +4732,137 @@ final private case class HashJoin(
         case None        => ()
       batchIndex += 1
     error.toLeft(selections)
+
+  private def shouldParallelProbe(left: Vector[DecodedBatch]): Boolean =
+    val leftRows = left.foldLeft(0)(_ + _.rowCount)
+    leftRows >= Parallelism.MinimumRows &&
+    Parallelism.partitions(leftRows, Scheduler.default) > 1
+
+  private def parallelProbe(
+      left: Vector[DecodedBatch],
+      built: HashJoinBuild
+  ): Either[ExecutionError, Array[JoinSelectionBuilder]] =
+    val leftRows = left.foldLeft(0)(_ + _.rowCount)
+    val scheduler = Scheduler.default
+    val workers = Parallelism.partitions(leftRows, scheduler)
+    val expectedTotal = expectedOutput(leftRows, built.rightRows)
+    val units = ArrayBuffer.empty[JoinProbeUnit]
+    var batch = 0
+    while batch < left.length do
+      val rowCount = left(batch).rowCount
+      val chunk =
+        math.max(
+          Parallelism.MinimumChunkRows,
+          rowCount / (workers * 4) + 1
+        )
+      var from = 0
+      while from < rowCount do
+        val until = math.min(from + chunk, rowCount)
+        val chunkRows = until - from
+        val chunkExpected =
+          if expectedTotal == leftRows then chunkRows
+          else if leftRows == 0 then 0
+          else
+            math
+              .min(
+                Int.MaxValue.toLong,
+                (expectedTotal.toLong * chunkRows.toLong + leftRows.toLong - 1L) /
+                  leftRows.toLong
+              )
+              .toInt
+        units += JoinProbeUnit(batch, from, until, chunkExpected)
+        from = until
+      batch += 1
+
+    val count = units.length
+    val selections = new Array[JoinSelectionBuilder](count)
+    val errors = Array.fill[Option[ExecutionError]](count)(None)
+    val taskCount = math.min(workers, count)
+    val tasks = new Array[Runnable](taskCount)
+    var task = 0
+    while task < taskCount do
+      val stride = task
+      tasks(task) = () =>
+        var index = stride
+        while index < count do
+          val unit = units(index)
+          val exactExpected =
+            if expectedTotal < leftRows then
+              countProbeRange(
+                left(unit.batch),
+                unit.from,
+                unit.until,
+                built
+              ) match
+                case Left(value) =>
+                  errors(index) = Some(value)
+                  -1
+                case Right(value) => value
+            else unit.expectedOutput
+          val builder =
+            new JoinSelectionBuilder(
+              RightSelectionMode.forJoin(columns, kind),
+              math.max(0, exactExpected),
+              leftSingleBatch = left.length == 1,
+              rightSingleBatch = built.singleBatch
+            )
+          selections(index) = builder
+          if exactExpected >= 0 then
+            errors(index) = probeRange(
+              left(unit.batch),
+              unit.batch,
+              unit.from,
+              unit.until,
+              built,
+              builder
+            )
+          index += taskCount
+      task += 1
+    scheduler.runAll(tasks)
+
+    var index = 0
+    var error: Option[ExecutionError] = None
+    while index < count && error.isEmpty do
+      error = errors(index)
+      index += 1
+    error.toLeft(selections)
+
+  private def expectedOutput(leftRows: Int, rightRows: Int): Int =
+    kind match
+      case JoinKind.LeftOuter | JoinKind.LeftAnti => leftRows
+      case JoinKind.Inner | JoinKind.LeftSemi     => math.min(leftRows, rightRows)
+
+  private def countProbeRange(
+      leftBatch: DecodedBatch,
+      from: Int,
+      until: Int,
+      built: HashJoinBuild
+  ): Either[ExecutionError, Int] =
+    leftBatch.columns(leftKey) match
+      case key: RawInt32Vector =>
+        var count = 0
+        var row = from
+        kind match
+          case JoinKind.Inner =>
+            while row < until do
+              var candidate =
+                if key.unsafeValid(row) then built.index.first(key.unsafeIntValue(row))
+                else -1
+              while candidate >= 0 do
+                count += 1
+                candidate = built.index.next(candidate)
+              row += 1
+          case JoinKind.LeftSemi =>
+            while row < until do
+              if key.unsafeValid(row) &&
+                built.index.first(key.unsafeIntValue(row)) >= 0
+              then count += 1
+              row += 1
+          case JoinKind.LeftOuter | JoinKind.LeftAnti =>
+            count = until - from
+        Right(count)
+      case _ =>
+        Left(ExecutionError.UnsupportedNode("hash join left key is not plain Int32"))
 
   private def probeRange(
       leftBatch: DecodedBatch,
@@ -4798,34 +4951,54 @@ final private case class HashJoin(
       case Some(value) => Left(value)
       case None        =>
         val selected = selections.result()
-        val outputColumns = columns.map:
-          case JoinColumn.Left(index) =>
-            GatheredVector(
-              left,
-              index,
-              selected.leftSingleBatch,
-              selected.leftBatches,
-              selected.leftRows,
-              selected.length,
-              validity = None
-            )
-          case JoinColumn.Right(index) =>
-            GatheredVector(
-              right,
-              index,
-              selected.rightSingleBatch,
-              selected.rightBatches,
-              selected.rightRows,
-              selected.length,
-              selected.rightValidity
-            )
         Right(
           ColumnarResult(
             outputSchema,
             order,
-            Vector(ColumnarBatch(outputColumns, selected.length))
+            Vector(materializeBatch(left, right, selected))
           )
         )
+
+  private def materializeSegments(
+      left: Vector[DecodedBatch],
+      right: Vector[DecodedBatch],
+      selections: Array[JoinSelectionBuilder]
+  ): Either[ExecutionError, ColumnarResult] =
+    val batches = Vector.newBuilder[ColumnarBatch]
+    var index = 0
+    while index < selections.length do
+      val selected = selections(index).result()
+      if selected.length > 0 then batches += materializeBatch(left, right, selected)
+      index += 1
+    Right(ColumnarResult(outputSchema, order, batches.result()))
+
+  private def materializeBatch(
+      left: Vector[DecodedBatch],
+      right: Vector[DecodedBatch],
+      selected: JoinSelection
+  ): ColumnarBatch =
+    val outputColumns = columns.map:
+      case JoinColumn.Left(index) =>
+        GatheredVector(
+          left,
+          index,
+          selected.leftSingleBatch,
+          selected.leftBatches,
+          selected.leftRows,
+          selected.length,
+          validity = None
+        )
+      case JoinColumn.Right(index) =>
+        GatheredVector(
+          right,
+          index,
+          selected.rightSingleBatch,
+          selected.rightBatches,
+          selected.rightRows,
+          selected.length,
+          selected.rightValidity
+        )
+    ColumnarBatch(outputColumns, selected.length)
 
 final private case class JoinSelection(
     leftSingleBatch: Boolean,

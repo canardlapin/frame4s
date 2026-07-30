@@ -295,17 +295,25 @@ in the timing. Sorted one-to-one joins improve by 2.26x at 256K, 2.91x at 1M,
 and 4.34x at 4M; shuffled controls and 1K latency do not regress. This is not
 reported as a hash-join improvement.
 
-The measured next steps are now:
+Parallel probing is now admitted. The
+[R5j.5 receipt](../benchmarks/receipts/2026-07-30-r5j-parallel-probe/admission.md)
+uses ordered result segments rather than concatenating per-worker arrays.
+Shuffled one-to-one improves 1.82--1.88x at 1M and 1.69--1.80x at 4M with
+allocation within 0.1% of sequential. The exact-sizing second pass also makes
+sparse, skewed, semi, and anti joins 2.39--5.30x faster at the large tiers,
+with allocation within 0.2%.
 
-1. Rebuild parallel probing around exact-size or segmented selections. At 1M,
-   sequential build costs 13.60--14.69 ms and probe costs 14.26--15.12 ms, so
-   probe parallelism can bring the default-thread ratio below 2x only if it
-   retains the admitted allocation result.
-2. Target the remaining large skewed regimes only after that broader lever
-   is measured; keep sparse and semi size/order misses visible as lower bounds.
-3. Rerun the complete size/order court after each admitted kernel change and
-   publish sorted pandas, shuffled pandas, pinned Polars, and default Polars as
-   separate columns.
+The default-thread one-to-one gap is now 0.99--1.09x at 1M and 1.18--1.30x at
+4M using the previously recorded Polars comparator. The final measured steps
+are:
+
+1. Rerun the complete size/order and join-shape courts and publish sorted
+   pandas, shuffled pandas, pinned Polars, and default Polars as separate
+   columns.
+2. Target any remaining default-thread large-shape losses shown by that court;
+   do not reopen single-thread specializations that already pass.
+3. Preserve the explicit sorted-merge and shuffled-hash claim boundary in the
+   final comparison.
 
 ## Earlier standing, at 1,000,000 rows
 
