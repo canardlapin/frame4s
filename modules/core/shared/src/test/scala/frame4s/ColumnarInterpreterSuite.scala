@@ -778,6 +778,252 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       leftInput.close()
       rightInput.close()
 
+  test("sorted merge joins preserve unique and duplicate order across batches"):
+    type Left = (key: Int, leftValue: Long)
+    type Right = (rightKey: Int, rightValue: Long)
+    val rows = 16384
+    val leftRef = reference("columnar-sorted-merge-left")
+    val uniqueRightRef = reference("columnar-sorted-merge-right-unique")
+    val duplicateRightRef = reference("columnar-sorted-merge-right-duplicate")
+    val leftRows = Vector.tabulate(rows): key =>
+      (key = key, leftValue = key.toLong * 3L)
+    val uniqueRightRows = Vector.tabulate(rows): key =>
+      (rightKey = key, rightValue = key.toLong * 5L)
+    val duplicateRightRows = Vector.tabulate(rows * 2): index =>
+      val key = index / 2
+      (rightKey = key, rightValue = key.toLong * 5L + (index & 1).toLong)
+    val leftInput = table[Left](leftRows, batchSize = 257)
+    val uniqueRightInput = table[Right](uniqueRightRows, batchSize = 509)
+    val duplicateRightInput = table[Right](duplicateRightRows, batchSize = 511)
+    val left = value(Frame.values[Left](leftRef))
+    val uniqueRight = value(Frame.values[Right](uniqueRightRef))
+    val duplicateRight = value(Frame.values[Right](duplicateRightRef))
+    val unique = left.innerJoin(uniqueRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+    val duplicate =
+      left.innerJoin(duplicateRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+
+    def expectedChecksum(duplicates: Int): Long =
+      var hash = rows.toLong * duplicates.toLong
+      var key = 0
+      while key < rows do
+        var duplicate = 0
+        while duplicate < duplicates do
+          hash = hash * 31L + key.toLong
+          hash = hash * 31L + key.toLong * 3L
+          hash = hash * 31L + key.toLong
+          hash = hash * 31L + key.toLong * 5L + duplicate.toLong
+          duplicate += 1
+        key += 1
+      hash
+
+    def assertMerge(
+        frame: Frame[(key: Int, leftValue: Long, rightKey: Int, rightValue: Long)],
+        sources: ReferenceSources,
+        duplicates: Int
+    ): Unit =
+      val execution = ColumnarInterpreter.prepare(frame.plan, sources)
+      try
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        try
+          assertEquals(profiled.run.receipt.fallback, None)
+          assert(profiled.run.receipt.physicalPlan.contains("SortedMergeOrHash"))
+          assert(profiled.stages.exists(_.stage == "merge-probe"))
+          assertEquals(result.rowCount, rows.toLong * duplicates.toLong)
+          assertEquals(value(result.checksum), expectedChecksum(duplicates))
+        finally result.close()
+      finally execution.close()
+
+    try
+      assertMerge(
+        unique,
+        ReferenceSources.empty.bind(leftRef, leftInput).bind(uniqueRightRef, uniqueRightInput),
+        duplicates = 1
+      )
+      assertMerge(
+        duplicate,
+        ReferenceSources.empty
+          .bind(leftRef, leftInput)
+          .bind(duplicateRightRef, duplicateRightInput),
+        duplicates = 2
+      )
+    finally
+      leftInput.close()
+      uniqueRightInput.close()
+      duplicateRightInput.close()
+
+  test("sorted merge preserves sparse kinds and falls back for nullable and empty keys"):
+    type Left = (key: Int, leftValue: Long)
+    type Right = (rightKey: Int, rightValue: Long)
+    val leftRowsCount = 32768
+    val rightRowsCount = 16384
+    val leftRef = reference("columnar-sorted-sparse-left")
+    val rightRef = reference("columnar-sorted-sparse-right")
+    val leftRows = Vector.tabulate(leftRowsCount): key =>
+      (key = key, leftValue = key.toLong * 3L)
+    val rightRows = Vector.tabulate(rightRowsCount): index =>
+      val key = index * 2
+      (rightKey = key, rightValue = key.toLong * 5L)
+    val leftInput = table[Left](leftRows, batchSize = 1021)
+    val rightInput = table[Right](rightRows, batchSize = 509)
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val condition = (lhs: Scope[Left, left.Origin], rhs: Scope[Right, right.Origin]) =>
+      lhs.col("key") === rhs.col("rightKey")
+    val inner = left.innerJoin(right)(condition)
+    val outer = left.leftJoin(right)(condition)
+    val semi = left.semiJoin(right)(condition)
+    val anti = left.antiJoin(right)(condition)
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val nullHash = 0x61c8864680b583ebL
+
+    def expected(kind: JoinKind): (Long, Long) =
+      val outputRows =
+        kind match
+          case JoinKind.Inner | JoinKind.LeftSemi => rightRowsCount.toLong
+          case JoinKind.LeftOuter                 => leftRowsCount.toLong
+          case JoinKind.LeftAnti                  => leftRowsCount.toLong - rightRowsCount.toLong
+      var hash = outputRows
+      var key = 0
+      while key < leftRowsCount do
+        val matched = (key & 1) == 0
+        val emit =
+          kind match
+            case JoinKind.Inner | JoinKind.LeftSemi => matched
+            case JoinKind.LeftOuter                 => true
+            case JoinKind.LeftAnti                  => !matched
+        if emit then
+          hash = hash * 31L + key.toLong
+          hash = hash * 31L + key.toLong * 3L
+          kind match
+            case JoinKind.Inner =>
+              hash = hash * 31L + key.toLong
+              hash = hash * 31L + key.toLong * 5L
+            case JoinKind.LeftOuter =>
+              if matched then
+                hash = hash * 31L + key.toLong
+                hash = hash * 31L + key.toLong * 5L
+              else
+                hash = hash * 31L + nullHash
+                hash = hash * 31L + nullHash
+            case JoinKind.LeftSemi => ()
+            case JoinKind.LeftAnti => ()
+        key += 1
+      outputRows -> hash
+
+    def assertMerge[S <: scala.NamedTuple.AnyNamedTuple](
+        frame: Frame[S],
+        kind: JoinKind
+    ): Unit =
+      val execution = ColumnarInterpreter.prepare(frame.plan, sources)
+      try
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        val expectedResult = expected(kind)
+        try
+          assert(profiled.stages.exists(_.stage == "merge-probe"))
+          assertEquals(result.rowCount, expectedResult._1)
+          assertEquals(value(result.checksum), expectedResult._2)
+        finally result.close()
+      finally execution.close()
+
+    try
+      assertMerge(inner, JoinKind.Inner)
+      assertMerge(outer, JoinKind.LeftOuter)
+      assertMerge(semi, JoinKind.LeftSemi)
+      assertMerge(anti, JoinKind.LeftAnti)
+    finally
+      leftInput.close()
+      rightInput.close()
+
+    type NullableLeft = (key: Option[Int], leftValue: Long)
+    type NullableRight = (rightKey: Option[Int], rightValue: Long)
+    val nullableLeftRef = reference("columnar-sorted-nullable-left")
+    val nullableRightRef = reference("columnar-sorted-nullable-right")
+    val nullableLeftRows = Vector.tabulate(16384): key =>
+      (key = Option.when(key != 8192)(key), leftValue = key.toLong)
+    val nullableRightRows = Vector.tabulate(16384): key =>
+      (rightKey = Some(key), rightValue = key.toLong * 2L)
+    val nullableLeftInput = table[NullableLeft](nullableLeftRows, batchSize = 1024)
+    val nullableRightInput = table[NullableRight](nullableRightRows, batchSize = 1024)
+    val nullableLeft = value(Frame.values[NullableLeft](nullableLeftRef))
+    val nullableRight = value(Frame.values[NullableRight](nullableRightRef))
+    val nullableCondition =
+      (
+          lhs: Scope[NullableLeft, nullableLeft.Origin],
+          rhs: Scope[NullableRight, nullableRight.Origin]
+      ) => (lhs.col("key") === rhs.col("rightKey")).isTrue
+    val nullableJoin = nullableLeft.innerJoin(nullableRight)(nullableCondition)
+    val nullableExecution = ColumnarInterpreter.prepare(
+      nullableJoin.plan,
+      ReferenceSources.empty
+        .bind(nullableLeftRef, nullableLeftInput)
+        .bind(nullableRightRef, nullableRightInput)
+    )
+    try
+      val profiled = nullableExecution.profileRun()
+      val result = completed(profiled.run)
+      try
+        assert(!profiled.stages.exists(_.stage == "merge-probe"))
+        assert(profiled.stages.exists(_.stage == "build"))
+        assertEquals(result.rowCount, 16383L)
+      finally result.close()
+    finally
+      nullableExecution.close()
+      nullableLeftInput.close()
+      nullableRightInput.close()
+
+    val emptyLeftRef = reference("columnar-empty-merge-left")
+    val emptyRightRef = reference("columnar-empty-merge-right")
+    val emptyLeftInput =
+      table[Left](Vector((key = 1, leftValue = 10L), (key = 2, leftValue = 20L)))
+    val emptyRightInput = table[Right](Vector.empty)
+    val emptyLeft = value(Frame.values[Left](emptyLeftRef))
+    val emptyRight = value(Frame.values[Right](emptyRightRef))
+    val emptySources =
+      ReferenceSources.empty.bind(emptyLeftRef, emptyLeftInput).bind(emptyRightRef, emptyRightInput)
+
+    def emptyRows[S <: scala.NamedTuple.AnyNamedTuple](frame: Frame[S]): Long =
+      val execution = ColumnarInterpreter.prepare(frame.plan, emptySources)
+      try
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        try
+          assert(!profiled.stages.exists(_.stage == "merge-probe"))
+          result.rowCount
+        finally result.close()
+      finally execution.close()
+
+    try
+      assertEquals(
+        emptyRows(
+          emptyLeft.innerJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        0L
+      )
+      assertEquals(
+        emptyRows(
+          emptyLeft.leftJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        2L
+      )
+      assertEquals(
+        emptyRows(
+          emptyLeft.semiJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        0L
+      )
+      assertEquals(
+        emptyRows(
+          emptyLeft.antiJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        2L
+      )
+    finally
+      emptyLeftInput.close()
+      emptyRightInput.close()
+
   test("hash joins preserve order and checksums at the bounded-probe admission threshold"):
     type Left = (key: Option[Int], leftValue: Long)
     type Right = (rightKey: Option[Int], rightValue: Long)

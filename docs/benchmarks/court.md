@@ -405,6 +405,24 @@ non-monotonic for sparse and semi joins and sustained only for large skewed
 joins. Those seven misses remain visible as the lower bound for the next
 single-thread work; they are not averaged into a parity claim.
 
+## Sorted merge is a separate conditional win
+
+After the shuffled controls existed, the
+[R5j.4 merge receipt](receipts/2026-07-30-r5j-sorted-merge/admission.md)
+admitted monotonic Int32 detection and stable merge selection. The detection
+scan is timed. Inputs below 16K rows, key streams containing a null, and any key
+inversion use the unchanged hash path.
+
+Against the immediately preceding commit, sorted one-to-one construction is
+2.26x faster at 256K, 2.91x at 1M, and 4.34x at 4M. Sorted allocation falls by
+about one third. Neither shuffled control regresses, and the 1K tier is
+unchanged. Exact JVM and Scala.js tests cover unique, duplicate, sparse,
+nullable, empty, and multi-batch inputs.
+
+This result must stay labelled as sorted merge performance. It does not revise
+the shuffled hash-join ratios or make the sorted pandas comparison a hash-join
+comparison.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than

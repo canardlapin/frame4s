@@ -10,7 +10,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters.*
 
-/** Measures where one-to-one hash join behavior changes with size and key order. */
+/** Measures one-to-one join behavior across size, key order, and selected strategy. */
 object JoinRegimeCourtRunner:
   final private case class Configuration(
       receipt: Path,
@@ -355,7 +355,7 @@ object JoinRegimeCourtRunner:
           f"${metric.allocation / 1000000.0}%.2f |"
     val stageNote =
       if stages.nonEmpty then
-        "Median decode/build/probe/materialize/checksum attribution is in `stage-summary.tsv`."
+        "Median strategy and execution-stage attribution is in `stage-summary.tsv`."
       else "No stage samples were recorded."
     val mode =
       if configuration.quick then "Quick provisional receipt." else "Full receipt."

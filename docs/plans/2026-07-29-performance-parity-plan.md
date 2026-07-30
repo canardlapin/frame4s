@@ -288,19 +288,22 @@ Anti passes throughout. Sparse misses only at 1M, semi changes winner with size
 and key order near parity, and skew retains a 1.13--1.40x large-row gap in three
 regimes. This is a shape-specific residual, not a universal 1M-row switch.
 
+The first item is also complete. The
+[R5j.4 receipt](../benchmarks/receipts/2026-07-30-r5j-sorted-merge/admission.md)
+admits a conditional sorted merge path only after including monotonic detection
+in the timing. Sorted one-to-one joins improve by 2.26x at 256K, 2.91x at 1M,
+and 4.34x at 4M; shuffled controls and 1K latency do not regress. This is not
+reported as a hash-join improvement.
+
 The measured next steps are now:
 
-1. Evaluate sorted merge join at adjacent sizes against the shuffled controls.
-   Report it as a conditional sorted-key optimization, not a hash-join
-   improvement.
-2. Rebuild parallel probing around exact-size or segmented selections. At 1M,
+1. Rebuild parallel probing around exact-size or segmented selections. At 1M,
    sequential build costs 13.60--14.69 ms and probe costs 14.26--15.12 ms, so
    probe parallelism can bring the default-thread ratio below 2x only if it
    retains the admitted allocation result.
-3. Target the remaining large skewed regimes only after those broader levers
-   are measured; keep sparse and semi size/order misses visible as lower
-   bounds.
-4. Rerun the complete size/order court after each admitted kernel change and
+2. Target the remaining large skewed regimes only after that broader lever
+   is measured; keep sparse and semi size/order misses visible as lower bounds.
+3. Rerun the complete size/order court after each admitted kernel change and
    publish sorted pandas, shuffled pandas, pinned Polars, and default Polars as
    separate columns.
 

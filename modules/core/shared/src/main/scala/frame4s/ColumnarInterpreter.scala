@@ -4229,6 +4229,40 @@ final private case class DecodedBatch(
     rowCount: Int
 )
 
+final private class JoinKeyCursor(keys: Vector[RawInt32Vector]):
+  private var batchIndex = 0
+  private var rowIndex = 0
+  skipEmptyBatches()
+
+  def nonEmpty: Boolean = batchIndex < keys.length
+
+  def batch: Int = batchIndex
+
+  def row: Int = rowIndex
+
+  def value: Int = keys(batchIndex).unsafeIntValue(rowIndex)
+
+  def valid: Boolean = keys(batchIndex).unsafeValid(rowIndex)
+
+  def advance(): Unit =
+    rowIndex += 1
+    skipEmptyBatches()
+
+  private def skipEmptyBatches(): Unit =
+    while batchIndex < keys.length && rowIndex >= keys(batchIndex).length do
+      batchIndex += 1
+      rowIndex = 0
+
+private enum JoinKeyOrder:
+  case StrictlyIncreasing
+  case NonDecreasing
+
+final private case class SortedJoinKeys(
+    left: Vector[RawInt32Vector],
+    right: Vector[RawInt32Vector],
+    unique: Boolean
+)
+
 final private class JoinIntIndex(expectedRows: Int):
   private val capacity =
     var value = 16
@@ -4301,7 +4335,8 @@ final private case class HashJoin(
     rightKey: Int,
     columns: Vector[JoinColumn]
 ) extends KernelPlan:
-  val name = s"HashJoin[$kind,Int32,SelectionGather]"
+  val name = s"HashJoin[$kind,Int32,SortedMergeOrHash,SelectionGather]"
+  private val mergeMinimumRows = 16384
 
   def execute(sources: ReferenceSources): KernelAttempt =
     (decode(sources, leftReference, leftSchema), decode(sources, rightReference, rightSchema)) match
@@ -4331,15 +4366,25 @@ final private case class HashJoin(
       case (Left(Right(reason)), _)    => KernelAttempt.Residual(reason)
       case (_, Left(Right(reason)))    => KernelAttempt.Residual(reason)
       case (Right(left), Right(right)) =>
-        timed("build")(build(right)) match
-          case Left(error)  => KernelAttempt.Completed(Left(error))
-          case Right(built) =>
-            timed("probe")(probe(left, built)) match
+        timed("detect-sorted")(sortedJoinKeys(left, right)) match
+          case Left(error)       => KernelAttempt.Completed(Left(error))
+          case Right(Some(keys)) =>
+            timed("merge-probe")(mergeProbe(keys)) match
               case Left(error)       => KernelAttempt.Completed(Left(error))
               case Right(selections) =>
                 KernelAttempt.Completed(
                   timed("materialize")(materialize(left, right, selections, None))
                 )
+          case Right(None) =>
+            timed("build")(build(right)) match
+              case Left(error)  => KernelAttempt.Completed(Left(error))
+              case Right(built) =>
+                timed("probe")(probe(left, built)) match
+                  case Left(error)       => KernelAttempt.Completed(Left(error))
+                  case Right(selections) =>
+                    KernelAttempt.Completed(
+                      timed("materialize")(materialize(left, right, selections, None))
+                    )
     KernelProfile(attempt, stages.result())
 
   def decode(
@@ -4370,9 +4415,228 @@ final private case class HashJoin(
       left: Vector[DecodedBatch],
       right: Vector[DecodedBatch]
   ): Either[ExecutionError, ColumnarResult] =
-    build(right).flatMap: built =>
-      probe(left, built).flatMap: selections =>
-        materialize(left, right, selections, None)
+    sortedJoinKeys(left, right).flatMap:
+      case Some(keys) =>
+        mergeProbe(keys).flatMap: selections =>
+          materialize(left, right, selections, None)
+      case None =>
+        build(right).flatMap: built =>
+          probe(left, built).flatMap: selections =>
+            materialize(left, right, selections, None)
+
+  private def sortedJoinKeys(
+      left: Vector[DecodedBatch],
+      right: Vector[DecodedBatch]
+  ): Either[ExecutionError, Option[SortedJoinKeys]] =
+    val leftRows = left.foldLeft(0)(_ + _.rowCount)
+    val rightRows = right.foldLeft(0)(_ + _.rowCount)
+    if leftRows < mergeMinimumRows || rightRows < mergeMinimumRows then Right(None)
+    else
+      keyVectors(right, rightKey, "right").flatMap: rightKeys =>
+        monotonicity(rightKeys) match
+          case None             => Right(None)
+          case Some(rightOrder) =>
+            keyVectors(left, leftKey, "left").map: leftKeys =>
+              monotonicity(leftKeys).map: leftOrder =>
+                SortedJoinKeys(
+                  leftKeys,
+                  rightKeys,
+                  leftOrder == JoinKeyOrder.StrictlyIncreasing &&
+                    rightOrder == JoinKeyOrder.StrictlyIncreasing
+                )
+
+  private def keyVectors(
+      batches: Vector[DecodedBatch],
+      keyIndex: Int,
+      side: String
+  ): Either[ExecutionError, Vector[RawInt32Vector]] =
+    val output = Vector.newBuilder[RawInt32Vector]
+    var batch = 0
+    var error: Option[ExecutionError] = None
+    while batch < batches.length && error.isEmpty do
+      batches(batch).columns(keyIndex) match
+        case key: RawInt32Vector => output += key
+        case _                   =>
+          error = Some(
+            ExecutionError.UnsupportedNode(
+              s"hash join $side key is not plain Int32"
+            )
+          )
+      batch += 1
+    error.toLeft(output.result())
+
+  private def monotonicity(
+      keys: Vector[RawInt32Vector]
+  ): Option[JoinKeyOrder] =
+    val cursor = new JoinKeyCursor(keys)
+    if !cursor.nonEmpty then Some(JoinKeyOrder.StrictlyIncreasing)
+    else if !cursor.valid then None
+    else
+      var previous = cursor.value
+      var strict = true
+      var sorted = true
+      cursor.advance()
+      while cursor.nonEmpty && sorted do
+        if !cursor.valid then sorted = false
+        else
+          val current = cursor.value
+          if current < previous then sorted = false
+          else
+            if current == previous then strict = false
+            previous = current
+        cursor.advance()
+      if !sorted then None
+      else if strict then Some(JoinKeyOrder.StrictlyIncreasing)
+      else Some(JoinKeyOrder.NonDecreasing)
+
+  private def mergeProbe(
+      keys: SortedJoinKeys
+  ): Either[ExecutionError, JoinSelectionBuilder] =
+    val leftRows = keys.left.foldLeft(0)(_ + _.length)
+    val rightRows = keys.right.foldLeft(0)(_ + _.length)
+    val expectedOutput = kind match
+      case JoinKind.LeftOuter | JoinKind.LeftAnti => leftRows
+      case JoinKind.Inner | JoinKind.LeftSemi     => math.min(leftRows, rightRows)
+    val selections =
+      new JoinSelectionBuilder(
+        RightSelectionMode.forJoin(columns, kind),
+        expectedOutput,
+        leftSingleBatch = keys.left.length == 1,
+        rightSingleBatch = keys.right.length == 1
+      )
+    if keys.unique then mergeUnique(keys.left, keys.right, selections)
+    else mergeGroups(keys.left, keys.right, selections)
+    Right(selections)
+
+  private def mergeUnique(
+      leftKeys: Vector[RawInt32Vector],
+      rightKeys: Vector[RawInt32Vector],
+      selections: JoinSelectionBuilder
+  ): Unit =
+    val left = new JoinKeyCursor(leftKeys)
+    val right = new JoinKeyCursor(rightKeys)
+    while left.nonEmpty do
+      val leftValue = left.value
+      while right.nonEmpty && right.value < leftValue do right.advance()
+      val matched = right.nonEmpty && right.value == leftValue
+      kind match
+        case JoinKind.Inner =>
+          if matched then selections.appendMatched(left.batch, left.row, right.batch, right.row)
+        case JoinKind.LeftOuter =>
+          if matched then selections.appendMatched(left.batch, left.row, right.batch, right.row)
+          else selections.appendLeftOnly(left.batch, left.row)
+        case JoinKind.LeftSemi =>
+          if matched then selections.appendLeftOnly(left.batch, left.row)
+        case JoinKind.LeftAnti =>
+          if !matched then selections.appendLeftOnly(left.batch, left.row)
+      left.advance()
+      if matched then right.advance()
+
+  private def mergeGroups(
+      leftKeys: Vector[RawInt32Vector],
+      rightKeys: Vector[RawInt32Vector],
+      selections: JoinSelectionBuilder
+  ): Unit =
+    val left = new JoinKeyCursor(leftKeys)
+    val right = new JoinKeyCursor(rightKeys)
+    while left.nonEmpty do
+      val key = left.value
+      val leftStartBatch = left.batch
+      val leftStartRow = left.row
+      while left.nonEmpty && left.value == key do left.advance()
+      val leftEndBatch = left.batch
+      val leftEndRow = left.row
+
+      while right.nonEmpty && right.value < key do right.advance()
+      val matched = right.nonEmpty && right.value == key
+      if matched then
+        val rightStartBatch = right.batch
+        val rightStartRow = right.row
+        while right.nonEmpty && right.value == key do right.advance()
+        kind match
+          case JoinKind.Inner | JoinKind.LeftOuter =>
+            appendMatchedGroups(
+              leftKeys,
+              leftStartBatch,
+              leftStartRow,
+              leftEndBatch,
+              leftEndRow,
+              rightKeys,
+              rightStartBatch,
+              rightStartRow,
+              right.batch,
+              right.row,
+              selections
+            )
+          case JoinKind.LeftSemi =>
+            appendLeftGroup(
+              leftKeys,
+              leftStartBatch,
+              leftStartRow,
+              leftEndBatch,
+              leftEndRow,
+              selections
+            )
+          case JoinKind.LeftAnti => ()
+      else if kind == JoinKind.LeftOuter || kind == JoinKind.LeftAnti then
+        appendLeftGroup(
+          leftKeys,
+          leftStartBatch,
+          leftStartRow,
+          leftEndBatch,
+          leftEndRow,
+          selections
+        )
+
+  private def appendLeftGroup(
+      leftKeys: Vector[RawInt32Vector],
+      startBatch: Int,
+      startRow: Int,
+      endBatch: Int,
+      endRow: Int,
+      selections: JoinSelectionBuilder
+  ): Unit =
+    var batch = startBatch
+    var row = startRow
+    while batch < endBatch || (batch == endBatch && row < endRow) do
+      selections.appendLeftOnly(batch, row)
+      row += 1
+      if batch < leftKeys.length && row >= leftKeys(batch).length then
+        batch += 1
+        row = 0
+
+  private def appendMatchedGroups(
+      leftKeys: Vector[RawInt32Vector],
+      leftStartBatch: Int,
+      leftStartRow: Int,
+      leftEndBatch: Int,
+      leftEndRow: Int,
+      rightKeys: Vector[RawInt32Vector],
+      rightStartBatch: Int,
+      rightStartRow: Int,
+      rightEndBatch: Int,
+      rightEndRow: Int,
+      selections: JoinSelectionBuilder
+  ): Unit =
+    var leftBatch = leftStartBatch
+    var leftRow = leftStartRow
+    while leftBatch < leftEndBatch ||
+      (leftBatch == leftEndBatch && leftRow < leftEndRow)
+    do
+      var rightBatch = rightStartBatch
+      var rightRow = rightStartRow
+      while rightBatch < rightEndBatch ||
+        (rightBatch == rightEndBatch && rightRow < rightEndRow)
+      do
+        selections.appendMatched(leftBatch, leftRow, rightBatch, rightRow)
+        rightRow += 1
+        if rightBatch < rightKeys.length && rightRow >= rightKeys(rightBatch).length then
+          rightBatch += 1
+          rightRow = 0
+      leftRow += 1
+      if leftBatch < leftKeys.length && leftRow >= leftKeys(leftBatch).length then
+        leftBatch += 1
+        leftRow = 0
 
   private def build(
       right: Vector[DecodedBatch]
