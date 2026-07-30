@@ -4619,35 +4619,107 @@ final private case class FusedInt32(
     sources.openProjected(reference, inputSchema, required) match
       case Left(error)   => KernelAttempt.Completed(Left(error))
       case Right(cursor) =>
-        val output = ArrayBuffer.empty[ColumnarBatch]
+        // Collect the batches, then decode and project each one inside the same task. Doing
+        // the decode as a separate earlier phase was measurably worse: it walks the whole
+        // input once to copy it and again to compute, so nothing is still in cache the second
+        // time. Decoding does take the buffer lock, but only a couple of times per batch
+        // rather than per row, so it is not worth splitting the phases to avoid it.
+        val pending = ArrayBuffer.empty[RecordBatch]
         var done = false
         var error: Option[ExecutionError] = None
         var residual: Option[String] = None
+        var totalRows = 0L
         try
-          while !done && error.isEmpty && residual.isEmpty do
+          while !done && error.isEmpty do
             cursor.nextBatch() match
               case Right(None)        => done = true
               case Left(value)        => error = Some(value)
               case Right(Some(batch)) =>
-                evaluateBatch(batch, required) match
-                  case Right(value)      => output += value
-                  case Left(Left(value)) =>
-                    error = Some(value)
-                  case Left(Right(value)) =>
-                    residual = Some(value)
-                batch.close()
-        finally cursor.close()
+                pending += batch
+                totalRows += batch.rowCount.toLong
+
+          if error.isEmpty then
+            // Decode once per batch, then split each batch into row chunks. A table is often
+            // a single large batch, so chunking has to happen inside a batch rather than
+            // across batches; splitting only across batches leaves one worker doing
+            // everything. Chunks are contiguous and their outputs are concatenated in order,
+            // so the emitted row sequence -- and therefore the checksum -- is unchanged,
+            // even though it now arrives as several batches instead of one.
+            val bounded = math.min(totalRows, Int.MaxValue.toLong).toInt
+            val workers = Parallelism.partitions(bounded, Scheduler.default)
+            val decodedBatches =
+              new Array[Either[Either[ExecutionError, String], Array[RawInt32Vector]]](
+                pending.length
+              )
+            var decodeIndex = 0
+            while decodeIndex < pending.length do
+              decodedBatches(decodeIndex) = decodeBatch(pending(decodeIndex), required)
+              decodeIndex += 1
+
+            val units = ArrayBuffer.empty[(Int, Int, Int)]
+            var batchOrdinal = 0
+            while batchOrdinal < pending.length do
+              val rowCount = pending(batchOrdinal).rowCount
+              val chunk =
+                if workers <= 1 then rowCount
+                else math.max(Parallelism.MinimumChunkRows, rowCount / (workers * 4) + 1)
+              var start = 0
+              while start < rowCount do
+                units += ((batchOrdinal, start, math.min(start + chunk, rowCount)))
+                start += chunk
+              if rowCount == 0 then units += ((batchOrdinal, 0, 0))
+              batchOrdinal += 1
+
+            val count = units.length
+            val results =
+              new Array[Either[Either[ExecutionError, String], ColumnarBatch]](count)
+            val evaluate = (index: Int) =>
+              val (batchOrdinal, from, until) = units(index)
+              results(index) = decodedBatches(batchOrdinal).flatMap(project(from, until, _))
+            if workers > 1 && count > 1 then
+              // Batches are independent and their outputs are concatenated in input order, so
+              // the result is bit-identical to the sequential path, not merely equivalent.
+              val tasks = new Array[Runnable](workers)
+              var worker = 0
+              while worker < workers do
+                val stride = worker
+                tasks(stride) = () =>
+                  var index = stride
+                  while index < count do
+                    evaluate(index)
+                    index += workers
+                worker += 1
+              Scheduler.default.runAll(tasks)
+            else
+              var index = 0
+              while index < count do
+                evaluate(index)
+                index += 1
+
+            val output = ArrayBuffer.empty[ColumnarBatch]
+            var index = 0
+            while index < count && error.isEmpty && residual.isEmpty do
+              results(index) match
+                case Right(value)       => output += value
+                case Left(Left(value))  => error = Some(value)
+                case Left(Right(value)) => residual = Some(value)
+              index += 1
+            if error.isEmpty && residual.isEmpty then
+              return KernelAttempt.Completed(
+                Right(ColumnarResult(outputSchema, order, output.toVector))
+              )
+        finally
+          pending.foreach(_.close())
+          cursor.close()
+
         residual match
           case Some(reason) => KernelAttempt.Residual(reason)
-          case None         =>
-            KernelAttempt.Completed(
-              error.toLeft(ColumnarResult(outputSchema, order, output.toVector))
-            )
+          case None         => KernelAttempt.Completed(Left(error.get))
 
-  private def evaluateBatch(
+  private def decodeBatch(
       batch: RecordBatch,
       required: Vector[Int]
-  ): Either[Either[ExecutionError, String], ColumnarBatch] =
+  ): Either[Either[ExecutionError, String], Array[RawInt32Vector]] =
     val decoded = new Array[RawInt32Vector](inputSchema.size)
     var index = 0
     var error: Option[Either[ExecutionError, String]] = None
@@ -4664,20 +4736,25 @@ final private case class FusedInt32(
               )
             )
           )
-        case Some(column) =>
-          ColumnarVector.copy(column) match
-            case Right(value: RawInt32Vector) if value.required =>
-              decoded(required(index)) = value
-            case Right(_: RawInt32Vector) =>
-              error = Some(Right(s"column ${required(index)} became nullable"))
-            case Right(_) =>
-              error = Some(Right(s"column ${required(index)} is not non-null Int32"))
-            case Left(value) => error = Some(Right(value))
+        // Borrow the column's bytes instead of copying them. `ColumnarVector.copy` duplicates
+        // every physical buffer, which for a read-only scan is the single largest allocation
+        // in this kernel and buys nothing: the batch stays open for the whole evaluation, so
+        // the bytes cannot be released underneath it.
+        case Some(column: Int32Array) if column.nullCount == 0 =>
+          column.withBorrowedValueBytes: (bytes, start, validity, offset, length) =>
+            RawInt32Vector(bytes, validity, offset, length, start)
+          match
+            case Right(value) => decoded(required(index)) = value
+            case Left(value)  => error = Some(Right(value.message))
+        case Some(_: Int32Array) =>
+          error = Some(Right(s"column ${required(index)} became nullable"))
+        case Some(_) =>
+          error = Some(Right(s"column ${required(index)} is not non-null Int32"))
       index += 1
 
     error match
       case Some(value) => Left(value)
-      case None        => project(batch, decoded)
+      case None        => Right(decoded)
 
   /** Column-at-a-time evaluation of the fused filter, projection, and checked addition.
     *
@@ -4694,10 +4771,11 @@ final private case class FusedInt32(
     * so the cold path rescans to find the first offending row.
     */
   private def project(
-      batch: RecordBatch,
+      from: Int,
+      until: Int,
       decoded: Array[RawInt32Vector]
   ): Either[Either[ExecutionError, String], ColumnarBatch] =
-    val rowCount = batch.rowCount
+    val rowCount = until - from
     val projectionCount = projections.length
     val sourceColumn = new Array[Int](projectionCount)
     val addend = new Array[Int](projectionCount)
@@ -4722,28 +4800,28 @@ final private case class FusedInt32(
     val selection = new Array[Int](rowCount)
     var selected = 0
     val literal = filter.literal
-    var row = 0
+    var row = from
     filter.operator match
       case BinaryOperator.GreaterThan =>
-        while row < rowCount do
+        while row < until do
           if filterValues.unsafeIntValue(row) > literal then
             selection(selected) = row
             selected += 1
           row += 1
       case BinaryOperator.GreaterThanOrEqual =>
-        while row < rowCount do
+        while row < until do
           if filterValues.unsafeIntValue(row) >= literal then
             selection(selected) = row
             selected += 1
           row += 1
       case BinaryOperator.LessThan =>
-        while row < rowCount do
+        while row < until do
           if filterValues.unsafeIntValue(row) < literal then
             selection(selected) = row
             selected += 1
           row += 1
       case BinaryOperator.LessThanOrEqual =>
-        while row < rowCount do
+        while row < until do
           if filterValues.unsafeIntValue(row) <= literal then
             selection(selected) = row
             selected += 1

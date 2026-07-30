@@ -69,6 +69,13 @@ private[frame4s] object Parallelism:
     */
   val MinimumRows = 65536
 
+  /** Smallest row chunk worth handing to a worker.
+    *
+    * Below this the scheduling handshake costs more than the work, and the chunk's output
+    * arrays are too small to amortize their own allocation.
+    */
+  val MinimumChunkRows = 16384
+
   /** How many partitions to use, as a power of two so hashing can mask instead of divide.
     *
     * Read the note on `Parallelism` before choosing a partition count for a new kernel: a
