@@ -10,11 +10,36 @@ import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters.*
 
 object CourtRunner:
+  /** Which court a receipt belongs to.
+    *
+    * `Small` is the ratified court: every backend runs, and the semantic reference
+    * interpreter is the checksum oracle for the candidate.
+    *
+    * `Scale` exists because that oracle cannot follow the court to large fixtures. The
+    * reference join is a full nested-loop cross product, so a 1,000,000-row join is on the
+    * order of 10^12 predicate evaluations. The scale tier therefore measures the candidate
+    * alone and states so in the receipt; candidate/reference agreement is established by the
+    * cross-platform conformance laws and by the `Small` tier, never assumed here.
+    */
+  private enum Tier:
+    case Small
+    case Scale
+
+    def id: String = this match
+      case Small => "small"
+      case Scale => "scale"
+
+    def include: String = this match
+      case Small => "frame4s\\.benchmarks\\..*Benchmarks\\..*"
+      case Scale => "frame4s\\.benchmarks\\.ColumnarBenchmarks\\..*"
+
   final private case class Configuration(
       receipt: Path,
       quick: Boolean,
       rows: Int,
-      validateOnly: Boolean
+      validateOnly: Boolean,
+      tier: Tier,
+      heap: String
   )
 
   final private case class Validation(
@@ -30,12 +55,17 @@ object CourtRunner:
     val raw = configuration.receipt.resolve("raw/jmh.json")
     val log = configuration.receipt.resolve("raw/jmh.log")
     val builder = new OptionsBuilder()
-      .include("frame4s\\.benchmarks\\..*Benchmarks\\..*")
+      .include(configuration.tier.include)
       .param("rows", configuration.rows.toString)
       .result(raw.toString)
       .resultFormat(ResultFormatType.JSON)
       .output(log.toString)
       .addProfiler(classOf[GCProfiler])
+
+    // The benchmark classes pin a 1 GiB heap, which no longer holds the fixture at scale.
+    // Appending wins over the annotation, and the chosen heap is recorded in the receipt.
+    if configuration.tier == Tier.Scale then
+      val _ = builder.jvmArgsAppend(s"-Xms${configuration.heap}", s"-Xmx${configuration.heap}")
 
     if configuration.quick then
       val _ = builder
@@ -45,9 +75,17 @@ object CourtRunner:
         .measurementTime(TimeValue.milliseconds(150))
         .forks(1)
 
-    val validations = validate(configuration.rows)
-    requireOracleParity(validations)
-    requireComparableParity(validations)
+    val validations = configuration.tier match
+      case Tier.Small =>
+        val all = validate(configuration.rows)
+        requireOracleParity(all)
+        requireComparableParity(all)
+        all
+      case Tier.Scale =>
+        validateCandidate(
+          configuration.rows,
+          "candidate kernel; self-consistency only, no oracle at this tier"
+        )
     writeEnvironment(configuration)
     writeValidations(configuration.receipt, validations)
     if !configuration.validateOnly then
@@ -65,11 +103,18 @@ object CourtRunner:
       throw new IllegalArgumentException("--receipt <directory> is required")
     val rows = value("--rows").fold(10000)(_.toInt)
     if rows <= 0 then throw new IllegalArgumentException("--rows must be positive")
+    val tier = value("--tier").fold(Tier.Small):
+      case "small" => Tier.Small
+      case "scale" => Tier.Scale
+      case other   =>
+        throw new IllegalArgumentException(s"--tier must be small or scale; got '$other'")
     Configuration(
       Path.of(receipt),
       arguments.contains("--quick"),
       rows,
-      arguments.contains("--validate-only")
+      arguments.contains("--validate-only"),
+      tier,
+      value("--heap").getOrElse("8g")
     )
 
   private def validate(rows: Int): Vector[Validation] =
@@ -231,6 +276,15 @@ object CourtRunner:
       )
     )
 
+    referenceValidations ++ saddleValidations ++ arrayValidations ++
+      validateCandidate(rows, "candidate kernel; oracle checksum required")
+
+  /** Untimed candidate execution, recording output rows and checksums.
+    *
+    * At the `Small` tier the caller cross-checks every row against the reference oracle. At
+    * the `Scale` tier no oracle exists, so these values stand alone and the receipt says so.
+    */
+  private def validateCandidate(rows: Int, status: String): Vector[Validation] =
     val columnarState = new ReferenceState
     columnarState.rows = rows
     columnarState.setup()
@@ -242,108 +296,108 @@ object CourtRunner:
             "ColumnarBenchmarks.primitiveScan",
             rows,
             columnar.primitiveScan(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.nullableScan",
             rows,
             columnar.nullableScan(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.utf8Scan",
             rows,
             columnar.utf8Scan(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.dictionaryScan",
             rows,
             columnar.dictionaryScan(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.filter",
             rows - rows / 2,
             columnar.filter(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.fusedFilterProjectArithmetic",
             rows - rows / 2,
             columnar.fusedFilterProjectArithmetic(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.groupedLowCardinality",
             math.min(16, rows),
             columnar.groupedLowCardinality(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.groupedLowCardinalitySumOnly",
             math.min(16, rows),
             columnar.groupedLowCardinalitySumOnly(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.groupedHighCardinality",
             rows,
             columnar.groupedHighCardinality(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.joinOneToOne",
             rows,
             columnar.joinOneToOne(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.joinOneToMany",
             rows,
             columnar.joinOneToMany(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.joinSparse",
             (rows + 9L) / 10L,
             columnar.joinSparse(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.joinSkewed",
             math.min(rows, 1000),
             columnar.joinSkewed(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.distinctLowCardinality",
             (rows + 2L) / 3L,
             columnar.distinctLowCardinality(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.semiJoinSparse",
             (rows + 9L) / 10L,
             columnar.semiJoinSparse(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.antiJoinSparse",
             rows - (rows + 9L) / 10L,
             columnar.antiJoinSparse(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           ),
           validation(
             "ColumnarBenchmarks.unionAll",
             rows * 2L,
             columnar.unionAll(columnarState),
-            "candidate kernel; oracle checksum required"
+            status
           )
         )
       finally columnarState.tearDown()
 
-    referenceValidations ++ saddleValidations ++ arrayValidations ++ columnarValidations
+    columnarValidations
 
   private def validation(
       benchmark: String,
@@ -361,6 +415,14 @@ object CourtRunner:
       s"quick=${configuration.quick}",
       s"validate_only=${configuration.validateOnly}",
       s"rows=${configuration.rows}",
+      s"tier=${configuration.tier.id}",
+      s"tier.oracle=${
+          configuration.tier match
+            case Tier.Small => "semantic-reference-interpreter"
+            case Tier.Scale =>
+              "candidate-only; reference join is a nested-loop cross product and " +
+                "cannot execute at this fixture size"
+        }",
       s"java.version=${System.getProperty("java.version")}",
       s"java.vendor=${System.getProperty("java.vendor")}",
       s"java.vm.name=${System.getProperty("java.vm.name")}",
@@ -369,7 +431,11 @@ object CourtRunner:
       s"os.arch=${System.getProperty("os.arch")}",
       s"processors=${runtime.availableProcessors()}",
       s"runner.max.heap.bytes=${runtime.maxMemory()}",
-      "benchmark.heap=-Xms1g,-Xmx1g",
+      s"benchmark.heap=${
+          configuration.tier match
+            case Tier.Small => "-Xms1g,-Xmx1g"
+            case Tier.Scale => s"-Xms${configuration.heap},-Xmx${configuration.heap}"
+        }",
       "benchmark.jvm.flags=-XX:+AlwaysPreTouch",
       s"hardware=${sys.env.getOrElse("FRAME4S_HARDWARE", "unrecorded")}",
       "scala.version=3.7.4",
@@ -424,19 +490,37 @@ object CourtRunner:
         "Quick court receipt. It validates harness wiring and produces provisional measurements; it is not a release performance claim."
       else
         "Full court receipt using the committed warmup, measurement, fork, heap, and profiler settings."
+    val preamble = configuration.tier match
+      case Tier.Small =>
+        """@The semantic reference interpreter is an executable oracle, not the optimized backend.
+           @Every `ColumnarBenchmarks` row refuses fallback and must carry the same checksum and
+           @output cardinality as its corresponding `ReferenceBenchmarks` row.
+           @The materialized primitive projection, fused filter/project, and materialized nullable
+           @grouped-sum Saddle rows are comparable. The raw primitive scan and scalar grouped
+           @reduction remain explicit lower bounds, not win/loss comparators. SQL duplicate-key
+           @joins, dictionary layout, CSV acquisition, and owned-table construction have no claimed
+           @Saddle-equivalent result. Scautable is intentionally excluded from relational rankings.""".stripMargin('@')
+      case Tier.Scale =>
+        s"""@Scale tier at ${configuration.rows} rows. Only the columnar candidate runs.
+            @
+            @This tier has no reference oracle, and that is a stated limit rather than an
+            @omission. The semantic reference join is a full nested-loop cross product, so
+            @executing it here would require on the order of ${configuration.rows.toLong * configuration.rows.toLong}
+            @predicate evaluations. Candidate agreement with the reference interpreter is
+            @established by the cross-platform conformance laws and by the small tier, whose
+            @receipts remain the ratified oracle record. Checksums below are candidate
+            @self-consistency values: they detect drift between runs of this tier, and they
+            @are not independent proof of semantic correctness.
+            @
+            @Saddle, the specialized-array lower bounds, and the reference rows are absent by
+            @construction, so this receipt ranks nothing against them.""".stripMargin('@')
+
     val summary =
       s"""@# frame4s benchmark court receipt
          @
          @$mode
          @
-         @The semantic reference interpreter is an executable oracle, not the optimized backend.
-         @Every `ColumnarBenchmarks` row refuses fallback and must carry the same checksum and
-         @output cardinality as its corresponding `ReferenceBenchmarks` row.
-         @The materialized primitive projection, fused filter/project, and materialized nullable
-         @grouped-sum Saddle rows are comparable. The raw primitive scan and scalar grouped
-         @reduction remain explicit lower bounds, not win/loss comparators. SQL duplicate-key
-         @joins, dictionary layout, CSV acquisition, and owned-table construction have no claimed
-         @Saddle-equivalent result. Scautable is intentionally excluded from relational rankings.
+         @$preamble
          @
          @| Benchmark | Mode | Time or throughput | Allocation | Output rows | Checksum | Comparison status |
          @|---|---:|---:|---:|---:|---:|---|

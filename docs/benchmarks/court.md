@@ -227,6 +227,83 @@ Scautable is intentionally absent from relational rankings. Its fixed-resource
 macro path and its runtime typed path are discussed separately in
 [ingestion and onboarding](ingestion-onboarding.md).
 
+## Scale tier
+
+Every court above uses a 1,000-row fixture, or 10,000 for the dplyr practical
+court. That is the regime where pandas and Polars are dominated by their own
+per-call dispatch overhead, so a ratio measured there describes interpreter
+startup rather than kernel quality. It is honest as overhead characterization
+and worthless as a comparative claim.
+
+The scale tier adds large fixtures without touching any ratified receipt,
+fixture, or threshold:
+
+```sh
+scripts/scale-court.sh docs/benchmarks/receipts/YYYY-MM-DD-scale-1m full 1000000
+```
+
+The scale tier measures the columnar candidate alone. It has no reference
+oracle, and that is a stated limit rather than an omission: the semantic
+reference join at `ReferenceInterpreter.scala` is a full nested-loop cross
+product, so a 1,000,000-row join is on the order of 10^12 predicate
+evaluations. Candidate agreement with the reference interpreter is established
+by the cross-platform conformance laws and by the small tier, whose receipts
+remain the ratified oracle record. Scale-tier checksums are candidate
+self-consistency values that detect drift between runs of that tier; they are
+not independent proof of semantic correctness, and the receipt says so.
+
+Saddle and the specialized-array lower bounds do not run at this tier, so a
+scale receipt ranks nothing against them.
+
+## Polars court
+
+Polars is the strongest local-dataframe comparator, so its court is built to be
+hard to win rather than easy:
+
+```sh
+scripts/polars-court.sh \
+  --receipt docs/benchmarks/receipts/YYYY-MM-DD-polars/pinned \
+  --threads 1 \
+  --rows 1000000 \
+  --oracle-validation docs/benchmarks/receipts/YYYY-MM-DD-scale-1m/validation.tsv \
+  --frame4s-jmh docs/benchmarks/receipts/YYYY-MM-DD-scale-1m/raw/jmh.json
+```
+
+Three rules govern it.
+
+Thread count is part of every result. Polars is measured pinned to one thread
+and at its default pool. The pinned column is the kernel comparison against
+single-threaded frame4s; the default column is the bar a user actually
+experiences. A ratio published without a stated thread count is not a claim.
+
+Zero-copy shapes are not ranked. A Polars projection is a refcount clone while
+frame4s materializes owned output, so `primitiveMaterializedProjection` is
+recorded as an unranked lower bound with a written reason, in the same way the
+court already treats Saddle's raw primitive scan. `unionAll` deserves the same
+scrutiny for the same reason.
+
+Validation scales with the fixture. At or below 100,000 rows the court requires
+exact raw-bit checksums. Above that a Python row walk costs more than the
+measurement, so it requires row count, schema, and vectorized per-column
+invariants -- count, null count, sum, sum of squares, minimum, maximum, and a
+row-weighted term that binds values to output order -- mirroring the dplyr
+practical court rather than quietly dropping validation at scale. Polars does
+not maintain group or join order, so unordered shapes are invariant-validated
+by construction.
+
+Each receipt records whether its frame4s oracle row came from the semantic
+reference interpreter or from the candidate-only scale tier, so a weaker
+validation can never be mistaken for the oracle-backed one.
+
+## Claim discipline
+
+No comparative claim is published from the 1,000-row tier. A "faster than
+pandas" claim requires the scale tier, exact checksums or declared invariants,
+and a stated thread count on both sides. An "approaching Polars" claim
+additionally requires reporting the default-threaded Polars column, not only the
+pinned one. The full rationale and the current standing are in
+[the performance parity plan](../plans/2026-07-29-performance-parity-plan.md).
+
 ## Law court
 
 `frame4s-testkit` is cross-built for JVM and Scala.js. Its generators
