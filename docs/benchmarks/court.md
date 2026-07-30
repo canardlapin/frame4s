@@ -312,8 +312,9 @@ fast path rather than executing the same join as the shuffled cases. Any
 published frame4s-versus-pandas ratio on this fixture compares a hash join
 against that fast path and should not be read as a hash-join comparison. Polars
 is flat across all three, so its comparator number is not flattered by ordering.
-The next regime court still has to measure frame4s itself under shuffled keys
-before making a shuffled-hash parity claim.
+The
+[size-by-order regime court](receipts/2026-07-30-r5j-join-regimes/admission.md)
+now measures frame4s under the same shuffled keys from 1K through 4M rows.
 
 This also constrains what frame4s may do about it. Detecting sorted keys and
 switching to a merge join is a legitimate technique, but adding it against this
@@ -354,6 +355,33 @@ execution from 42.28 to 28.32 ms against the isolated allocation-only candidate,
 but raised allocation from 65.17 to 97.07 MB/op. Its probe stage is demonstrably
 parallelizable; its per-chunk selection ownership is not yet allocation-safe.
 The sequential allocation reduction is admitted independently.
+
+## Join behavior changes with size
+
+The
+[R5j regime receipt](receipts/2026-07-30-r5j-join-regimes/admission.md)
+uses identical deterministic key permutations for frame4s, pandas, and Polars
+at 1K, 4K, 16K, 64K, 256K, 1M, and 4M rows. It records sorted keys, a shuffled
+right side, and both sides shuffled. Comparator validation happens outside the
+timed operation.
+
+At 1M rows frame4s takes 29.33--30.12 ms across the three orders, or
+0.56--0.59x single-threaded Polars. At 4M it takes 0.52--0.69x
+single-threaded Polars. The one-to-one single-thread gap is therefore closed at
+the large tiers. The remaining gap is to default 14-thread Polars: 2.84--3.22x
+at 1M and 2.98--3.25x at 4M.
+
+pandas remains algorithm-sensitive. At 1M it takes 2.08 ms sorted, 29.48 ms
+with the right side shuffled, and 44.67 ms with both sides shuffled. frame4s is
+14.32x slower than sorted pandas, within 2% of its right-shuffled result, and
+faster than its both-shuffled result. At 4M frame4s is 22.51x slower than
+sorted pandas but 0.76--0.80x its shuffled times.
+
+frame4s allocation stays near 65 bytes per output row across sizes and orders.
+At 1M, build takes 13.60--14.69 ms and probe takes 14.26--15.12 ms. This makes
+allocation-safe parallel probing the direct one-to-one lever. A sorted merge
+kernel is still legitimate, but it remains a separate conditional optimization
+whose win must hold at adjacent sizes without slowing the shuffled fixtures.
 
 ## Claim discipline
 

@@ -251,8 +251,43 @@ Fresh execution-matched Polars receipts put the new one-to-one time at 0.62x
 Polars pinned to one thread and 3.26x Polars at its 14-thread default. The full
 deterministic order receipt also passes: pandas is strongly order-sensitive
 (1.946 ms sorted, 40.093 ms with both sides shuffled), while Polars remains
-between 48.620 and 50.361 ms across the three orderings. Frame4s key-order
-sensitivity remains an explicit input to the next size-by-order regime court.
+between 48.620 and 50.361 ms across the three orderings. The size-by-order
+regime court below now resolves frame4s key-order sensitivity.
+
+## R5j size and key-order result
+
+The
+[full regime receipt](../benchmarks/receipts/2026-07-30-r5j-join-regimes/admission.md)
+measures the same deterministic one-to-one key/value multisets in frame4s,
+pandas, single-threaded Polars, and default-threaded Polars from 1K through 4M
+rows. It separates sorted, right-shuffled, and both-shuffled keys.
+
+The 1M tier is representative of the large single-thread regime, not a hidden
+loss. frame4s takes 29.33--30.12 ms there and 183.31--190.00 ms at 4M. It is
+0.56--0.59x single-threaded Polars at 1M and 0.52--0.69x at 4M. The remaining
+one-to-one gap is 2.84--3.22x against default 14-thread Polars at 1M and
+2.98--3.25x at 4M.
+
+The pandas comparison splits by algorithm. At 1M, pandas takes 2.08 ms sorted,
+29.48 ms with the right side shuffled, and 44.67 ms with both sides shuffled.
+frame4s is therefore 14.32x slower than pandas' monotonic merge path, within 2%
+on the right-shuffled case, and faster on the both-shuffled case. The same
+separation grows at 4M: frame4s is 22.51x slower sorted and 0.76--0.80x pandas
+when shuffled.
+
+The measured next steps are:
+
+1. Close the remaining 1.23--1.46x pinned-Polars losses on sparse, semi, anti,
+   and skewed joins without regressing the already-winning one-to-one path.
+2. Evaluate sorted merge join at adjacent sizes against the new shuffled
+   controls. Do not use it to claim hash-join improvement.
+3. Rebuild parallel probing around exact-size or segmented selections. At 1M,
+   sequential build costs 13.60--14.69 ms and probe costs 14.26--15.12 ms, so
+   probe parallelism can bring the default-thread ratio below 2x only if it
+   retains the 65.17 MB/op allocation result.
+4. Rerun the complete size/order court after each admitted kernel change and
+   publish sorted pandas, shuffled pandas, pinned Polars, and default Polars as
+   separate columns.
 
 ## Earlier standing, at 1,000,000 rows
 
