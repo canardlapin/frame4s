@@ -12,14 +12,14 @@ import scala.jdk.CollectionConverters.*
 object CourtRunner:
   /** Which court a receipt belongs to.
     *
-    * `Small` is the ratified court: every backend runs, and the semantic reference
-    * interpreter is the checksum oracle for the candidate.
+    * `Small` is the ratified court: every backend runs, and the semantic reference interpreter is
+    * the checksum oracle for the candidate.
     *
-    * `Scale` exists because that oracle cannot follow the court to large fixtures. The
-    * reference join is a full nested-loop cross product, so a 1,000,000-row join is on the
-    * order of 10^12 predicate evaluations. The scale tier therefore measures the candidate
-    * alone and states so in the receipt; candidate/reference agreement is established by the
-    * cross-platform conformance laws and by the `Small` tier, never assumed here.
+    * `Scale` exists because that oracle cannot follow the court to large fixtures. The reference
+    * join is a full nested-loop cross product, so a 1,000,000-row join is on the order of 10^12
+    * predicate evaluations. The scale tier therefore measures the candidate alone and states so in
+    * the receipt; candidate/reference agreement is established by the cross-platform conformance
+    * laws and by the `Small` tier, never assumed here.
     */
   private enum Tier:
     case Small
@@ -281,8 +281,8 @@ object CourtRunner:
 
   /** Untimed candidate execution, recording output rows and checksums.
     *
-    * At the `Small` tier the caller cross-checks every row against the reference oracle. At
-    * the `Scale` tier no oracle exists, so these values stand alone and the receipt says so.
+    * At the `Small` tier the caller cross-checks every row against the reference oracle. At the
+    * `Scale` tier no oracle exists, so these values stand alone and the receipt says so.
     */
   private def validateCandidate(rows: Int, status: String): Vector[Validation] =
     val columnarState = new ReferenceState
@@ -416,12 +416,11 @@ object CourtRunner:
       s"validate_only=${configuration.validateOnly}",
       s"rows=${configuration.rows}",
       s"tier=${configuration.tier.id}",
-      s"tier.oracle=${
-          configuration.tier match
-            case Tier.Small => "semantic-reference-interpreter"
-            case Tier.Scale =>
-              "candidate-only; reference join is a nested-loop cross product and " +
-                "cannot execute at this fixture size"
+      s"tier.oracle=${configuration.tier match
+          case Tier.Small => "semantic-reference-interpreter"
+          case Tier.Scale =>
+            "candidate-only; reference join is a nested-loop cross product and " +
+              "cannot execute at this fixture size"
         }",
       s"java.version=${System.getProperty("java.version")}",
       s"java.vendor=${System.getProperty("java.vendor")}",
@@ -431,10 +430,9 @@ object CourtRunner:
       s"os.arch=${System.getProperty("os.arch")}",
       s"processors=${runtime.availableProcessors()}",
       s"runner.max.heap.bytes=${runtime.maxMemory()}",
-      s"benchmark.heap=${
-          configuration.tier match
-            case Tier.Small => "-Xms1g,-Xmx1g"
-            case Tier.Scale => s"-Xms${configuration.heap},-Xmx${configuration.heap}"
+      s"benchmark.heap=${configuration.tier match
+          case Tier.Small => "-Xms1g,-Xmx1g"
+          case Tier.Scale => s"-Xms${configuration.heap},-Xmx${configuration.heap}"
         }",
       "benchmark.jvm.flags=-XX:+AlwaysPreTouch",
       s"hardware=${sys.env.getOrElse("FRAME4S_HARDWARE", "unrecorded")}",
@@ -499,7 +497,8 @@ object CourtRunner:
            @grouped-sum Saddle rows are comparable. The raw primitive scan and scalar grouped
            @reduction remain explicit lower bounds, not win/loss comparators. SQL duplicate-key
            @joins, dictionary layout, CSV acquisition, and owned-table construction have no claimed
-           @Saddle-equivalent result. Scautable is intentionally excluded from relational rankings.""".stripMargin('@')
+           @Saddle-equivalent result. Scautable is intentionally excluded from relational rankings."""
+          .stripMargin('@')
       case Tier.Scale =>
         s"""@Scale tier at ${configuration.rows} rows. Only the columnar candidate runs.
             @

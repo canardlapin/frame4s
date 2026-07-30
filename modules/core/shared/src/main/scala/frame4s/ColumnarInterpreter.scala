@@ -11,10 +11,10 @@ import scala.collection.mutable.ArrayBuffer
 /** Bridge from a columnar result to the Arrow-compatible batches the public API returns.
   *
   * The optimized engine computes into `ColumnarVector`, while `FrameRuntime` hands callers
-  * `RecordBatch` of `ColumnArray`. Deliberately partial: it converts the materialized value
-  * vectors the engine actually emits and reports a named residual for anything else, so an
-  * unrecognised shape falls back to the semantic reference path instead of being guessed at.
-  * Widening it is additive and each addition should arrive with a conformance test.
+  * `RecordBatch` of `ColumnArray`. Deliberately partial: it converts the materialized value vectors
+  * the engine actually emits and reports a named residual for anything else, so an unrecognised
+  * shape falls back to the semantic reference path instead of being guessed at. Widening it is
+  * additive and each addition should arrive with a conformance test.
   */
 private[frame4s] object ColumnarMaterialization:
   def toRecordBatch(schema: Schema, batch: ColumnarBatch): Either[String, RecordBatch] =
@@ -41,26 +41,26 @@ private[frame4s] object ColumnarMaterialization:
   /** An empty validity array means "no nulls", which is what the builders already expect. */
   private def toColumnArray(vector: ColumnarVector): Either[String, ColumnArray] =
     val built: Option[Either[StorageError, ColumnArray]] = vector match
-      case Int32Values(values)               => Some(ColumnArray.int32(values))
+      case Int32Values(values)                => Some(ColumnArray.int32(values))
       case NullableInt32Values(values, valid) => Some(ColumnArray.int32(values, valid))
-      case Int64Values(values)               => Some(ColumnArray.int64(values))
+      case Int64Values(values)                => Some(ColumnArray.int64(values))
       case NullableInt64Values(values, valid) => Some(ColumnArray.int64(values, valid))
-      case Float32Values(values, valid)      => Some(ColumnArray.float32(values, valid))
-      case Float64Values(values, valid)      => Some(ColumnArray.float64(values, valid))
-      case Utf8Values(values)                => Some(ColumnArray.utf8(values))
-      case NullableUtf8Values(values, valid) => Some(ColumnArray.utf8(values, valid))
-      case _                                 => None
+      case Float32Values(values, valid)       => Some(ColumnArray.float32(values, valid))
+      case Float64Values(values, valid)       => Some(ColumnArray.float64(values, valid))
+      case Utf8Values(values)                 => Some(ColumnArray.utf8(values))
+      case NullableUtf8Values(values, valid)  => Some(ColumnArray.utf8(values, valid))
+      case _                                  => None
     built match
-      case None         => Left(s"columnar vector ${vector.getClass.getSimpleName} has no batch form")
+      case None => Left(s"columnar vector ${vector.getClass.getSimpleName} has no batch form")
       case Some(result) => result.left.map(_.message)
 
   /** Generic fallback: rebuild a column from its scalars using the schema's declared type.
     *
-    * Some vectors are views rather than storage -- a filter yields a `SelectedVector` holding
-    * an input plus a selection -- so there is no array to hand over directly. Reading through
-    * `scalar` costs more than a typed copy, but it is correct for every vector shape and the
-    * declared type, rather than a guess from the first non-null value, decides the result.
-    * That matters for an all-null column, which carries no evidence of its own type.
+    * Some vectors are views rather than storage -- a filter yields a `SelectedVector` holding an
+    * input plus a selection -- so there is no array to hand over directly. Reading through `scalar`
+    * costs more than a typed copy, but it is correct for every vector shape and the declared type,
+    * rather than a guess from the first non-null value, decides the result. That matters for an
+    * all-null column, which carries no evidence of its own type.
     */
   private def materialize(
       dataType: DataType,
@@ -175,11 +175,11 @@ private[frame4s] object ColumnarInterpreter:
 
   /** Materialize a plan with the optimized engine, or decline with a reason.
     *
-    * A `Left` is never a failed query, only a statement that this engine will not answer it:
-    * the plan has no kernel, a kernel hit a capability residual, execution errored, or the
-    * result contains a vector with no batch form. The caller runs the semantic reference path
-    * instead, which stays the definition of correct behaviour. Declining is therefore always
-    * safe, and the reason is meant to be reported rather than swallowed.
+    * A `Left` is never a failed query, only a statement that this engine will not answer it: the
+    * plan has no kernel, a kernel hit a capability residual, execution errored, or the result
+    * contains a vector with no batch form. The caller runs the semantic reference path instead,
+    * which stays the definition of correct behaviour. Declining is therefore always safe, and the
+    * reason is meant to be reported rather than swallowed.
     */
   def collectBatches(
       plan: LogicalPlan,
@@ -215,6 +215,16 @@ final private[frame4s] case class ColumnarRun(
     receipt: ColumnarReceipt
 )
 
+final private[frame4s] case class KernelStageTiming(
+    stage: String,
+    nanoseconds: Long
+)
+
+final private[frame4s] case class ColumnarProfileRun(
+    run: ColumnarRun,
+    stages: Vector[KernelStageTiming]
+)
+
 final private[frame4s] class ColumnarExecution private[frame4s] (
     val logicalPlan: LogicalPlan,
     sources: ReferenceSources,
@@ -240,6 +250,25 @@ final private[frame4s] class ColumnarExecution private[frame4s] (
       )
     else runOpen()
 
+  /** Execute once while attributing wall time to kernel-defined stages.
+    *
+    * This package-internal path exists for benchmark receipts. Ordinary execution does not read a
+    * clock or allocate stage records.
+    */
+  def profileRun(): ColumnarProfileRun = synchronized:
+    if closed then
+      ColumnarProfileRun(
+        ColumnarRun(
+          Left(ExecutionError.Storage(StorageError.SourceClosed)),
+          ColumnarReceipt(
+            "ColumnarExecution(operator=Closed, fallback=none)",
+            fallback = None
+          )
+        ),
+        Vector.empty
+      )
+    else profileOpen()
+
   def close(): Unit = synchronized:
     if !closed then
       closed = true
@@ -261,6 +290,27 @@ final private[frame4s] class ColumnarExecution private[frame4s] (
             reference(reason)
       case None =>
         reference(fallbackReason(logicalPlan))
+
+  private def profileOpen(): ColumnarProfileRun =
+    kernel match
+      case Some(value) =>
+        val profiled = value.profile(sources)
+        profiled.attempt match
+          case KernelAttempt.Completed(result) =>
+            ColumnarProfileRun(
+              ColumnarRun(
+                result,
+                ColumnarReceipt(
+                  s"ColumnarExecution(operator=${value.name}, fallback=none)",
+                  fallback = None
+                )
+              ),
+              profiled.stages
+            )
+          case KernelAttempt.Residual(reason) =>
+            ColumnarProfileRun(reference(reason), profiled.stages)
+      case None =>
+        ColumnarProfileRun(reference(fallbackReason(logicalPlan)), Vector.empty)
 
   private def reference(reason: String): ColumnarRun =
     val execution = ReferenceInterpreter.prepare(logicalPlan, sources)
@@ -983,10 +1033,9 @@ final private case class GatheredVector(
     columnIndex: Int,
     selectedBatches: Array[Int],
     selectedRows: Array[Int],
+    length: Int,
     validity: Option[Array[Byte]]
 ) extends ColumnarVector:
-  val length: Int = selectedRows.length
-
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     if index < 0 || index >= length then
       Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
@@ -2384,9 +2433,21 @@ private enum KernelAttempt:
   case Completed(result: Either[ExecutionError, ColumnarResult])
   case Residual(reason: String)
 
+final private case class KernelProfile(
+    attempt: KernelAttempt,
+    stages: Vector[KernelStageTiming]
+)
+
 sealed private trait KernelPlan:
   def name: String
   def execute(sources: ReferenceSources): KernelAttempt
+  def profile(sources: ReferenceSources): KernelProfile =
+    val started = System.nanoTime()
+    val attempt = execute(sources)
+    KernelProfile(
+      attempt,
+      Vector(KernelStageTiming("execute", System.nanoTime() - started))
+    )
   def close(): Unit = ()
 
 private object KernelPlan:
@@ -3337,13 +3398,12 @@ final private class IntGroupIndex:
 private object IntGroupIndex:
   /** Next table size: at least a doubling, at most an eightfold jump.
     *
-    * Doubling from 32 to a million distinct keys rehashes fifteen times and allocates about
-    * twice the final table. Jumping straight to an estimate is tempting but dangerous,
-    * because distinct count extrapolated from an early sample is biased high -- the first
-    * rows are nearly all new keys whatever the true cardinality. Capping each jump at 8x
-    * keeps the chain short (six steps instead of fifteen to reach a million) while bounding
-    * how badly a wrong estimate can overshoot, and an estimate that is too low simply grows
-    * again.
+    * Doubling from 32 to a million distinct keys rehashes fifteen times and allocates about twice
+    * the final table. Jumping straight to an estimate is tempting but dangerous, because distinct
+    * count extrapolated from an early sample is biased high -- the first rows are nearly all new
+    * keys whatever the true cardinality. Capping each jump at 8x keeps the chain short (six steps
+    * instead of fifteen to reach a million) while bounding how badly a wrong estimate can
+    * overshoot, and an estimate that is too low simply grows again.
     */
   def targetCapacity(current: Int, projectedGroups: Int): Int =
     val doubled = current * 2
@@ -3915,8 +3975,8 @@ final private class Int32AggregateAccumulator(requirements: AggregateRequirement
 
   /** Total input rows, when the caller knows them before aggregating.
     *
-    * A hard upper bound on the group count, and the denominator for projecting how many
-    * groups the remaining input will add.
+    * A hard upper bound on the group count, and the denominator for projecting how many groups the
+    * remaining input will add.
     */
   def hintTotalRows(rows: Int): Unit =
     if rows > totalRowsHint then totalRowsHint = rows
@@ -3949,8 +4009,8 @@ final private class Int32AggregateAccumulator(requirements: AggregateRequirement
   /** Groups the whole input is projected to produce, from the ratio observed so far.
     *
     * Returns 0 until enough rows have been seen for the ratio to mean anything. Linear
-    * extrapolation of a distinct count is biased high, so this is only ever a hint; the 8x
-    * cap in `IntGroupIndex.targetCapacity` is what bounds the damage when it is wrong.
+    * extrapolation of a distinct count is biased high, so this is only ever a hint; the 8x cap in
+    * `IntGroupIndex.targetCapacity` is what bounds the damage when it is wrong.
     */
   private def projectedGroups: Int =
     if totalRowsHint <= 0 || rowsObserved < 4096L then 0
@@ -4176,7 +4236,7 @@ final private class JoinIntIndex(expectedRows: Int):
   private val keys = new Array[Int](capacity)
   private val heads = filledIntArray(capacity, -1)
   private val tails = filledIntArray(capacity, -1)
-  val next: Array[Int] = filledIntArray(expectedRows, -1)
+  private var duplicateNext = Array.emptyIntArray
 
   def add(key: Int, row: Int): Unit =
     var slot = mix(key) & (capacity - 1)
@@ -4186,13 +4246,17 @@ final private class JoinIntIndex(expectedRows: Int):
       heads(slot) = row
       tails(slot) = row
     else
-      next(tails(slot)) = row
+      if duplicateNext.isEmpty then duplicateNext = filledIntArray(expectedRows, -1)
+      duplicateNext(tails(slot)) = row
       tails(slot) = row
 
   def first(key: Int): Int =
     var slot = mix(key) & (capacity - 1)
     while heads(slot) >= 0 && keys(slot) != key do slot = (slot + 1) & (capacity - 1)
     heads(slot)
+
+  def next(row: Int): Int =
+    if duplicateNext.isEmpty then -1 else duplicateNext(row)
 
   private def mix(value: Int): Int =
     var hash = value
@@ -4201,6 +4265,19 @@ final private class JoinIntIndex(expectedRows: Int):
     hash ^= hash >>> 15
     hash *= 0x846ca68b
     hash ^ (hash >>> 16)
+
+final private case class HashJoinBuild(
+    rightBatch: Array[Int],
+    rightRow: Array[Int],
+    rightRows: Int,
+    singleBatch: Boolean,
+    index: JoinIntIndex
+):
+  def batch(candidate: Int): Int =
+    if singleBatch then 0 else rightBatch(candidate)
+
+  def row(candidate: Int): Int =
+    if singleBatch then candidate else rightRow(candidate)
 
 final private case class HashJoin(
     leftReference: SourceRef,
@@ -4226,6 +4303,34 @@ final private case class HashJoin(
         join(left, right) match
           case Left(error)  => KernelAttempt.Completed(Left(error))
           case Right(value) => KernelAttempt.Completed(Right(value))
+
+  override def profile(sources: ReferenceSources): KernelProfile =
+    val stages = Vector.newBuilder[KernelStageTiming]
+
+    def timed[A](stage: String)(operation: => A): A =
+      val started = System.nanoTime()
+      val value = operation
+      stages += KernelStageTiming(stage, System.nanoTime() - started)
+      value
+
+    val decoded = timed("decode"):
+      (decode(sources, leftReference, leftSchema), decode(sources, rightReference, rightSchema))
+    val attempt = decoded match
+      case (Left(Left(error)), _)      => KernelAttempt.Completed(Left(error))
+      case (_, Left(Left(error)))      => KernelAttempt.Completed(Left(error))
+      case (Left(Right(reason)), _)    => KernelAttempt.Residual(reason)
+      case (_, Left(Right(reason)))    => KernelAttempt.Residual(reason)
+      case (Right(left), Right(right)) =>
+        timed("build")(build(right)) match
+          case Left(error)  => KernelAttempt.Completed(Left(error))
+          case Right(built) =>
+            timed("probe")(probe(left, built)) match
+              case Left(error)       => KernelAttempt.Completed(Left(error))
+              case Right(selections) =>
+                KernelAttempt.Completed(
+                  timed("materialize")(materialize(left, right, selections, None))
+                )
+    KernelProfile(attempt, stages.result())
 
   def decode(
       sources: ReferenceSources,
@@ -4255,9 +4360,17 @@ final private case class HashJoin(
       left: Vector[DecodedBatch],
       right: Vector[DecodedBatch]
   ): Either[ExecutionError, ColumnarResult] =
+    build(right).flatMap: built =>
+      probe(left, built).flatMap: selections =>
+        materialize(left, right, selections, None)
+
+  private def build(
+      right: Vector[DecodedBatch]
+  ): Either[ExecutionError, HashJoinBuild] =
     val rightRows = right.foldLeft(0)(_ + _.rowCount)
-    val rightBatch = new Array[Int](rightRows)
-    val rightRow = new Array[Int](rightRows)
+    val singleBatch = right.length == 1
+    val rightBatch = if singleBatch then Array.emptyIntArray else new Array[Int](rightRows)
+    val rightRow = if singleBatch then Array.emptyIntArray else new Array[Int](rightRows)
     val index = new JoinIntIndex(rightRows)
     var global = 0
     var batchIndex = 0
@@ -4267,8 +4380,9 @@ final private case class HashJoin(
         case key: RawInt32Vector =>
           var row = 0
           while row < right(batchIndex).rowCount do
-            rightBatch(global) = batchIndex
-            rightRow(global) = row
+            if !singleBatch then
+              rightBatch(global) = batchIndex
+              rightRow(global) = row
             if key.unsafeValid(row) then index.add(key.unsafeIntValue(row), global)
             global += 1
             row += 1
@@ -4278,44 +4392,77 @@ final private case class HashJoin(
           )
       batchIndex += 1
 
-    val selections =
-      new JoinSelectionBuilder(RightSelectionMode.forJoin(columns, kind))
-    batchIndex = 0
-    while batchIndex < left.length && error.isEmpty do
-      val leftBatch = left(batchIndex)
-      leftBatch.columns(leftKey) match
-        case key: RawInt32Vector =>
-          var row = 0
-          while row < leftBatch.rowCount && error.isEmpty do
-            var candidate =
-              if key.unsafeValid(row) then index.first(key.unsafeIntValue(row))
-              else -1
-            val existence = kind == JoinKind.LeftSemi || kind == JoinKind.LeftAnti
-            val matched = candidate >= 0
-            if existence then
-              val emit =
-                (kind == JoinKind.LeftSemi && matched) ||
-                  (kind == JoinKind.LeftAnti && !matched)
-              if emit then selections.appendLeftOnly(batchIndex, row)
-            else
-              while candidate >= 0 && error.isEmpty do
-                selections.appendMatched(
-                  batchIndex,
-                  row,
-                  rightBatch(candidate),
-                  rightRow(candidate)
-                )
-                candidate = index.next(candidate)
-            if !existence && !matched && kind == JoinKind.LeftOuter && error.isEmpty then
-              selections.appendLeftOnly(batchIndex, row)
-            row += 1
-        case _ =>
-          error = Some(
-            ExecutionError.UnsupportedNode("hash join left key is not plain Int32")
-          )
-      batchIndex += 1
+    error match
+      case Some(value) => Left(value)
+      case None        =>
+        Right(HashJoinBuild(rightBatch, rightRow, rightRows, singleBatch, index))
 
-    materialize(left, right, selections, error)
+  private def probe(
+      left: Vector[DecodedBatch],
+      built: HashJoinBuild
+  ): Either[ExecutionError, JoinSelectionBuilder] =
+    val leftRows = left.foldLeft(0)(_ + _.rowCount)
+    val expectedOutput = kind match
+      case JoinKind.LeftOuter | JoinKind.LeftAnti => leftRows
+      case JoinKind.Inner | JoinKind.LeftSemi     => math.min(leftRows, built.rightRows)
+    val selections =
+      new JoinSelectionBuilder(
+        RightSelectionMode.forJoin(columns, kind),
+        expectedOutput
+      )
+    var batchIndex = 0
+    var error: Option[ExecutionError] = None
+    while batchIndex < left.length && error.isEmpty do
+      probeRange(
+        left(batchIndex),
+        batchIndex,
+        0,
+        left(batchIndex).rowCount,
+        built,
+        selections
+      ) match
+        case Some(value) => error = Some(value)
+        case None        => ()
+      batchIndex += 1
+    error.toLeft(selections)
+
+  private def probeRange(
+      leftBatch: DecodedBatch,
+      batchIndex: Int,
+      from: Int,
+      until: Int,
+      built: HashJoinBuild,
+      selections: JoinSelectionBuilder
+  ): Option[ExecutionError] =
+    leftBatch.columns(leftKey) match
+      case key: RawInt32Vector =>
+        var row = from
+        val existence = kind == JoinKind.LeftSemi || kind == JoinKind.LeftAnti
+        while row < until do
+          var candidate =
+            if key.unsafeValid(row) then built.index.first(key.unsafeIntValue(row))
+            else -1
+          val matched = candidate >= 0
+          if existence then
+            val emit =
+              (kind == JoinKind.LeftSemi && matched) ||
+                (kind == JoinKind.LeftAnti && !matched)
+            if emit then selections.appendLeftOnly(batchIndex, row)
+          else
+            while candidate >= 0 do
+              selections.appendMatched(
+                batchIndex,
+                row,
+                built.batch(candidate),
+                built.row(candidate)
+              )
+              candidate = built.index.next(candidate)
+          if !existence && !matched && kind == JoinKind.LeftOuter then
+            selections.appendLeftOnly(batchIndex, row)
+          row += 1
+        None
+      case _ =>
+        Some(ExecutionError.UnsupportedNode("hash join left key is not plain Int32"))
 
   def materialize(
       left: Vector[DecodedBatch],
@@ -4327,13 +4474,14 @@ final private case class HashJoin(
       case Some(value) => Left(value)
       case None        =>
         val selected = selections.result()
-        val output = columns.map:
+        val outputColumns = columns.map:
           case JoinColumn.Left(index) =>
             GatheredVector(
               left,
               index,
               selected.leftBatches,
               selected.leftRows,
+              selected.length,
               validity = None
             )
           case JoinColumn.Right(index) =>
@@ -4342,13 +4490,14 @@ final private case class HashJoin(
               index,
               selected.rightBatches,
               selected.rightRows,
+              selected.length,
               selected.rightValidity
             )
         Right(
           ColumnarResult(
             outputSchema,
             order,
-            Vector(ColumnarBatch(output, selected.length))
+            Vector(ColumnarBatch(outputColumns, selected.length))
           )
         )
 
@@ -4357,9 +4506,9 @@ final private case class JoinSelection(
     leftRows: Array[Int],
     rightBatches: Array[Int],
     rightRows: Array[Int],
-    rightValidity: Option[Array[Byte]]
-):
-  val length: Int = leftRows.length
+    rightValidity: Option[Array[Byte]],
+    length: Int
+)
 
 private enum RightSelectionMode:
   case Absent
@@ -4380,18 +4529,21 @@ private object RightSelectionMode:
         case JoinKind.LeftAnti  => RightSelectionMode.Nullable
 
 final private class JoinSelectionBuilder(
-    rightMode: RightSelectionMode
+    rightMode: RightSelectionMode,
+    initialCapacity: Int = 16
 ):
-  private var leftBatches = new Array[Int](16)
-  private var leftRows = new Array[Int](16)
+  private val boundedInitialCapacity = math.max(0, initialCapacity)
+  private var leftBatches = new Array[Int](boundedInitialCapacity)
+  private var leftRows = new Array[Int](boundedInitialCapacity)
   private var rightBatches =
-    if rightMode != RightSelectionMode.Absent then new Array[Int](16)
+    if rightMode != RightSelectionMode.Absent then new Array[Int](boundedInitialCapacity)
     else Array.emptyIntArray
   private var rightRows =
-    if rightMode != RightSelectionMode.Absent then new Array[Int](16)
+    if rightMode != RightSelectionMode.Absent then new Array[Int](boundedInitialCapacity)
     else Array.emptyIntArray
   private var rightValidity =
-    if rightMode == RightSelectionMode.Nullable then new Array[Byte](2)
+    if rightMode == RightSelectionMode.Nullable then
+      new Array[Byte]((boundedInitialCapacity + 7) >>> 3)
     else Array.emptyByteArray
   private var length = 0
 
@@ -4413,22 +4565,19 @@ final private class JoinSelectionBuilder(
     if rightMode != RightSelectionMode.Absent then
       rightBatches(length) = rightBatch
       rightRows(length) = rightRow
-      if rightValidity.nonEmpty then
+      if rightMode == RightSelectionMode.Nullable then
         val byte = length >>> 3
         rightValidity(byte) = (rightValidity(byte).toInt | (1 << (length & 7))).toByte
     length += 1
 
   def result(): JoinSelection =
     new JoinSelection(
-      java.util.Arrays.copyOf(leftBatches, length),
-      java.util.Arrays.copyOf(leftRows, length),
-      if rightMode != RightSelectionMode.Absent then java.util.Arrays.copyOf(rightBatches, length)
-      else Array.emptyIntArray,
-      if rightMode != RightSelectionMode.Absent then java.util.Arrays.copyOf(rightRows, length)
-      else Array.emptyIntArray,
-      if rightValidity.nonEmpty then
-        Some(java.util.Arrays.copyOf(rightValidity, (length + 7) >>> 3))
-      else None
+      leftBatches,
+      leftRows,
+      rightBatches,
+      rightRows,
+      Option.when(rightMode == RightSelectionMode.Nullable)(rightValidity),
+      length
     )
 
   private def ensureCapacity(required: Int): Unit =
@@ -4439,7 +4588,7 @@ final private class JoinSelectionBuilder(
       if rightMode != RightSelectionMode.Absent then
         rightBatches = java.util.Arrays.copyOf(rightBatches, next)
         rightRows = java.util.Arrays.copyOf(rightRows, next)
-      if rightValidity.nonEmpty then
+      if rightMode == RightSelectionMode.Nullable then
         rightValidity = java.util.Arrays.copyOf(rightValidity, (next + 7) >>> 3)
 
 final private class PreparedHashJoin private (
@@ -4926,9 +5075,10 @@ final private case class FusedInt32(
         // in this kernel and buys nothing: the batch stays open for the whole evaluation, so
         // the bytes cannot be released underneath it.
         case Some(column: Int32Array) if column.nullCount == 0 =>
-          column.withBorrowedValueBytes: (bytes, start, validity, offset, length) =>
-            RawInt32Vector(bytes, validity, offset, length, start)
-          match
+          val decodedColumn =
+            column.withBorrowedValueBytes: (bytes, start, validity, offset, length) =>
+              RawInt32Vector(bytes, validity, offset, length, start)
+          decodedColumn match
             case Right(value) => decoded(required(index)) = value
             case Left(value)  => error = Some(Right(value.message))
         case Some(_: Int32Array) =>
@@ -4943,17 +5093,17 @@ final private case class FusedInt32(
 
   /** Column-at-a-time evaluation of the fused filter, projection, and checked addition.
     *
-    * The row-at-a-time shape this replaces paid, for every element, a virtual `keep`
-    * dispatch that re-matched the comparison operator, a `Vector` trie lookup to reach the
-    * projection, a runtime type test to tell `Direct` from `Add`, and an `Option` check in
-    * both loop conditions. None of that work depends on the row, so all of it is hoisted to
-    * once per batch and the remaining loops are monomorphic over primitive arrays.
+    * The row-at-a-time shape this replaces paid, for every element, a virtual `keep` dispatch that
+    * re-matched the comparison operator, a `Vector` trie lookup to reach the projection, a runtime
+    * type test to tell `Direct` from `Add`, and an `Option` check in both loop conditions. None of
+    * that work depends on the row, so all of it is hoisted to once per batch and the remaining
+    * loops are monomorphic over primitive arrays.
     *
-    * Overflow detection moves out of the inner loop too. A checked `x + literal` overflows
-    * for some selected row exactly when it overflows at the minimum or the maximum selected
-    * input, so the loop tracks those two values branch-free and the bound is tested once.
-    * The reported error must still be the one the row-at-a-time order would have produced,
-    * so the cold path rescans to find the first offending row.
+    * Overflow detection moves out of the inner loop too. A checked `x + literal` overflows for some
+    * selected row exactly when it overflows at the minimum or the maximum selected input, so the
+    * loop tracks those two values branch-free and the bound is tested once. The reported error must
+    * still be the one the row-at-a-time order would have produced, so the cold path rescans to find
+    * the first offending row.
     */
   private def project(
       from: Int,
@@ -5059,8 +5209,8 @@ final private case class FusedInt32(
 
   /** Cold path: the first selected offset whose checked addition overflows.
     *
-    * Only reached once a batch is already known to fail, so it trades speed for reproducing
-    * the exact row-major error the row-at-a-time evaluation reported.
+    * Only reached once a batch is already known to fail, so it trades speed for reproducing the
+    * exact row-major error the row-at-a-time evaluation reported.
     */
   private def firstOverflow(
       source: RawInt32Vector,
@@ -5077,10 +5227,10 @@ final private case class FusedInt32(
 
 /** Allocate an `Int` array pre-filled with a sentinel.
   *
-  * `Array.fill` takes a by-name element and compiles to a closure call per slot, which the
-  * JIT does not turn into a vectorized fill. `java.util.Arrays.fill` is intrinsified. The
-  * difference is invisible on a 32-slot hash table and worth several percent of a join once
-  * the arrays are sized by the input, where it showed up as 4.0% of runnable time.
+  * `Array.fill` takes a by-name element and compiles to a closure call per slot, which the JIT does
+  * not turn into a vectorized fill. `java.util.Arrays.fill` is intrinsified. The difference is
+  * invisible on a 32-slot hash table and worth several percent of a join once the arrays are sized
+  * by the input, where it showed up as 4.0% of runnable time.
   */
 private[frame4s] def filledIntArray(length: Int, value: Int): Array[Int] =
   val array = new Array[Int](length)

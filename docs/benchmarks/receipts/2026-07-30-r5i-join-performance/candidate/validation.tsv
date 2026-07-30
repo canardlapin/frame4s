@@ -1,0 +1,7 @@
+workload	output_rows	checksum	status
+joinOneToOne	1000000	6706901494945186080	candidate self-consistency; small-tier oracle laws remain binding
+joinOneToMany	1000000	3230237087133107989	candidate self-consistency; small-tier oracle laws remain binding
+joinSparse	100000	9974464967841974896	candidate self-consistency; small-tier oracle laws remain binding
+joinSkewed	1000	6659192972797761300	candidate self-consistency; small-tier oracle laws remain binding
+semiJoinSparse	100000	5135246031684690592	candidate self-consistency; small-tier oracle laws remain binding
+antiJoinSparse	900000	2512695010752838560	candidate self-consistency; small-tier oracle laws remain binding

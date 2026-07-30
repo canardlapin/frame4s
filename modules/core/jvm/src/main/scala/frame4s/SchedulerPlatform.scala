@@ -5,10 +5,10 @@ import java.util.concurrent.{ForkJoinPool, ForkJoinTask}
 private[frame4s] object SchedulerPlatform:
   /** The pool frame4s owns.
     *
-    * A dedicated `ForkJoinPool` rather than `commonPool`, so a neighbouring library's
-    * parallel stream cannot starve query execution and vice versa. Work stealing matters
-    * here beyond load balancing: the court's skewed join and group fixtures are deliberately
-    * lopsided, and a fixed partition-per-thread split would leave most workers idle on them.
+    * A dedicated `ForkJoinPool` rather than `commonPool`, so a neighbouring library's parallel
+    * stream cannot starve query execution and vice versa. Work stealing matters here beyond load
+    * balancing: the court's skewed join and group fixtures are deliberately lopsided, and a fixed
+    * partition-per-thread split would leave most workers idle on them.
     *
     * One thread is left to the caller, which is the thread that submits the work and then
     * participates in it.

@@ -285,13 +285,13 @@ final class FrameRuntime[F[_]] private (
 
   /** Batches for a materializing collect, from the optimized engine when it will take the plan.
     *
-    * Only `collect` routes here. `stream` deliberately stays on the reference cursor: the
-    * optimized engine materializes its whole result before yielding anything, so promoting it
-    * there would quietly turn an incremental stream into materialize-then-emit, which is a
-    * change in what callers are promised rather than an optimization.
+    * Only `collect` routes here. `stream` deliberately stays on the reference cursor: the optimized
+    * engine materializes its whole result before yielding anything, so promoting it there would
+    * quietly turn an incremental stream into materialize-then-emit, which is a change in what
+    * callers are promised rather than an optimization.
     *
-    * The engine declines rather than fails, and the reference path defines correct behaviour,
-    * so a decline is always safe.
+    * The engine declines rather than fails, and the reference path defines correct behaviour, so a
+    * decline is always safe.
     */
   private def collectBatches(
       frame: Frame[?],

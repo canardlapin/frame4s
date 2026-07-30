@@ -195,10 +195,18 @@ verified bit-identical at both the 200,000-row scale tier and the ratified
 The conclusion is a redirection, not a smaller version of the same plan.
 Parallelism should go first to kernels that stream rather than chase pointers --
 filter, projection, arithmetic -- where access is sequential and bandwidth scales
-with cores. Grouping and joins need a more compact, cache-resident table before
-threading them is worth attempting again. Note that Polars' own single-threaded
-grouping is 37.6 ms against our 45.1, so its 4.3x threading win comes from a
-table design we do not have, not from threading a table like ours.
+with cores. High-cardinality grouping needs a more compact, cache-resident table
+before threading it is worth attempting again. Note that Polars' own
+single-threaded grouping is 37.6 ms against our 45.1, so its 4.3x threading win
+comes from a table design we do not have, not from threading a table like ours.
+
+The join follow-up separated a different constraint. A bounded parallel probe
+cut the allocation-only one-to-one path from 42.28 to 28.32 ms and the profiled
+probe stage from 26.77 to 4.79 ms, so read-only probing of the immutable index
+does scale. It was still rejected: one selection builder per row chunk raised
+allocation from 65.17 to 97.07 MB/op. Reconsider it only with a segmented or
+prefix-sized selection representation that preserves left order without
+duplicating capacity.
 
 Note also that the two low-cardinality grouping workloads key on `Utf8`, not
 `Int32`, so they run a different accumulator and were never touched by this
@@ -221,7 +229,32 @@ execution receipt rather than hiding it, and ships with an ADR recording the
 rationale and a dated receipt measuring the public path. This runs last so the
 engine being promoted is the improved one.
 
-## Standing, at 1,000,000 rows
+## R5i join result, at 1,000,000 rows
+
+The join court now measures detached-result construction separately from the
+serial checksum consumption pass. The admitted allocation changes are:
+
+- allocate the duplicate-chain array only when a right key actually repeats;
+- omit right batch/row location arrays when the right input has one batch;
+- size selection builders from join shape and transfer their arrays into the
+  gathered result instead of copying four arrays at completion.
+
+The full [R5i receipt](../benchmarks/receipts/2026-07-30-r5i-join-performance/admission.md)
+records exact unchanged checksums for inner, one-to-many, sparse, skewed, semi,
+and anti joins. One-to-one construction falls from 129.68 to 29.90 ms/op and
+allocation from 110.73 to 65.17 MB/op. The consumed path is 68.12 ms/op, so the
+checksum/consumption walk accounts for approximately 56% of that benchmark.
+The 1,000-row consumed path is also lower than the earlier admitted receipt
+(0.036 versus 0.105 ms/op), rather than trading scale throughput for latency.
+
+Fresh execution-matched Polars receipts put the new one-to-one time at 0.62x
+Polars pinned to one thread and 3.26x Polars at its 14-thread default. The full
+deterministic order receipt also passes: pandas is strongly order-sensitive
+(1.946 ms sorted, 40.093 ms with both sides shuffled), while Polars remains
+between 48.620 and 50.361 ms across the three orderings. Frame4s key-order
+sensitivity remains an explicit input to the next size-by-order regime court.
+
+## Earlier standing, at 1,000,000 rows
 
 Single-threaded frame4s candidate, milliseconds per operation, against the
 starting position recorded above. Scouting measurements, not receipts.
@@ -245,7 +278,7 @@ amount of single-threaded kernel work closes that.
 
 ## Measured position against Polars, 1,000,000 rows
 
-From the committed
+From the pre-R5i committed
 [scale receipt](../benchmarks/receipts/2026-07-30-scale-1m/summary.md) and the
 [Polars receipts](../benchmarks/receipts/2026-07-30-polars-1m/default/summary.md).
 Ratio is frame4s over Polars, so below 1.00 means frame4s is faster.

@@ -303,20 +303,57 @@ with the same key multiset and output cardinality and only the ordering changed:
 
 | Key order | pandas | Polars |
 |---|---:|---:|
-| sorted, as the committed fixture | 2.08 ms | 48.7 ms |
-| left sorted, right shuffled | 31.8 ms | 45.0 ms |
-| both shuffled | 28.5 ms | 47.1 ms |
+| sorted, as the committed fixture | 1.946 ms | 49.573 ms |
+| left sorted, right shuffled | 32.278 ms | 48.620 ms |
+| both shuffled | 40.093 ms | 50.361 ms |
 
-pandas is 15x faster on the sorted case, so it is reaching a monotonic-key merge
-path rather than executing a hash join. Any published frame4s-versus-pandas join
-ratio on this fixture compares a hash join against a merge and should not be
-read as a hash-join comparison. Polars is flat across all three, so its number is
-a genuine hash join and the frame4s-versus-Polars join ratio stands.
+pandas is 20.6x faster on the sorted case, so it is reaching an order-sensitive
+fast path rather than executing the same join as the shuffled cases. Any
+published frame4s-versus-pandas ratio on this fixture compares a hash join
+against that fast path and should not be read as a hash-join comparison. Polars
+is flat across all three, so its comparator number is not flattered by ordering.
+The next regime court still has to measure frame4s itself under shuffled keys
+before making a shuffled-hash parity claim.
 
 This also constrains what frame4s may do about it. Detecting sorted keys and
 switching to a merge join is a legitimate technique, but adding it against this
 fixture would be indistinguishable from fitting the benchmark. A scattered-key
 join fixture has to exist first, so the optimization can be shown to generalize.
+
+## Join construction and consumption are separate measurements
+
+The original join benchmark returned `ColumnarResult.checksum`, so it timed a
+serial walk over every output cell after constructing the detached result.
+Polars' eager join timing stops at its result frame and has no corresponding
+consumption pass. The join court now carries both paths:
+
+- `*ExecutionOnly` constructs and blackholes the detached result, then closes it;
+- the original method additionally computes the exact checksum.
+
+Comparator ratios use the execution-only row. The checksum row remains in the
+same receipt as a validation and consumption-cost measurement. At 1,000,000
+one-to-one rows, the admitted candidate measures 29.90 ms execution-only and
+68.12 ms with checksum. The difference is 56% of the consumed timing, so the
+older 91.51/47.14 frame4s-to-Polars ratio combined unlike endpoints.
+
+Fresh execution-matched receipts put one-to-one frame4s at 0.62x
+single-threaded Polars (29.90 versus 48.08 ms) and 3.26x default 14-thread
+Polars (29.90 versus 9.18 ms). Across all six joins, frame4s wins one-to-one and
+one-to-many against pinned Polars; sparse, skewed, semi, and anti remain
+1.23--1.46x slower. It remains 3.26--4.18x slower than default-threaded Polars.
+
+The [R5i join receipt](receipts/2026-07-30-r5i-join-performance/admission.md)
+also records the optimization court. Lazy duplicate chains, single-batch
+right-row addressing, capacity-aware selection arrays, and transferring those
+arrays into the result reduce one-to-one allocation from 110.73 to 65.17 MB/op.
+All six measured join shapes improve, exact checksums remain unchanged, and the
+1,000-row consumed path improves from the earlier 0.105 ms receipt to 0.036 ms.
+
+A bounded parallel probe was measured and rejected. It reduced one-to-one
+execution from 42.28 to 28.32 ms against the isolated allocation-only candidate,
+but raised allocation from 65.17 to 97.07 MB/op. Its probe stage is demonstrably
+parallelizable; its per-chunk selection ownership is not yet allocation-safe.
+The sequential allocation reduction is admitted independently.
 
 ## Claim discipline
 

@@ -778,6 +778,117 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       leftInput.close()
       rightInput.close()
 
+  test("hash joins preserve order and checksums at the bounded-probe admission threshold"):
+    type Left = (key: Option[Int], leftValue: Long)
+    type Right = (rightKey: Option[Int], rightValue: Long)
+    val leftRef = reference("columnar-threshold-left")
+    val rightRef = reference("columnar-threshold-right")
+    val rowCount = Parallelism.MinimumRows
+    val mask = rowCount - 1
+    val rightKeyCount = rowCount / 2
+    val rightMask = rightKeyCount - 1
+
+    val leftRows: Vector[Left] = Vector.tabulate(rowCount): index =>
+      val key = (index * 40503) & mask
+      val nullableKey = if key % 8192 == 0 then None else Some(key)
+      (key = nullableKey, leftValue = index.toLong * 3L)
+    val rightRows: Vector[Right] = Vector.tabulate(rowCount): index =>
+      val pair = index / 2
+      val duplicate = index & 1
+      val key = ((pair * 16411) & rightMask) * 2
+      (rightKey = Some(key), rightValue = key.toLong * 5L + duplicate.toLong)
+
+    val leftInput = table[Left](leftRows, batchSize = rowCount)
+    val rightInput = table[Right](rightRows, batchSize = rowCount)
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val condition = (lhs: Scope[Left, left.Origin], rhs: Scope[Right, right.Origin]) =>
+      (lhs.col("key") === rhs.col("rightKey")).isTrue
+    val inner = left.innerJoin(right)(condition)
+    val outer = left.leftJoin(right)(condition)
+    val semi = left.semiJoin(right)(condition)
+    val anti = left.antiJoin(right)(condition)
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+
+    def mix(hash: Long, value: Long): Long = hash * 31L + value
+    def mixKey(hash: Long, key: Option[Int]): Long =
+      mix(hash, key.fold(0x61c8864680b583ebL)(_.toLong))
+
+    var innerRows = 0L
+    var outerRows = 0L
+    var semiRows = 0L
+    var antiRows = 0L
+    leftRows.foreach: row =>
+      val matched = row.key.exists(_ % 2 == 0)
+      if matched then
+        innerRows += 2L
+        outerRows += 2L
+        semiRows += 1L
+      else
+        outerRows += 1L
+        antiRows += 1L
+
+    var innerChecksum = innerRows
+    var outerChecksum = outerRows
+    var semiChecksum = semiRows
+    var antiChecksum = antiRows
+    leftRows.foreach: row =>
+      val matched = row.key.exists(_ % 2 == 0)
+      if matched then
+        val matchedKey = row.key.get
+        var duplicate = 0
+        while duplicate < 2 do
+          innerChecksum = mixKey(innerChecksum, row.key)
+          innerChecksum = mix(innerChecksum, row.leftValue)
+          innerChecksum = mixKey(innerChecksum, Some(matchedKey))
+          innerChecksum = mix(innerChecksum, matchedKey.toLong * 5L + duplicate.toLong)
+
+          outerChecksum = mixKey(outerChecksum, row.key)
+          outerChecksum = mix(outerChecksum, row.leftValue)
+          outerChecksum = mixKey(outerChecksum, Some(matchedKey))
+          outerChecksum = mix(outerChecksum, matchedKey.toLong * 5L + duplicate.toLong)
+          duplicate += 1
+
+        semiChecksum = mixKey(semiChecksum, row.key)
+        semiChecksum = mix(semiChecksum, row.leftValue)
+      else
+        outerChecksum = mixKey(outerChecksum, row.key)
+        outerChecksum = mix(outerChecksum, row.leftValue)
+        outerChecksum = mix(outerChecksum, 0x61c8864680b583ebL)
+        outerChecksum = mix(outerChecksum, 0x61c8864680b583ebL)
+
+        antiChecksum = mixKey(antiChecksum, row.key)
+        antiChecksum = mix(antiChecksum, row.leftValue)
+
+    def assertStable[S <: scala.NamedTuple.AnyNamedTuple](
+        frame: Frame[S],
+        expectedRows: Long,
+        expectedChecksum: Long
+    ): Unit =
+      val execution = ColumnarInterpreter.prepare(frame.plan, sources)
+      try
+        (0 until 3).foreach: _ =>
+          val run = execution.run()
+          val result = completed(run)
+          try
+            assertEquals(run.receipt.fallback, None)
+            assert(run.receipt.physicalPlan.contains("HashJoin"))
+            assertEquals(result.order, frame.plan.order)
+            assertEquals(result.rowCount, expectedRows)
+            assertEquals(value(result.checksum), expectedChecksum)
+          finally result.close()
+      finally execution.close()
+
+    try
+      assertStable(inner, innerRows, innerChecksum)
+      assertStable(outer, outerRows, outerChecksum)
+      assertStable(semi, semiRows, semiChecksum)
+      assertStable(anti, antiRows, antiChecksum)
+    finally
+      leftInput.close()
+      rightInput.close()
+
   test("selection-backed outer joins gather every primitive family and survive owner closure"):
     type Left =
       (key: Int, flag: Boolean, ratio: Float, label: String, at: TimestampMicros)
@@ -981,7 +1092,6 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       direct.close()
       dictionary.close()
 
-
   test("collectBatches materializes Arrow batches matching the reference interpreter"):
     type Input = (id: Int, value: Option[Double], label: String)
     type Output = (id: Int, value: Option[Double], label: String)
@@ -1014,8 +1124,6 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
 
     assertEquals(produced, expected)
     assertEquals(produced.length, 3)
-
-
 
 object ColumnarInterpreterSuite:
   private def fingerprint(row: Vector[ScalarValue]): String = row match

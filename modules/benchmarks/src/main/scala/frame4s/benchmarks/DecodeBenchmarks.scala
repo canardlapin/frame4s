@@ -7,14 +7,14 @@ import java.util.concurrent.TimeUnit
 
 /** Isolates the cost of frame4s' storage representation from the cost of its kernels.
   *
-  * frame4s keeps every numeric column in an `Array[Byte]` and decodes each element with
-  * masked loads and shifts. That is Arrow-compatible and platform-neutral, but it is also
-  * the layer every kernel sits on, so its cost is charged to every workload in the court.
+  * frame4s keeps every numeric column in an `Array[Byte]` and decodes each element with masked
+  * loads and shifts. That is Arrow-compatible and platform-neutral, but it is also the layer every
+  * kernel sits on, so its cost is charged to every workload in the court.
   *
   * This benchmark answers one question before any kernel is rewritten: how much does the
-  * representation actually cost against a native primitive array, and does a `VarHandle`
-  * recover it? The native rows are the ceiling, not a proposal -- frame4s cannot simply
-  * become `Array[Double]` without giving up zero-copy Arrow interchange.
+  * representation actually cost against a native primitive array, and does a `VarHandle` recover
+  * it? The native rows are the ceiling, not a proposal -- frame4s cannot simply become
+  * `Array[Double]` without giving up zero-copy Arrow interchange.
   */
 @BenchmarkMode(Array(Mode.AverageTime))
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
