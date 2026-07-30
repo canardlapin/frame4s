@@ -154,6 +154,28 @@ execution receipt rather than hiding it, and ships with an ADR recording the
 rationale and a dated receipt measuring the public path. This runs last so the
 engine being promoted is the improved one.
 
+## Standing, at 1,000,000 rows
+
+Single-threaded frame4s candidate, milliseconds per operation, against the
+starting position recorded above. Scouting measurements, not receipts.
+
+| Workload | Start | Now | Change |
+|---|---:|---:|---:|
+| fused filter/project | 6.12 | 3.19 | 1.92x |
+| grouped high cardinality | 53.5 | 45.1 | 1.19x |
+| one-to-one join | 100.9 | 89.1 | 1.13x |
+| grouped low cardinality | 10.62 | 10.56 | unchanged |
+
+Allocation on high-cardinality grouping moved 113.4 to 106.3 MB/op, and on the
+fused pipeline 16.0 to 12.0 MB/op.
+
+Phases 1 and 2 have reached diminishing returns in their current form. The
+kernels no longer interpret per row, the court no longer substantially times its
+own validator, and the remaining single-threaded gap is spread thinly rather
+than concentrated in one hot spot. The largest untouched lever is Phase 3:
+Polars gains 4.3--4.9x from threads on grouping and joins on this host, and no
+amount of single-threaded kernel work closes that.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than
