@@ -283,6 +283,31 @@ final class FrameRuntime[F[_]] private (
       )(cursor => F.delay(cursor.close()))
       .flatMap(batches)
 
+  /** Batches for a materializing collect, from the optimized engine when it will take the plan.
+    *
+    * Only `collect` routes here. `stream` deliberately stays on the reference cursor: the
+    * optimized engine materializes its whole result before yielding anything, so promoting it
+    * there would quietly turn an incremental stream into materialize-then-emit, which is a
+    * change in what callers are promised rather than an optimization.
+    *
+    * The engine declines rather than fails, and the reference path defines correct behaviour,
+    * so a decline is always safe.
+    */
+  private def collectBatches(
+      frame: Frame[?],
+      sources: ReferenceSources
+  ): Stream[F, RecordBatch] =
+    Stream
+      .eval(F.delay(ColumnarInterpreter.collectBatches(frame.plan, sources)))
+      .flatMap:
+        case Left(_)        => referenceBatches(frame, sources)
+        case Right(batches) =>
+          Stream
+            .emits(batches)
+            .covary[F]
+            .flatMap: batch =>
+              Stream.bracket(F.pure(batch))(value => F.delay(value.close()))
+
   private def prepare(frame: Frame[?]): Resource[F, PreparedExecution] =
     legacySources match
       case Some(sources) =>
@@ -365,7 +390,7 @@ final class FrameRuntime[F[_]] private (
           def closeRetained: F[Unit] =
             retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
 
-          val copyBatches = referenceBatches(frame, sources).evalMap: batch =>
+          val copyBatches = collectBatches(frame, sources).evalMap: batch =>
             F.uncancelable: _ =>
               F.delay(batch.slice(0, batch.rowCount))
                 .flatMap(result => executionFailure(result.left.map(ExecutionError.Storage.apply)))

@@ -981,6 +981,42 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       direct.close()
       dictionary.close()
 
+
+  test("collectBatches materializes Arrow batches matching the reference interpreter"):
+    type Input = (id: Int, value: Option[Double], label: String)
+    type Output = (id: Int, value: Option[Double], label: String)
+    val ref = reference("columnar-collect")
+    val rows = Vector(
+      (id = 1, value = Some(1.5), label = "a"),
+      (id = 2, value = None, label = "b"),
+      (id = 3, value = Some(-0.0), label = "c"),
+      (id = 4, value = Some(2.25), label = "d")
+    )
+    val input = table[Input](rows)
+    val source = value(Frame.values[Input](ref))
+    val query: Frame[Output] = source.filter(row => row.col("id") > 1)
+    val sources = ReferenceSources.empty.bind(ref, input)
+
+    // The engine must actually take this plan; a silent decline would make the comparison
+    // below vacuous, because both sides would then be the reference interpreter.
+    val batches = ColumnarInterpreter.collectBatches(query.plan, sources) match
+      case Left(reason) => fail(s"columnar engine declined a supported plan: $reason")
+      case Right(value) => value
+
+    val produced = batches.flatMap: batch =>
+      (0 until batch.rowCount).toVector.map: row =>
+        batch.columns.map(column => value(column.scalar(row)))
+    val expected =
+      value(ReferenceInterpreter.prepare(query.plan, sources).collect[Output]).batches
+        .flatMap: batch =>
+          (0 until batch.rowCount).toVector.map: row =>
+            batch.columns.map(column => value(column.scalar(row)))
+
+    assertEquals(produced, expected)
+    assertEquals(produced.length, 3)
+
+
+
 object ColumnarInterpreterSuite:
   private def fingerprint(row: Vector[ScalarValue]): String = row match
     case Vector(ScalarValue.Utf8(word), ScalarValue.Float64(value)) =>

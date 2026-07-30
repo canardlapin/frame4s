@@ -8,6 +8,152 @@ import scala.collection.mutable.ArrayBuffer
   * with an exact physical contract and falls back for the whole plan when that contract is not met.
   * The reference interpreter therefore remains the semantic oracle.
   */
+/** Bridge from a columnar result to the Arrow-compatible batches the public API returns.
+  *
+  * The optimized engine computes into `ColumnarVector`, while `FrameRuntime` hands callers
+  * `RecordBatch` of `ColumnArray`. Deliberately partial: it converts the materialized value
+  * vectors the engine actually emits and reports a named residual for anything else, so an
+  * unrecognised shape falls back to the semantic reference path instead of being guessed at.
+  * Widening it is additive and each addition should arrive with a conformance test.
+  */
+private[frame4s] object ColumnarMaterialization:
+  def toRecordBatch(schema: Schema, batch: ColumnarBatch): Either[String, RecordBatch] =
+    val columns = Vector.newBuilder[ColumnArray]
+    var index = 0
+    var failure: Option[String] = None
+    while index < batch.columns.length && failure.isEmpty do
+      val vector = batch.columns(index)
+      val converted = toColumnArray(vector) match
+        case Right(value) => Right(value)
+        case Left(_)      => materialize(schema.fields(index).dataType, vector)
+      converted match
+        case Right(value) => columns += value
+        case Left(reason) => failure = Some(reason)
+      index += 1
+    failure match
+      case Some(reason) => Left(reason)
+      case None         =>
+        // RecordBatch derives its row count from the columns and validates width, types,
+        // lengths, and nullability against the schema, so a bridge mistake surfaces here as a
+        // structured error rather than as a silently malformed table.
+        RecordBatch(schema, columns.result()).left.map(_.message)
+
+  /** An empty validity array means "no nulls", which is what the builders already expect. */
+  private def toColumnArray(vector: ColumnarVector): Either[String, ColumnArray] =
+    val built: Option[Either[StorageError, ColumnArray]] = vector match
+      case Int32Values(values)               => Some(ColumnArray.int32(values))
+      case NullableInt32Values(values, valid) => Some(ColumnArray.int32(values, valid))
+      case Int64Values(values)               => Some(ColumnArray.int64(values))
+      case NullableInt64Values(values, valid) => Some(ColumnArray.int64(values, valid))
+      case Float32Values(values, valid)      => Some(ColumnArray.float32(values, valid))
+      case Float64Values(values, valid)      => Some(ColumnArray.float64(values, valid))
+      case Utf8Values(values)                => Some(ColumnArray.utf8(values))
+      case NullableUtf8Values(values, valid) => Some(ColumnArray.utf8(values, valid))
+      case _                                 => None
+    built match
+      case None         => Left(s"columnar vector ${vector.getClass.getSimpleName} has no batch form")
+      case Some(result) => result.left.map(_.message)
+
+  /** Generic fallback: rebuild a column from its scalars using the schema's declared type.
+    *
+    * Some vectors are views rather than storage -- a filter yields a `SelectedVector` holding
+    * an input plus a selection -- so there is no array to hand over directly. Reading through
+    * `scalar` costs more than a typed copy, but it is correct for every vector shape and the
+    * declared type, rather than a guess from the first non-null value, decides the result.
+    * That matters for an all-null column, which carries no evidence of its own type.
+    */
+  private def materialize(
+      dataType: DataType,
+      vector: ColumnarVector
+  ): Either[String, ColumnArray] =
+    val length = vector.length
+    val valid = new Array[Boolean](length)
+    var failure: Option[String] = None
+
+    def scalars(): Array[ScalarValue] =
+      val output = new Array[ScalarValue](length)
+      var index = 0
+      while index < length && failure.isEmpty do
+        vector.scalar(index) match
+          case Right(value) =>
+            output(index) = value
+            valid(index) = value != ScalarValue.Null
+          case Left(error) => failure = Some(error.message)
+        index += 1
+      output
+
+    val values = scalars()
+    failure match
+      case Some(reason) => Left(reason)
+      case None         =>
+        val built: Either[StorageError, ColumnArray] = dataType match
+          case DataType.Int32 =>
+            val output = new Array[Int](length)
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Int32(actual) => output(index) = actual
+                case _                         => ()
+              index += 1
+            ColumnArray.int32(output, valid)
+          case DataType.Int64 =>
+            val output = new Array[Long](length)
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Int64(actual) => output(index) = actual
+                case _                         => ()
+              index += 1
+            ColumnArray.int64(output, valid)
+          case DataType.Float32 =>
+            val output = new Array[Float](length)
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Float32(actual) => output(index) = actual
+                case _                           => ()
+              index += 1
+            ColumnArray.float32(output, valid)
+          case DataType.Float64 =>
+            val output = new Array[Double](length)
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Float64(actual) => output(index) = actual
+                case _                           => ()
+              index += 1
+            ColumnArray.float64(output, valid)
+          case DataType.Bool =>
+            val output = new Array[Boolean](length)
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Bool(actual) => output(index) = actual
+                case _                        => ()
+              index += 1
+            ColumnArray.bool(output, valid)
+          case DataType.Utf8 =>
+            // Null slots still need a non-null placeholder: the builder encodes every entry
+            // before the validity bitmap decides which ones count.
+            val output = Array.fill(length)("")
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Utf8(actual) => output(index) = actual
+                case _                        => ()
+              index += 1
+            ColumnArray.utf8(output, valid)
+          case DataType.Timestamp(unit) =>
+            val output = new Array[Long](length)
+            var index = 0
+            while index < length do
+              values(index) match
+                case ScalarValue.Timestamp(actual, _) => output(index) = actual
+                case _                                => ()
+              index += 1
+            ColumnArray.timestamp(output, unit, valid)
+        built.left.map(_.message)
+
 private[frame4s] object ColumnarInterpreter:
   def prepare(plan: LogicalPlan, sources: ReferenceSources): ColumnarExecution =
     val normalized = PlanNormalizer.normalize(plan).plan
@@ -26,6 +172,31 @@ private[frame4s] object ColumnarInterpreter:
         Left(SecondaryIndexError.UnsupportedKernel(kernel.name))
       case None =>
         Left(SecondaryIndexError.UnsupportedLogicalShape(plan.nodeName))
+
+  /** Materialize a plan with the optimized engine, or decline with a reason.
+    *
+    * A `Left` is never a failed query, only a statement that this engine will not answer it:
+    * the plan has no kernel, a kernel hit a capability residual, execution errored, or the
+    * result contains a vector with no batch form. The caller runs the semantic reference path
+    * instead, which stays the definition of correct behaviour. Declining is therefore always
+    * safe, and the reason is meant to be reported rather than swallowed.
+    */
+  def collectBatches(
+      plan: LogicalPlan,
+      sources: ReferenceSources
+  ): Either[String, Vector[RecordBatch]] =
+    val execution = prepare(plan, sources)
+    try
+      val run = execution.run()
+      run.receipt.fallback match
+        case Some(reason) => Left(reason)
+        case None         =>
+          run.result match
+            case Left(error)   => Left(error.message)
+            case Right(result) =>
+              try result.recordBatches
+              finally result.close()
+    finally execution.close()
 
   def columnChecksum(column: ColumnArray): Either[ExecutionError, Long] =
     ColumnarVector
@@ -143,6 +314,20 @@ final private[frame4s] class ColumnarResult private (
           row += 1
         batchIndex += 1
       error.toLeft(output.result())
+
+  /** Arrow batches for this result, or a residual naming the shape that has no batch form. */
+  def recordBatches: Either[String, Vector[RecordBatch]] =
+    if isClosed then Left("columnar result is closed")
+    else
+      val output = Vector.newBuilder[RecordBatch]
+      var index = 0
+      var failure: Option[String] = None
+      while index < batches.length && failure.isEmpty do
+        ColumnarMaterialization.toRecordBatch(schema, batches(index)) match
+          case Right(value) => output += value
+          case Left(reason) => failure = Some(reason)
+        index += 1
+      failure.toLeft(output.result())
 
   def checksum: Either[ExecutionError, Long] =
     if isClosed then Left(ExecutionError.Storage(StorageError.SourceClosed))
