@@ -180,6 +180,18 @@ adding workers adds concurrent random-access streams to the subsystem that is
 already the bottleneck. No partition count and no cheaper partition pass rescues
 this shape.
 
+**The redirection paid off: 1.70x on the fused streaming kernel.** Two further
+findings were needed, both only visible by measuring. Batch-level parallelism
+was a no-op, because a frame4s table is frequently a single `RecordBatch`
+holding every row, so splitting across batches handed one worker everything;
+work is now split into row chunks inside a batch. And the kernel was copying its
+own input, since `decodeBatch` called `ColumnarVector.copy` for a read-only
+scan. At 1,000,000 rows over ten iterations: 2027 +/- 97 us against 3442 us
+sequential, with allocation down from 12.0 to 8.0 MB/op. Chunk outputs are
+concatenated in order, so the row sequence and checksum are unchanged --
+verified bit-identical at both the 200,000-row scale tier and the ratified
+1,000-row tier.
+
 The conclusion is a redirection, not a smaller version of the same plan.
 Parallelism should go first to kernels that stream rather than chase pointers --
 filter, projection, arithmetic -- where access is sequential and bandwidth scales
@@ -216,7 +228,7 @@ starting position recorded above. Scouting measurements, not receipts.
 
 | Workload | Start | Now | Change |
 |---|---:|---:|---:|
-| fused filter/project | 6.12 | 3.19 | 1.92x |
+| fused filter/project | 6.12 | 2.03 | 3.02x |
 | grouped high cardinality | 53.5 | 45.1 | 1.19x |
 | one-to-one join | 100.9 | 89.1 | 1.13x |
 | grouped low cardinality | 10.62 | 10.56 | unchanged |
