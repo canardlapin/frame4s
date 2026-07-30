@@ -38,22 +38,39 @@ receipt. Milliseconds per operation:
 Allocation at 1,000,000 rows: fused pipeline 16 MB/op, grouped high cardinality
 113 MB/op, one-to-one join 111 MB/op.
 
-Two caveats travel with that table. pandas reaches a monotonic-key fast path on
-the court's `arange` join fixture, so its join column is not a general-case
-result. The primitive projection row is omitted entirely because Polars answers
-it with a refcount clone while frame4s materializes owned output; that shape is
-not comparable until the court states which contract it is ranking.
+Three caveats travel with that table, and all three are fixture weaknesses that
+flatter the comparators rather than frame4s. pandas reaches a monotonic-key fast
+path on the court's `arange` join fixture, so its join column is not a
+general-case result. The primitive projection row is omitted entirely because
+Polars answers it with a refcount clone while frame4s materializes owned output;
+that shape is not comparable until the court states which contract it is
+ranking, and `unionAll` needs the same scrutiny. The fused pipeline filters
+`id >= rows / 2` on a monotonic `id`, so the selected rows are a contiguous
+suffix and any engine with a slice or run-detection fast path wins it without
+doing the general work; a scattered-selection fixture is needed before that ratio
+is treated as a kernel comparison.
 
 The candidate is therefore slower than single-threaded pandas on three of five
 shapes at 1,000,000 rows, and 2–28x behind default Polars on four of five.
 
 ## Root causes
 
-1. **Per-element byte decode.** All numeric data lives in `Array[Byte]`.
-   `ColumnarInterpreter.scala:4634-4642` decodes every `Int` with four masked
-   loads, three shifts, and three ors, and every `Double` with that twice plus
-   `longBitsToDouble`. This forecloses auto-vectorization. The tightest
-   single-column fold reaches 3.3 GB/s against roughly 30 GB/s achievable.
+1. **Per-row interpretation inside the kernels.** ~~Per-element byte decode.~~
+   The original suspect was the `Array[Byte]` representation, which decodes
+   every `Int` with four masked loads and shifts. `DecodeBenchmarks` refutes
+   that: at 1,000,000 elements the shift decode costs 583 us against 557 us for
+   a native `Array[Int]`, a 4.6% penalty, because HotSpot already merges the
+   loads. The `Double` penalty is 37%. A `VarHandle` is actively harmful here --
+   Scala 3 does not intrinsify the signature-polymorphic call, so it boxes and
+   runs 14x slower than the code it would replace. The representation is not the
+   problem and must not be rewritten on this theory.
+
+   The real cost is that kernels interpret per row. `FusedInt32.evaluateBatch`
+   was 40.9% of runnable time, and for every element it paid a virtual `keep`
+   dispatch that re-matched the comparison operator, a `Vector` trie lookup to
+   reach the projection, a runtime type test to separate `Direct` from `Add`,
+   and an `Option` check in both loop conditions -- none of which depends on the
+   row.
 2. **No parallelism.** `modules/core` contains no `Thread`, `ForkJoin`,
    `Executor`, or `.par`. Polars gains 4.3–4.9x from threads on grouping and
    joins on this host, so single-threaded execution alone caps frame4s about 5x
@@ -94,12 +111,24 @@ against the real bar rather than the 1,000-row regime.
   shape or mark the zero-copy shape as an unranked lower bound, in the same way
   the court already handles Saddle's raw primitive scan.
 
-### Phase 1 — native arrays and VarHandle decode
+### Phase 1 — column-at-a-time kernels
 
-Remove the per-element decode. Add a JVM `byteArrayViewVarHandle` shim for
-single-instruction unaligned loads, with a Scala.js implementation behind the
-existing jvm/js source split, and native `Array[Double]`, `Array[Int]`, and
-`Array[Long]` fast paths so hot kernels vectorize. No public API change.
+Hoist every per-element dispatch out of the row loops. Plan structure moves into
+primitive arrays once per batch, the comparison operator is matched once and
+branches into specialized scans, and each output column gets its own monomorphic
+pass over a selection vector. Checked arithmetic stops branching per element: a
+checked `x + literal` overflows for some selected row exactly when it overflows
+at the minimum or maximum selected input, so the loop tracks those branch-free
+and tests the bound once, with a cold rescan to reproduce the exact row-major
+error. No public API change.
+
+Done for `FusedInt32`: 1.92x faster at 1,000,000 rows (6124 to 3191 us), 1.89x
+at 10,000 (63.2 to 33.4 us), and 25% less allocation (16.0 to 12.0 MB/op), with
+all 173 core and testkit tests and small-tier oracle parity unchanged. The same
+shape applies to the remaining kernels.
+
+Remaining allocation is dominated by the selection vector, one `Int` per input
+row per batch, which can be reused across batches rather than reallocated.
 
 ### Phase 2 — allocation, grouping, and joins
 

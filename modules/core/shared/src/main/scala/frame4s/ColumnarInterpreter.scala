@@ -4600,36 +4600,140 @@ final private case class FusedInt32(
 
     error match
       case Some(value) => Left(value)
-      case None        =>
-        val values = projections.map(_ => new Array[Int](batch.rowCount))
-        var outputRows = 0
-        var row = 0
-        while row < batch.rowCount && error.isEmpty do
-          val actual = decoded(filter.index).unsafeIntValue(row)
-          if filter.keep(actual) then
-            var projectionIndex = 0
-            while projectionIndex < projections.length && error.isEmpty do
-              val projection = projections(projectionIndex)
-              val input = decoded(projection.columnIndex).unsafeIntValue(row)
-              projection match
-                case Int32Projection.Direct(_, _) =>
-                  values(projectionIndex)(outputRows) = input
-                case Int32Projection.Add(_, literal, id) =>
-                  val result = input.toLong + literal.toLong
-                  if result < Int.MinValue.toLong || result > Int.MaxValue.toLong then
-                    error = Some(
-                      Left(ExecutionError.IntegerOverflow(id, BinaryOperator.Add))
-                    )
-                  else values(projectionIndex)(outputRows) = result.toInt
-              projectionIndex += 1
-            if error.isEmpty then outputRows += 1
+      case None        => project(batch, decoded)
+
+  /** Column-at-a-time evaluation of the fused filter, projection, and checked addition.
+    *
+    * The row-at-a-time shape this replaces paid, for every element, a virtual `keep`
+    * dispatch that re-matched the comparison operator, a `Vector` trie lookup to reach the
+    * projection, a runtime type test to tell `Direct` from `Add`, and an `Option` check in
+    * both loop conditions. None of that work depends on the row, so all of it is hoisted to
+    * once per batch and the remaining loops are monomorphic over primitive arrays.
+    *
+    * Overflow detection moves out of the inner loop too. A checked `x + literal` overflows
+    * for some selected row exactly when it overflows at the minimum or the maximum selected
+    * input, so the loop tracks those two values branch-free and the bound is tested once.
+    * The reported error must still be the one the row-at-a-time order would have produced,
+    * so the cold path rescans to find the first offending row.
+    */
+  private def project(
+      batch: RecordBatch,
+      decoded: Array[RawInt32Vector]
+  ): Either[Either[ExecutionError, String], ColumnarBatch] =
+    val rowCount = batch.rowCount
+    val projectionCount = projections.length
+    val sourceColumn = new Array[Int](projectionCount)
+    val addend = new Array[Int](projectionCount)
+    val checked = new Array[Boolean](projectionCount)
+    val identifiers = new Array[ExprId](projectionCount)
+    var index = 0
+    while index < projectionCount do
+      projections(index) match
+        case Int32Projection.Direct(column, id) =>
+          sourceColumn(index) = column
+          identifiers(index) = id
+        case Int32Projection.Add(column, literal, id) =>
+          sourceColumn(index) = column
+          addend(index) = literal
+          checked(index) = true
+          identifiers(index) = id
+      index += 1
+
+    // Pass one: materialize the selection vector with the comparison hoisted out of the row
+    // loop, so each branch is a tight monomorphic scan rather than a per-element match.
+    val filterValues = decoded(filter.index)
+    val selection = new Array[Int](rowCount)
+    var selected = 0
+    val literal = filter.literal
+    var row = 0
+    filter.operator match
+      case BinaryOperator.GreaterThan =>
+        while row < rowCount do
+          if filterValues.unsafeIntValue(row) > literal then
+            selection(selected) = row
+            selected += 1
           row += 1
-        error match
-          case Some(value) => Left(value)
-          case None        =>
-            val columns = values.map: buffer =>
-              Int32Values(java.util.Arrays.copyOf(buffer, outputRows))
-            Right(ColumnarBatch(columns, outputRows))
+      case BinaryOperator.GreaterThanOrEqual =>
+        while row < rowCount do
+          if filterValues.unsafeIntValue(row) >= literal then
+            selection(selected) = row
+            selected += 1
+          row += 1
+      case BinaryOperator.LessThan =>
+        while row < rowCount do
+          if filterValues.unsafeIntValue(row) < literal then
+            selection(selected) = row
+            selected += 1
+          row += 1
+      case BinaryOperator.LessThanOrEqual =>
+        while row < rowCount do
+          if filterValues.unsafeIntValue(row) <= literal then
+            selection(selected) = row
+            selected += 1
+          row += 1
+      case _ => ()
+
+    // Pass two: one monomorphic loop per output column over the selection vector.
+    val columns = new Array[ColumnarVector](projectionCount)
+    var overflowProjection = -1
+    var overflowRow = Int.MaxValue
+    var projectionIndex = 0
+    while projectionIndex < projectionCount do
+      val source = decoded(sourceColumn(projectionIndex))
+      val target = new Array[Int](selected)
+      if !checked(projectionIndex) then
+        var offset = 0
+        while offset < selected do
+          target(offset) = source.unsafeIntValue(selection(offset))
+          offset += 1
+      else
+        val literalValue = addend(projectionIndex)
+        var minimum = Int.MaxValue
+        var maximum = Int.MinValue
+        var offset = 0
+        while offset < selected do
+          val input = source.unsafeIntValue(selection(offset))
+          if input < minimum then minimum = input
+          if input > maximum then maximum = input
+          target(offset) = input + literalValue
+          offset += 1
+        val low = minimum.toLong + literalValue.toLong
+        val high = maximum.toLong + literalValue.toLong
+        if selected > 0 && (low < Int.MinValue.toLong || high > Int.MaxValue.toLong) then
+          // Projections are visited in order, so a strict improvement is the only way a
+          // later projection can win the tie-break that row-major order would have applied.
+          val first = firstOverflow(source, selection, selected, literalValue)
+          if first < overflowRow then
+            overflowRow = first
+            overflowProjection = projectionIndex
+      columns(projectionIndex) = Int32Values(target)
+      projectionIndex += 1
+
+    if overflowProjection >= 0 then
+      Left(
+        Left(
+          ExecutionError.IntegerOverflow(identifiers(overflowProjection), BinaryOperator.Add)
+        )
+      )
+    else Right(ColumnarBatch(columns.toVector, selected))
+
+  /** Cold path: the first selected offset whose checked addition overflows.
+    *
+    * Only reached once a batch is already known to fail, so it trades speed for reproducing
+    * the exact row-major error the row-at-a-time evaluation reported.
+    */
+  private def firstOverflow(
+      source: RawInt32Vector,
+      selection: Array[Int],
+      selected: Int,
+      literal: Int
+  ): Int =
+    var offset = 0
+    while offset < selected do
+      val result = source.unsafeIntValue(selection(offset)).toLong + literal.toLong
+      if result < Int.MinValue.toLong || result > Int.MaxValue.toLong then return offset
+      offset += 1
+    Int.MaxValue
 
 private def readInt(bytes: Array[Byte], offset: Int): Int =
   (bytes(offset) & 0xff) |
