@@ -39,6 +39,7 @@ object JoinPerformanceCourtRunner:
   )
 
   final private case class StageSample(
+      workload: String,
       sample: Int,
       stage: String,
       milliseconds: Double
@@ -144,40 +145,64 @@ object JoinPerformanceCourtRunner:
     state.rows = rows
     state.setup()
     try
-      var warmup = 0
-      while warmup < 10 do
-        val profiled = state.columnarJoinOne.profileRun()
-        val result =
-          profiled.run.result
-            .fold(error => throw new IllegalStateException(error.message), identity)
-        result.close()
-        warmup += 1
-
       val output = Vector.newBuilder[StageSample]
-      var sample = 1
-      var expectedChecksum: Option[Long] = None
-      while sample <= samples do
-        val profiled = state.columnarJoinOne.profileRun()
-        if profiled.run.receipt.fallback.nonEmpty then
-          throw new IllegalStateException("profiled join unexpectedly fell back")
-        val result =
-          profiled.run.result
-            .fold(error => throw new IllegalStateException(error.message), identity)
-        try
-          profiled.stages.foreach: timing =>
-            output += StageSample(sample, timing.stage, timing.nanoseconds.toDouble / 1e6)
-          val checksumStarted = System.nanoTime()
-          val checksum =
-            result.checksum.fold(error => throw new IllegalStateException(error.message), identity)
-          val checksumNanos = System.nanoTime() - checksumStarted
-          expectedChecksum match
-            case Some(expected) if expected != checksum =>
-              throw new IllegalStateException("profiled join checksum is nondeterministic")
-            case None => expectedChecksum = Some(checksum)
-            case _    => ()
-          output += StageSample(sample, "checksum", checksumNanos.toDouble / 1e6)
-        finally result.close()
-        sample += 1
+      val executions = Vector(
+        "joinOneToOne" -> state.columnarJoinOne,
+        "joinOneToMany" -> state.columnarJoinMany,
+        "joinSparse" -> state.columnarJoinSparse,
+        "joinSkewed" -> state.columnarJoinSkew,
+        "semiJoinSparse" -> state.columnarSemiSparse,
+        "antiJoinSparse" -> state.columnarAntiSparse
+      )
+      executions.foreach: (workload, execution) =>
+        var warmup = 0
+        while warmup < 10 do
+          val profiled = execution.profileRun()
+          val result =
+            profiled.run.result
+              .fold(error => throw new IllegalStateException(error.message), identity)
+          result.close()
+          warmup += 1
+
+        var sample = 1
+        var expectedChecksum: Option[Long] = None
+        while sample <= samples do
+          val profiled = execution.profileRun()
+          if profiled.run.receipt.fallback.nonEmpty then
+            throw new IllegalStateException(s"profiled $workload unexpectedly fell back")
+          val result =
+            profiled.run.result
+              .fold(error => throw new IllegalStateException(error.message), identity)
+          try
+            profiled.stages.foreach: timing =>
+              output += StageSample(
+                workload,
+                sample,
+                timing.stage,
+                timing.nanoseconds.toDouble / 1e6
+              )
+            val checksumStarted = System.nanoTime()
+            val checksum =
+              result.checksum.fold(
+                error => throw new IllegalStateException(error.message),
+                identity
+              )
+            val checksumNanos = System.nanoTime() - checksumStarted
+            expectedChecksum match
+              case Some(expected) if expected != checksum =>
+                throw new IllegalStateException(
+                  s"profiled $workload checksum is nondeterministic"
+                )
+              case None => expectedChecksum = Some(checksum)
+              case _    => ()
+            output += StageSample(
+              workload,
+              sample,
+              "checksum",
+              checksumNanos.toDouble / 1e6
+            )
+          finally result.close()
+          sample += 1
       output.result()
     finally state.tearDown()
 
@@ -250,23 +275,27 @@ object JoinPerformanceCourtRunner:
 
   private def writeStageSamples(receipt: Path, samples: Vector[StageSample]): Unit =
     val rows = samples.map: sample =>
-      f"${sample.sample}\t${sample.stage}\t${sample.milliseconds}%.6f"
+      f"${sample.workload}\t${sample.sample}\t${sample.stage}\t${sample.milliseconds}%.6f"
     write(
       receipt.resolve("raw/stages.tsv"),
-      ("sample\tstage\tmilliseconds" +: rows).mkString("", "\n", "\n")
+      ("workload\tsample\tstage\tmilliseconds" +: rows).mkString("", "\n", "\n")
     )
-    val totals = samples.groupMapReduce(_.sample)(_.milliseconds)(_ + _)
+    val totals =
+      samples.groupMapReduce(value => value.workload -> value.sample)(_.milliseconds)(_ + _)
     val summary = samples
-      .groupBy(_.stage)
+      .groupBy(value => value.workload -> value.stage)
       .toVector
       .sortBy(_._1)
-      .map: (stage, values) =>
+      .map: (key, values) =>
         val milliseconds = median(values.map(_.milliseconds))
-        val fractions = values.map(value => value.milliseconds / totals(value.sample))
-        f"$stage\t$milliseconds%.6f\t${median(fractions) * 100.0}%.3f"
+        val fractions = values.map: value =>
+          value.milliseconds / totals(value.workload -> value.sample)
+        f"${key._1}\t${key._2}\t$milliseconds%.6f\t${median(fractions) * 100.0}%.3f"
     write(
       receipt.resolve("stage-summary.tsv"),
-      ("stage\tmedian_milliseconds\tmedian_fraction_percent" +: summary)
+      (
+        "workload\tstage\tmedian_milliseconds\tmedian_fraction_percent" +: summary
+      )
         .mkString("", "\n", "\n")
     )
 
@@ -311,11 +340,11 @@ object JoinPerformanceCourtRunner:
         )(value => f"$value%.2fx")} | ${allocationRatio.fold("baseline")(value => f"$value%.3f")} |"
 
     val stageRows = stages
-      .groupBy(_.stage)
+      .groupBy(value => value.workload -> value.stage)
       .toVector
       .sortBy(_._1)
-      .map: (stage, values) =>
-        f"| $stage | ${median(values.map(_.milliseconds))}%.6f |"
+      .map: (key, values) =>
+        f"| ${key._1} | ${key._2} | ${median(values.map(_.milliseconds))}%.6f |"
     val decision = configuration.baseline match
       case None =>
         "This is the same-harness baseline; no optimization is admitted from this receipt."
@@ -342,10 +371,10 @@ object JoinPerformanceCourtRunner:
          @|---|---:|---:|---:|---:|---:|---:|
          @${rows.mkString("\n")}
          @
-         @## One-to-one stage attribution
+         @## Stage attribution
          @
-         @| Stage | Median ms |
-         @|---|---:|
+         @| Workload | Stage | Median ms |
+         @|---|---|---:|
          @${stageRows.mkString("\n")}
          @
          @Individual stage samples are in `raw/stages.tsv`; `stage-summary.tsv`

@@ -275,16 +275,31 @@ on the right-shuffled case, and faster on the both-shuffled case. The same
 separation grows at 4M: frame4s is 22.51x slower sorted and 0.76--0.80x pandas
 when shuffled.
 
-The measured next steps are:
+The first measured follow-up is complete. The
+[R5j.3 receipt](../benchmarks/receipts/2026-07-30-r5j-single-thread/admission.md)
+admits lazy duplicate tails, a cheaper hash mix, required-key build and
+existence probes, and single-batch selection addressing. Against commit
+`1293232`, all six shapes improve at both 1K and 1M; the 1M gains are
+1.24--1.69x and no allocation result regresses.
 
-1. Close the remaining 1.23--1.46x pinned-Polars losses on sparse, semi, anti,
-   and skewed joins without regressing the already-winning one-to-one path.
-2. Evaluate sorted merge join at adjacent sizes against the new shuffled
-   controls. Do not use it to claim hash-join improvement.
-3. Rebuild parallel probing around exact-size or segmented selections. At 1M,
+The adjacent-size court also prevents an overbroad parity claim. Seventeen of
+24 sparse, semi, anti, and skewed regimes meet the 1.05x pinned-Polars target.
+Anti passes throughout. Sparse misses only at 1M, semi changes winner with size
+and key order near parity, and skew retains a 1.13--1.40x large-row gap in three
+regimes. This is a shape-specific residual, not a universal 1M-row switch.
+
+The measured next steps are now:
+
+1. Evaluate sorted merge join at adjacent sizes against the shuffled controls.
+   Report it as a conditional sorted-key optimization, not a hash-join
+   improvement.
+2. Rebuild parallel probing around exact-size or segmented selections. At 1M,
    sequential build costs 13.60--14.69 ms and probe costs 14.26--15.12 ms, so
    probe parallelism can bring the default-thread ratio below 2x only if it
-   retains the 65.17 MB/op allocation result.
+   retains the admitted allocation result.
+3. Target the remaining large skewed regimes only after those broader levers
+   are measured; keep sparse and semi size/order misses visible as lower
+   bounds.
 4. Rerun the complete size/order court after each admitted kernel change and
    publish sorted pandas, shuffled pandas, pinned Polars, and default Polars as
    separate columns.

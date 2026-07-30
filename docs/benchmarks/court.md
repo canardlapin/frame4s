@@ -383,6 +383,28 @@ allocation-safe parallel probing the direct one-to-one lever. A sorted merge
 kernel is still legitimate, but it remains a separate conditional optimization
 whose win must hold at adjacent sizes without slowing the shuffled fixtures.
 
+## The residual single-thread gap is shape-specific
+
+The
+[R5j.3 single-thread receipt](receipts/2026-07-30-r5j-single-thread/admission.md)
+measures a narrower hash index and selection representation against the
+immediately preceding commit. With the same JMH command and 1 GiB heap, all six
+join shapes improve at both 1K and 1M. At 1M the median improvements are
+1.24--1.69x; allocation falls by 8--25% on five shapes and is unchanged on the
+skewed shape.
+
+The corresponding Polars court covers sparse, semi, anti, and skewed joins at
+256K, 1M, and 4M under both sorted and both-shuffled keys. Seventeen of 24
+regimes meet the 1.05x pinned-thread target. Anti passes every regime. Sparse
+passes at 256K and 4M but is 1.12--1.22x Polars at 1M. Semi changes winner with
+size and order and misses only by 1.06x and 1.11x. Skew is the persistent
+large-row residual, reaching 1.13--1.40x Polars in three regimes.
+
+There is therefore no general 1M-row regime switch. The remaining boundary is
+non-monotonic for sparse and semi joins and sustained only for large skewed
+joins. Those seven misses remain visible as the lower bound for the next
+single-thread work; they are not averaged into a parity claim.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than

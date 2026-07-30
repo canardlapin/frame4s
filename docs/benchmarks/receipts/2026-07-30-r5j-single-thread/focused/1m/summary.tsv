@@ -1,0 +1,7 @@
+workload	baseline_median_ms	candidate_median_ms	speedup	candidate_allocation_ratio
+antiJoinSparse	16.896521	12.881579	1.312	0.793
+joinOneToMany	35.876906	29.024012	1.236	0.884
+joinOneToOne	31.645622	21.504719	1.472	0.749
+joinSkewed	2.164692	1.281436	1.689	0.999
+joinSparse	15.384429	12.393231	1.241	0.897
+semiJoinSparse	16.532914	12.283631	1.346	0.916

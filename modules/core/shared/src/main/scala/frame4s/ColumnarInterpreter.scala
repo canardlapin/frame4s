@@ -1031,6 +1031,7 @@ final private case class SelectedVector(
 final private case class GatheredVector(
     batches: Vector[DecodedBatch],
     columnIndex: Int,
+    singleBatch: Boolean,
     selectedBatches: Array[Int],
     selectedRows: Array[Int],
     length: Int,
@@ -1047,7 +1048,7 @@ final private case class GatheredVector(
     else source(index).unsafeScalarHash(selectedRows(index))
 
   private def source(index: Int): ColumnarVector =
-    batches(selectedBatches(index)).columns(columnIndex)
+    batches(if singleBatch then 0 else selectedBatches(index)).columns(columnIndex)
 
   private def isValid(index: Int): Boolean =
     validity.forall(bytes => bit(bytes, index))
@@ -4235,8 +4236,11 @@ final private class JoinIntIndex(expectedRows: Int):
     value
   private val keys = new Array[Int](capacity)
   private val heads = filledIntArray(capacity, -1)
-  private val tails = filledIntArray(capacity, -1)
+  private var tails = Array.emptyIntArray
   private var duplicateNext = Array.emptyIntArray
+  private var distinctKeys = 0
+  private var singletonKey = 0
+  private var singletonHead = -1
 
   def add(key: Int, row: Int): Unit =
     var slot = mix(key) & (capacity - 1)
@@ -4244,26 +4248,32 @@ final private class JoinIntIndex(expectedRows: Int):
     if heads(slot) < 0 then
       keys(slot) = key
       heads(slot) = row
-      tails(slot) = row
+      distinctKeys += 1
+      if distinctKeys == 1 then
+        singletonKey = key
+        singletonHead = row
     else
       if duplicateNext.isEmpty then duplicateNext = filledIntArray(expectedRows, -1)
-      duplicateNext(tails(slot)) = row
+      if tails.isEmpty then tails = filledIntArray(capacity, -1)
+      val previous = if tails(slot) >= 0 then tails(slot) else heads(slot)
+      duplicateNext(previous) = row
       tails(slot) = row
 
   def first(key: Int): Int =
-    var slot = mix(key) & (capacity - 1)
-    while heads(slot) >= 0 && keys(slot) != key do slot = (slot + 1) & (capacity - 1)
-    heads(slot)
+    if distinctKeys == 1 then if key == singletonKey then singletonHead else -1
+    else
+      var slot = mix(key) & (capacity - 1)
+      var head = heads(slot)
+      while head >= 0 && keys(slot) != key do
+        slot = (slot + 1) & (capacity - 1)
+        head = heads(slot)
+      head
 
   def next(row: Int): Int =
     if duplicateNext.isEmpty then -1 else duplicateNext(row)
 
   private def mix(value: Int): Int =
-    var hash = value
-    hash ^= hash >>> 16
-    hash *= 0x7feb352d
-    hash ^= hash >>> 15
-    hash *= 0x846ca68b
+    val hash = value * 0x9e3779b9
     hash ^ (hash >>> 16)
 
 final private case class HashJoinBuild(
@@ -4379,13 +4389,22 @@ final private case class HashJoin(
       right(batchIndex).columns(rightKey) match
         case key: RawInt32Vector =>
           var row = 0
-          while row < right(batchIndex).rowCount do
-            if !singleBatch then
-              rightBatch(global) = batchIndex
-              rightRow(global) = row
-            if key.unsafeValid(row) then index.add(key.unsafeIntValue(row), global)
-            global += 1
-            row += 1
+          if key.required then
+            while row < right(batchIndex).rowCount do
+              if !singleBatch then
+                rightBatch(global) = batchIndex
+                rightRow(global) = row
+              index.add(key.unsafeIntValue(row), global)
+              global += 1
+              row += 1
+          else
+            while row < right(batchIndex).rowCount do
+              if !singleBatch then
+                rightBatch(global) = batchIndex
+                rightRow(global) = row
+              if key.unsafeValid(row) then index.add(key.unsafeIntValue(row), global)
+              global += 1
+              row += 1
         case _ =>
           error = Some(
             ExecutionError.UnsupportedNode("hash join right key is not plain Int32")
@@ -4408,7 +4427,9 @@ final private case class HashJoin(
     val selections =
       new JoinSelectionBuilder(
         RightSelectionMode.forJoin(columns, kind),
-        expectedOutput
+        expectedOutput,
+        leftSingleBatch = left.length == 1,
+        rightSingleBatch = built.singleBatch
       )
     var batchIndex = 0
     var error: Option[ExecutionError] = None
@@ -4436,33 +4457,72 @@ final private case class HashJoin(
   ): Option[ExecutionError] =
     leftBatch.columns(leftKey) match
       case key: RawInt32Vector =>
-        var row = from
-        val existence = kind == JoinKind.LeftSemi || kind == JoinKind.LeftAnti
-        while row < until do
-          var candidate =
-            if key.unsafeValid(row) then built.index.first(key.unsafeIntValue(row))
-            else -1
-          val matched = candidate >= 0
-          if existence then
-            val emit =
-              (kind == JoinKind.LeftSemi && matched) ||
-                (kind == JoinKind.LeftAnti && !matched)
-            if emit then selections.appendLeftOnly(batchIndex, row)
-          else
-            while candidate >= 0 do
-              selections.appendMatched(
-                batchIndex,
-                row,
-                built.batch(candidate),
-                built.row(candidate)
-              )
-              candidate = built.index.next(candidate)
-          if !existence && !matched && kind == JoinKind.LeftOuter then
-            selections.appendLeftOnly(batchIndex, row)
-          row += 1
+        kind match
+          case JoinKind.Inner | JoinKind.LeftOuter =>
+            var row = from
+            while row < until do
+              var candidate =
+                if key.unsafeValid(row) then built.index.first(key.unsafeIntValue(row))
+                else -1
+              val matched = candidate >= 0
+              while candidate >= 0 do
+                selections.appendMatched(
+                  batchIndex,
+                  row,
+                  built.batch(candidate),
+                  built.row(candidate)
+                )
+                candidate = built.index.next(candidate)
+              if !matched && kind == JoinKind.LeftOuter then
+                selections.appendLeftOnly(batchIndex, row)
+              row += 1
+          case JoinKind.LeftSemi =>
+            probeLeftSemi(key, batchIndex, from, until, built, selections)
+          case JoinKind.LeftAnti =>
+            probeLeftAnti(key, batchIndex, from, until, built, selections)
         None
       case _ =>
         Some(ExecutionError.UnsupportedNode("hash join left key is not plain Int32"))
+
+  private def probeLeftSemi(
+      key: RawInt32Vector,
+      batchIndex: Int,
+      from: Int,
+      until: Int,
+      built: HashJoinBuild,
+      selections: JoinSelectionBuilder
+  ): Unit =
+    var row = from
+    if key.required then
+      while row < until do
+        if built.index.first(key.unsafeIntValue(row)) >= 0 then
+          selections.appendLeftOnly(batchIndex, row)
+        row += 1
+    else
+      while row < until do
+        if key.unsafeValid(row) && built.index.first(key.unsafeIntValue(row)) >= 0 then
+          selections.appendLeftOnly(batchIndex, row)
+        row += 1
+
+  private def probeLeftAnti(
+      key: RawInt32Vector,
+      batchIndex: Int,
+      from: Int,
+      until: Int,
+      built: HashJoinBuild,
+      selections: JoinSelectionBuilder
+  ): Unit =
+    var row = from
+    if key.required then
+      while row < until do
+        if built.index.first(key.unsafeIntValue(row)) < 0 then
+          selections.appendLeftOnly(batchIndex, row)
+        row += 1
+    else
+      while row < until do
+        if !key.unsafeValid(row) || built.index.first(key.unsafeIntValue(row)) < 0 then
+          selections.appendLeftOnly(batchIndex, row)
+        row += 1
 
   def materialize(
       left: Vector[DecodedBatch],
@@ -4479,6 +4539,7 @@ final private case class HashJoin(
             GatheredVector(
               left,
               index,
+              selected.leftSingleBatch,
               selected.leftBatches,
               selected.leftRows,
               selected.length,
@@ -4488,6 +4549,7 @@ final private case class HashJoin(
             GatheredVector(
               right,
               index,
+              selected.rightSingleBatch,
               selected.rightBatches,
               selected.rightRows,
               selected.length,
@@ -4502,8 +4564,10 @@ final private case class HashJoin(
         )
 
 final private case class JoinSelection(
+    leftSingleBatch: Boolean,
     leftBatches: Array[Int],
     leftRows: Array[Int],
+    rightSingleBatch: Boolean,
     rightBatches: Array[Int],
     rightRows: Array[Int],
     rightValidity: Option[Array[Byte]],
@@ -4530,13 +4594,18 @@ private object RightSelectionMode:
 
 final private class JoinSelectionBuilder(
     rightMode: RightSelectionMode,
-    initialCapacity: Int = 16
+    initialCapacity: Int = 16,
+    leftSingleBatch: Boolean = false,
+    rightSingleBatch: Boolean = false
 ):
   private val boundedInitialCapacity = math.max(0, initialCapacity)
-  private var leftBatches = new Array[Int](boundedInitialCapacity)
+  private var leftBatches =
+    if leftSingleBatch then Array.emptyIntArray
+    else new Array[Int](boundedInitialCapacity)
   private var leftRows = new Array[Int](boundedInitialCapacity)
   private var rightBatches =
-    if rightMode != RightSelectionMode.Absent then new Array[Int](boundedInitialCapacity)
+    if rightMode != RightSelectionMode.Absent && !rightSingleBatch then
+      new Array[Int](boundedInitialCapacity)
     else Array.emptyIntArray
   private var rightRows =
     if rightMode != RightSelectionMode.Absent then new Array[Int](boundedInitialCapacity)
@@ -4549,7 +4618,7 @@ final private class JoinSelectionBuilder(
 
   def appendLeftOnly(leftBatch: Int, leftRow: Int): Unit =
     ensureCapacity(length + 1)
-    leftBatches(length) = leftBatch
+    if !leftSingleBatch then leftBatches(length) = leftBatch
     leftRows(length) = leftRow
     length += 1
 
@@ -4560,10 +4629,10 @@ final private class JoinSelectionBuilder(
       rightRow: Int
   ): Unit =
     ensureCapacity(length + 1)
-    leftBatches(length) = leftBatch
+    if !leftSingleBatch then leftBatches(length) = leftBatch
     leftRows(length) = leftRow
     if rightMode != RightSelectionMode.Absent then
-      rightBatches(length) = rightBatch
+      if !rightSingleBatch then rightBatches(length) = rightBatch
       rightRows(length) = rightRow
       if rightMode == RightSelectionMode.Nullable then
         val byte = length >>> 3
@@ -4572,8 +4641,10 @@ final private class JoinSelectionBuilder(
 
   def result(): JoinSelection =
     new JoinSelection(
+      leftSingleBatch,
       leftBatches,
       leftRows,
+      rightSingleBatch,
       rightBatches,
       rightRows,
       Option.when(rightMode == RightSelectionMode.Nullable)(rightValidity),
@@ -4583,10 +4654,10 @@ final private class JoinSelectionBuilder(
   private def ensureCapacity(required: Int): Unit =
     if required > leftRows.length then
       val next = math.max(required, leftRows.length * 2)
-      leftBatches = java.util.Arrays.copyOf(leftBatches, next)
+      if !leftSingleBatch then leftBatches = java.util.Arrays.copyOf(leftBatches, next)
       leftRows = java.util.Arrays.copyOf(leftRows, next)
       if rightMode != RightSelectionMode.Absent then
-        rightBatches = java.util.Arrays.copyOf(rightBatches, next)
+        if !rightSingleBatch then rightBatches = java.util.Arrays.copyOf(rightBatches, next)
         rightRows = java.util.Arrays.copyOf(rightRows, next)
       if rightMode == RightSelectionMode.Nullable then
         rightValidity = java.util.Arrays.copyOf(rightValidity, (next + 7) >>> 3)
@@ -4630,7 +4701,9 @@ final private class PreparedHashJoin private (
   ): Either[ExecutionError, ColumnarResult] =
     val selections =
       new JoinSelectionBuilder(
-        RightSelectionMode.forJoin(join.columns, join.kind)
+        RightSelectionMode.forJoin(join.columns, join.kind),
+        leftSingleBatch = left.length == 1,
+        rightSingleBatch = right.length == 1
       )
     var batchIndex = 0
     var error: Option[ExecutionError] = None
