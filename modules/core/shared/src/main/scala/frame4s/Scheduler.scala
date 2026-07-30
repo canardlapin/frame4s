@@ -30,20 +30,35 @@ private[frame4s] object SequentialScheduler extends Scheduler:
       tasks(index).run()
       index += 1
 
-/** Policy for splitting work, and one measured lesson about how not to.
+/** Policy for splitting work, and a measured lesson about which kernels are worth splitting.
   *
-  * A partitioned grouped aggregation was built on this and rejected. Each of P workers owned
-  * a share of the key space and scanned every row to find its own, which divides the
-  * accumulate work by P but multiplies the scan by P. At 1,000,000 rows and a million groups
-  * it measured 124.3 ms with 16 partitions and 53.9 ms with 4, against 45.1 ms sequential --
-  * a loss at every count, because scanning is not the cheap part once the hash table no
-  * longer fits in cache.
+  * Two partitioned grouped aggregations were built on this and both rejected. The first let
+  * every worker scan every row to find the keys it owned, which divides the accumulate work
+  * by P but multiplies the scan by P. The second fixed that with a counting-sort partition
+  * pass, so each row is visited exactly once per phase. It made almost no difference, which
+  * is the useful part of the result. High-cardinality grouping at 1,000,000 rows, against
+  * 45.1 ms sequential:
   *
-  * The determinism half of that design was sound and should be reused: partitioning by key
-  * rather than by row means every row of a group is folded by one worker in input order, so
-  * floating sums stay bit-identical instead of merely close, which a row split could never
-  * offer. What it needs is a partition pass that visits each row once and materializes
-  * per-partition row lists, so the scan is divided rather than duplicated.
+  *   partitions   1      2      4      16
+  *   duplicated scan     --     50.2   53.9   124.3 ms
+  *   single scan  --     50.2   --     122.4 ms
+  *
+  * Time rises monotonically with worker count. A million-group build is bound by random
+  * access latency into a table far larger than cache, not by compute, and adding workers adds
+  * concurrent random-access streams to a memory subsystem that is already the bottleneck.
+  * More threads make it worse rather than merely failing to help. No partition count, and no
+  * cheaper partition pass, rescues this shape; the data structure has to change first.
+  *
+  * The implication is that parallelism should go first to kernels that stream rather than
+  * chase pointers -- filter, projection, arithmetic -- where access is sequential and
+  * bandwidth scales with cores. Grouping and joins need a more compact, cache-resident table
+  * before threading them is worth attempting again.
+  *
+  * The determinism design was verified and should be reused when that happens: partitioning
+  * by key rather than by row keeps every row of a group on one worker in input order, so
+  * floating sums stay bit-identical instead of merely close, and recovering output order
+  * needs only each group's first-seen input ordinal and a merge across partitions. Checked
+  * end to end at 200,000 rows against a pre-parallelism receipt, floating aggregates included.
   */
 private[frame4s] object Parallelism:
   /** Rows below which splitting costs more than it saves.

@@ -163,9 +163,30 @@ million groups: 124.3 ms with 16 partitions, 53.9 ms with 4, against 45.1 ms
 sequential. A loss at every count, because scanning is not the cheap part once
 the hash table stops fitting in cache. Reverted; only the `Scheduler` remains.
 
-The correct shape is a partition pass that visits each row once and materializes
-per-partition row lists, so the scan is divided rather than duplicated, followed
-by per-partition aggregation and the first-seen merge. That is the next slice.
+**Second attempt also rejected, and it is the more informative failure.** The
+counting-sort partition pass was built, so each row is visited exactly once per
+phase and the scan is divided rather than duplicated. It measured 122.4 ms
+against the first attempt's 124.3 ms: essentially no change. High-cardinality
+grouping at 1,000,000 rows, against 45.1 ms sequential:
+
+| Partitions | 2 | 4 | 16 |
+|---|---:|---:|---:|
+| duplicated scan | 50.2 ms | 53.9 ms | 124.3 ms |
+| single scan | 50.2 ms | -- | 122.4 ms |
+
+Time rises monotonically with worker count. A million-group build is bound by
+random access latency into a table far larger than cache, not by compute, so
+adding workers adds concurrent random-access streams to the subsystem that is
+already the bottleneck. No partition count and no cheaper partition pass rescues
+this shape.
+
+The conclusion is a redirection, not a smaller version of the same plan.
+Parallelism should go first to kernels that stream rather than chase pointers --
+filter, projection, arithmetic -- where access is sequential and bandwidth scales
+with cores. Grouping and joins need a more compact, cache-resident table before
+threading them is worth attempting again. Note that Polars' own single-threaded
+grouping is 37.6 ms against our 45.1, so its 4.3x threading win comes from a
+table design we do not have, not from threading a table like ours.
 
 Note also that the two low-cardinality grouping workloads key on `Utf8`, not
 `Int32`, so they run a different accumulator and were never touched by this
