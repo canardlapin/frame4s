@@ -188,8 +188,10 @@ def write_receipt(args: argparse.Namespace) -> None:
     metrics: list[dict[str, object]] = []
     validations: list[dict[str, object]] = []
     threads = pl.thread_pool_size()
-    if threads != 1:
-        raise RuntimeError(f"Polars thread pool is {threads}; expected 1")
+    if args.expected_threads is not None and threads != args.expected_threads:
+        raise RuntimeError(
+            f"Polars thread pool is {threads}; expected {args.expected_threads}"
+        )
 
     for rows in args.sizes:
         for workload in args.workloads:
@@ -281,6 +283,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sizes", default="256000,1000000,4000000")
     parser.add_argument("--workloads", default=",".join(WORKLOADS))
     parser.add_argument("--orders", default=",".join(ORDERS))
+    parser.add_argument("--expected-threads", type=int)
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
     args.sizes = [int(value) for value in args.sizes.split(",") if value]

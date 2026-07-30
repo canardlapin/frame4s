@@ -303,17 +303,20 @@ allocation within 0.1% of sequential. The exact-sizing second pass also makes
 sparse, skewed, semi, and anti joins 2.39--5.30x faster at the large tiers,
 with allocation within 0.2%.
 
-The default-thread one-to-one gap is now 0.99--1.09x at 1M and 1.18--1.30x at
-4M using the previously recorded Polars comparator. The final measured steps
-are:
+The
+[final parity court](../benchmarks/receipts/2026-07-30-r5j-final-parity/admission.md)
+is complete. Fresh results put shuffled one-to-one at 0.36--0.42x pandas,
+0.23--0.24x pinned Polars, and 1.18--1.19x default Polars at 1M. At 4M it is
+0.31--0.38x pandas, 0.30--0.31x pinned Polars, and 1.23--1.26x default Polars.
+Sorted pandas remains 4.72--4.91x faster and is reported separately as a merge
+comparison.
 
-1. Rerun the complete size/order and join-shape courts and publish sorted
-   pandas, shuffled pandas, pinned Polars, and default Polars as separate
-   columns.
-2. Target any remaining default-thread large-shape losses shown by that court;
-   do not reopen single-thread specializations that already pass.
-3. Preserve the explicit sorted-merge and shuffled-hash claim boundary in the
-   final comparison.
+All 24 sparse, skewed, semi, and anti regimes beat pinned Polars. Twenty are
+within 2x default Polars. The four documented boundaries are sorted sparse and
+semi at 256K, where sequential merge setup has not amortized, and skew at 4M,
+where the workload scans 4M left rows to emit 1K. The program therefore exits
+with its pinned, shuffled-pandas, and one-to-one default-thread targets met and
+the remaining default-thread losses explicit.
 
 ## Earlier standing, at 1,000,000 rows
 

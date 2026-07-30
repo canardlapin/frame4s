@@ -445,6 +445,29 @@ it is 0.99--1.09x at 1M and 1.18--1.30x at 4M. These cross-receipt ratios state
 the current standing; the final publication court reruns the comparators before
 certification.
 
+## Final join standing
+
+The
+[final parity receipt](receipts/2026-07-30-r5j-final-parity/admission.md)
+reruns frame4s, pandas 3.0.1, pinned Polars 1.43.1, and default 14-thread Polars
+against the admitted code and identical deterministic fixtures.
+
+At 1M, shuffled one-to-one frame4s takes 9.82--9.85 ms: 0.36--0.42x pandas,
+0.23--0.24x pinned Polars, and 1.18--1.19x default Polars. At 4M it is
+0.31--0.38x pandas, 0.30--0.31x pinned Polars, and 1.23--1.26x default Polars.
+Sorted frame4s remains 4.72--4.91x slower than pandas' merge path, while taking
+0.22x pinned Polars and 1.18x default Polars at 1M and 0.18x/0.76x at 4M.
+
+All 24 sparse, skewed, semi, and anti size/order regimes beat pinned Polars.
+Twenty are within 2x default Polars. The visible exceptions are sorted sparse
+and semi at 256K, where sequential merge setup has not amortized, and skewed
+joins at 4M, where 4M left rows are scanned to emit 1K rows. Those are the
+documented architectural boundary, not hidden losses.
+
+The final consumption court keeps construction and checksum endpoints separate.
+At 1M the checksum share ranges from 5.0% for skew to 72.3% for one-to-one.
+Comparator ratios use construction only.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than

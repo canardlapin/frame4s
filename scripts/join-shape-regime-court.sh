@@ -39,6 +39,15 @@ sbt "benchmarks/Jmh/runMain frame4s.benchmarks.JoinShapeRegimeCourtRunner --rece
 POLARS_MAX_THREADS=1 uv run --with 'numpy==2.5.1' --with 'polars==1.43.1' \
   python scripts/join-shape-regime-court.py \
   --receipt "$receipt/polars-pinned" \
+  --expected-threads 1 \
+  --sizes "$sizes" \
+  --workloads "$workloads" \
+  --orders "$orders" \
+  $quick_flag
+
+env -u POLARS_MAX_THREADS uv run --with 'numpy==2.5.1' --with 'polars==1.43.1' \
+  python scripts/join-shape-regime-court.py \
+  --receipt "$receipt/polars-default" \
   --sizes "$sizes" \
   --workloads "$workloads" \
   --orders "$orders" \
@@ -47,4 +56,5 @@ POLARS_MAX_THREADS=1 uv run --with 'numpy==2.5.1' --with 'polars==1.43.1' \
 python3 scripts/join-shape-regime-summary.py \
   --receipt "$receipt" \
   --frame4s "$receipt/frame4s" \
-  --polars "$receipt/polars-pinned"
+  --polars-pinned "$receipt/polars-pinned" \
+  --polars-default "$receipt/polars-default"
