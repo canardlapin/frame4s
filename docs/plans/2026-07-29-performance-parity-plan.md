@@ -243,6 +243,40 @@ than concentrated in one hot spot. The largest untouched lever is Phase 3:
 Polars gains 4.3--4.9x from threads on grouping and joins on this host, and no
 amount of single-threaded kernel work closes that.
 
+## Measured position against Polars, 1,000,000 rows
+
+From the committed
+[scale receipt](../benchmarks/receipts/2026-07-30-scale-1m/summary.md) and the
+[Polars receipts](../benchmarks/receipts/2026-07-30-polars-1m/default/summary.md).
+Ratio is frame4s over Polars, so below 1.00 means frame4s is faster.
+
+| Ranked workload | vs Polars, 1 thread | vs Polars, 14 threads |
+|---|---:|---:|
+| grouped low cardinality, four statistics | **0.43x** | 2.15x |
+| distinct low cardinality | **0.77x** | 3.40x |
+| grouped low cardinality, sum only | 1.29x | 4.86x |
+| semi join sparse | 1.68x | 4.55x |
+| one-to-one join | 1.94x | 10.80x |
+| sparse join | 2.02x | 6.00x |
+| anti join sparse | 2.19x | 5.27x |
+| one-to-many join | 2.32x | 10.76x |
+| skewed join | 2.62x | 6.35x |
+| fused filter/project | 15.97x | 12.30x |
+
+Two workloads beat single-threaded Polars. None beats default-threaded Polars,
+which is the bar a user actually meets. The gap is widest exactly where the
+earlier phases already showed it: joins, and the fused pipeline whose fixture
+selects a contiguous suffix and so rewards a slice fast path.
+
+An open discrepancy travels with this: the fused pipeline measures 3.165 ms in
+the full-court receipt and 2.03 ms in isolation, at identical allocation, so it
+is the same code path. Warmup does not explain it, since isolated runs at the
+court's own three-iteration warmup also produced roughly 2 ms, and JMH forks
+each benchmark separately so cross-benchmark JIT pollution is ruled out. What
+remains is the court's 8 GiB pre-touched heap and its second timing mode. The
+receipt number stands until that is understood, because it is what the committed
+harness produces.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than
