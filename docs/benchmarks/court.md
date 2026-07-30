@@ -501,6 +501,27 @@ primitive payloads of approximately 24 MB and 96 MB. Future join parity claims
 must report gather-view construction, deep materialization, and matched
 consumption separately.
 
+The
+[R5k.2 anti-fitting court](receipts/2026-07-30-r5k2-antifit-regimes/admission.md)
+freezes the pre-optimization behavior over ten workloads from 1K through 1M
+rows and nine feasible workloads at 4M. Expected output comes from independent
+closed-form match maps with row-distinct payloads. All 69 configurations match
+their exact cardinality and ordered checksum.
+
+The dispatch boundary is now measured rather than assumed. Every workload uses
+hash below 16,384 rows. At 64K, sorted aligned, offset, interleaved, disjoint,
+duplicate, and multi-batch inputs use merge; sparse remains hash because its
+right side is only 6,400 rows. At 256K and above, every non-null sorted shape
+uses merge. Nullable, shuffled, and final-key-inversion inputs remain hash.
+This demonstrates that merge dispatch generalizes beyond the aligned fixture.
+
+It also confirms that physical output, not identity fitting, is the main sorted
+target. At 1M aligned rows, gather-view construction takes 22.666 ms and
+allocates 32.01 MB, while deep output takes 140.896 ms and allocates 204.02 MB.
+At 4M those values are 86.312 ms/128.02 MB and 654.683 ms/816.04 MB. R5k.3
+must improve typed materialization while preserving the frozen shuffled,
+nullable, late-inversion, small-tier, and multi-batch baselines.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than

@@ -348,6 +348,23 @@ physical output without scalar boxing while retaining range-based sorted
 selection. R5k.2 establishes the anti-fitting and fallback matrix before that
 implementation is judged.
 
+That
+[R5k.2 matrix](../benchmarks/receipts/2026-07-30-r5k2-antifit-regimes/admission.md)
+is now ratified. It covers ten deterministic shapes from 1K through 1M and nine
+at 4M with independent cardinality and ordered-checksum oracles. Offset,
+interleaved, disjoint, duplicate, sparse, and multi-batch sorted inputs all
+reach merge once both sides cross the 16,384-row threshold. Nullable,
+fully-shuffled, and final-key-inversion inputs remain on hash. This is the
+anti-fitting evidence required before changing the sorted implementation.
+
+The matrix reinforces the implementation order. At 1M aligned rows,
+gather-view construction is 22.666 ms/32.01 MB but deep physical output is
+140.896 ms/204.02 MB. At 4M it is 86.312 ms/128.02 MB versus
+654.683 ms/816.04 MB. R5k.3 therefore targets typed gather materialization
+first, then representation/probe refinements that survive the same matrix.
+Large shuffled latency is capped at 1.03x the frozen baseline, small tiers at
+1.05x, and fallback allocation at 1.05x.
+
 ## Earlier standing, at 1,000,000 rows
 
 Single-threaded frame4s candidate, milliseconds per operation, against the

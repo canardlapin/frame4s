@@ -852,6 +852,57 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       uniqueRightInput.close()
       duplicateRightInput.close()
 
+  test("a late key inversion rejects merge dispatch and preserves stable hash output"):
+    type Left = (key: Int, leftValue: Long)
+    type Right = (rightKey: Int, rightValue: Long)
+    val rows = 16384
+    val leftRef = reference("columnar-late-inversion-left")
+    val rightRef = reference("columnar-late-inversion-right")
+    val leftRows = Vector.tabulate(rows): key =>
+      (key = key, leftValue = key.toLong * 3L)
+    val rightRows = Vector.tabulate(rows): row =>
+      val key =
+        if row == rows - 2 then rows - 1
+        else if row == rows - 1 then rows - 2
+        else row
+      (rightKey = key, rightValue = row.toLong * 5L)
+    val leftInput = table[Left](leftRows, batchSize = 257)
+    val rightInput = table[Right](rightRows, batchSize = 509)
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val joined =
+      left.innerJoin(right)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val execution = ColumnarInterpreter.prepare(joined.plan, sources)
+    var expectedChecksum = rows.toLong
+    var key = 0
+    while key < rows do
+      val rightRow =
+        if key == rows - 2 then rows - 1
+        else if key == rows - 1 then rows - 2
+        else key
+      expectedChecksum = expectedChecksum * 31L + key.toLong
+      expectedChecksum = expectedChecksum * 31L + key.toLong * 3L
+      expectedChecksum = expectedChecksum * 31L + key.toLong
+      expectedChecksum = expectedChecksum * 31L + rightRow.toLong * 5L
+      key += 1
+
+    try
+      (0 until 3).foreach: _ =>
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        try
+          assert(!profiled.stages.exists(_.stage == "merge-probe"))
+          assert(profiled.stages.exists(_.stage == "build"))
+          assertEquals(result.rowCount, rows.toLong)
+          assertEquals(value(result.checksum), expectedChecksum)
+        finally result.close()
+    finally
+      execution.close()
+      leftInput.close()
+      rightInput.close()
+
   test("sorted merge preserves sparse kinds and falls back for nullable and empty keys"):
     type Left = (key: Int, leftValue: Long)
     type Right = (rightKey: Int, rightValue: Long)
