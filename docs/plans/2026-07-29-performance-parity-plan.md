@@ -139,6 +139,40 @@ inflating every timed region, and re-run the affected receipts.
 
 ### Phase 3 — parallel execution
 
+Decided: a `Scheduler` abstraction in `frame4s-core`, with a frame4s-owned
+`ForkJoinPool` on the JVM and a sequential implementation on Scala.js. A
+dedicated pool rather than `commonPool` so a neighbouring library's parallel
+stream cannot starve query execution; work stealing because the court's skewed
+fixtures are deliberately lopsided. Virtual threads and `StructuredTaskScope`
+were rejected as the wrong tool -- they address blocking I/O, and CPU-bound work
+multiplexed onto a carrier pool gains nothing. `frame4s-fs2` can inject a
+cats-effect-backed `Scheduler` later so those users unify pools.
+
+**Determinism is the binding constraint, not the pool.** Parallel float
+reduction reassociates additions and would change every ratified checksum.
+Partitioning by key rather than by row keeps every row of a group on one worker
+in input order, so results stay bit-identical; output order is recovered by
+recording each group's first-seen input ordinal and merging partitions on it.
+This was verified end to end at 200,000 rows against a pre-parallelism receipt:
+bit-identical, floating aggregates included.
+
+**First attempt rejected on measurement.** Giving each of P workers a share of
+the key space and having it scan every row to find its own divides the
+accumulate work by P but multiplies the scan by P. At 1,000,000 rows and a
+million groups: 124.3 ms with 16 partitions, 53.9 ms with 4, against 45.1 ms
+sequential. A loss at every count, because scanning is not the cheap part once
+the hash table stops fitting in cache. Reverted; only the `Scheduler` remains.
+
+The correct shape is a partition pass that visits each row once and materializes
+per-partition row lists, so the scan is divided rather than duplicated, followed
+by per-partition aggregation and the first-seen merge. That is the next slice.
+
+Note also that the two low-cardinality grouping workloads key on `Utf8`, not
+`Int32`, so they run a different accumulator and were never touched by this
+attempt.
+
+### Phase 3 notes (original)
+
 Morsel-parallel scan, grouped aggregation, and join build/probe. `frame4s-core`
 must stay dependency-free and cross-built, so parallelism belongs behind a
 platform-specific scheduler abstraction with a sequential Scala.js
