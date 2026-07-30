@@ -3104,6 +3104,14 @@ final private class IntGroupIndex:
   private var keys = new Array[Int](32)
   private var groups = filledIntArray(32, -1)
   private var size = 0
+  private var projected = 0
+
+  /** Tell the index how many groups the caller now expects, so growth can skip ahead.
+    *
+    * Advisory only: the index still grows on demand if the estimate is low.
+    */
+  def hintCapacity(expected: Int): Unit =
+    if expected > projected then projected = expected
 
   def find(key: Int): Int =
     var slot = mix(key) & (groups.length - 1)
@@ -3121,8 +3129,9 @@ final private class IntGroupIndex:
   private def grow(): Unit =
     val oldKeys = keys
     val oldGroups = groups
-    keys = new Array[Int](oldKeys.length * 2)
-    groups = filledIntArray(oldGroups.length * 2, -1)
+    val target = IntGroupIndex.targetCapacity(oldGroups.length, projected)
+    keys = new Array[Int](target)
+    groups = filledIntArray(target, -1)
     var index = 0
     while index < oldGroups.length do
       if oldGroups(index) >= 0 then
@@ -3139,6 +3148,30 @@ final private class IntGroupIndex:
     hash ^= hash >>> 15
     hash *= 0x846ca68b
     hash ^ (hash >>> 16)
+
+private object IntGroupIndex:
+  /** Next table size: at least a doubling, at most an eightfold jump.
+    *
+    * Doubling from 32 to a million distinct keys rehashes fifteen times and allocates about
+    * twice the final table. Jumping straight to an estimate is tempting but dangerous,
+    * because distinct count extrapolated from an early sample is biased high -- the first
+    * rows are nearly all new keys whatever the true cardinality. Capping each jump at 8x
+    * keeps the chain short (six steps instead of fifteen to reach a million) while bounding
+    * how badly a wrong estimate can overshoot, and an estimate that is too low simply grows
+    * again.
+    */
+  def targetCapacity(current: Int, projectedGroups: Int): Int =
+    val doubled = current * 2
+    if projectedGroups <= 0 then doubled
+    else
+      val wanted = tableSizeFor(projectedGroups)
+      math.max(doubled, math.min(current * 8, wanted))
+
+  /** Smallest power of two that holds `groups` at the index's 50% load factor. */
+  def tableSizeFor(groups: Int): Int =
+    var size = 32
+    while size < Int.MaxValue / 2 && size < groups * 2 do size *= 2
+    size
 
 final private class Utf8GroupIndex:
   private var hashes = new Array[Int](32)
@@ -3599,6 +3632,14 @@ final private case class Int32HashAggregate(
       case Left(error)    => KernelAttempt.Completed(Left(error))
       case Right(batches) =>
         val accumulator = new Int32AggregateAccumulator(requirements)
+        // Every batch is already in hand, so the group count has a known upper bound and the
+        // hash table can stop climbing a doubling chain from 32.
+        var totalRows = 0L
+        var countIndex = 0
+        while countIndex < batches.length do
+          totalRows += batches(countIndex).rowCount.toLong
+          countIndex += 1
+        accumulator.hintTotalRows(math.min(totalRows, Int.MaxValue.toLong).toInt)
         var batchIndex = 0
         var error: Option[ExecutionError] = None
         var residual: Option[String] = None
@@ -3684,8 +3725,19 @@ final private class Int32AggregateAccumulator(requirements: AggregateRequirement
   private var m2 =
     if requirements.variance then new Array[Double](32) else new Array[Double](0)
   private var size = 0
+  private var rowsObserved = 0L
+  private var totalRowsHint = 0
+
+  /** Total input rows, when the caller knows them before aggregating.
+    *
+    * A hard upper bound on the group count, and the denominator for projecting how many
+    * groups the remaining input will add.
+    */
+  def hintTotalRows(rows: Int): Unit =
+    if rows > totalRowsHint then totalRowsHint = rows
 
   def add(key: Int, valid: Boolean, value: Double): Unit =
+    rowsObserved += 1L
     val found = groups.find(key)
     val group =
       if found >= 0 then found
@@ -3709,8 +3761,26 @@ final private class Int32AggregateAccumulator(requirements: AggregateRequirement
         val delta2 = value - means(group)
         m2(group) += delta * delta2
 
+  /** Groups the whole input is projected to produce, from the ratio observed so far.
+    *
+    * Returns 0 until enough rows have been seen for the ratio to mean anything. Linear
+    * extrapolation of a distinct count is biased high, so this is only ever a hint; the 8x
+    * cap in `IntGroupIndex.targetCapacity` is what bounds the damage when it is wrong.
+    */
+  private def projectedGroups: Int =
+    if totalRowsHint <= 0 || rowsObserved < 4096L then 0
+    else
+      val ratio = size.toDouble / rowsObserved.toDouble
+      val estimate = math.ceil(ratio * totalRowsHint.toDouble).toLong
+      math.min(totalRowsHint.toLong, math.max(estimate, size.toLong)).toInt
+
   private def ensureCapacity(): Unit =
     if size == keys.length then
+      // The hash table benefits from skipping ahead; these dense arrays do not. Measured at
+      // 1,000,000 rows and a million groups, estimating their size too allocated 147 MB/op
+      // against 113 MB/op for plain doubling, because a copyOf chain with few large steps
+      // holds more live bytes at once than one with many small steps. Doubling stays.
+      groups.hintCapacity(projectedGroups)
       val next = size * 2
       keys = java.util.Arrays.copyOf(keys, next)
       if requirements.count then rows = java.util.Arrays.copyOf(rows, next)
