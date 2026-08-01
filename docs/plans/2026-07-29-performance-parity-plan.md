@@ -384,8 +384,17 @@ small tiers get faster rather than paying for the large-tier win. The
 run-compressed selection separately cuts 4M aligned gather-view allocation
 to 0.75x and construction from 86.31 to 76.28 ms.
 
-The next step is re-running the R5k.1 matched-endpoint court so the pandas
-and Polars construction ratios are restated on the corrected deep endpoint.
+The [re-run matched-endpoint court](../benchmarks/receipts/2026-08-01-r5k3-matched-endpoints/admission.md)
+restates the cross-runtime ratios on the corrected deep endpoint. Sorted
+deep construction moves from 42.62x to 20.51x pandas at 1M and 47.37x to
+22.96x at 4M — the pandas column remains a monotonic-merge comparison —
+and from 1.82x to 0.77x and 1.40x to 0.68x pinned Polars, so frame4s now
+beats single-threaded Polars on the corrected endpoint for sorted inputs
+and reaches parity at 1M both-shuffled (0.99x). Against default
+14-thread Polars the gap narrows from 8.21x/6.28x to 3.48x/3.15x sorted
+and 3.15x–5.81x overall. The two remaining deep-output targets are
+shuffled physical construction against pandas' hash join (1.68x–2.35x)
+and parallel materialization for the default-thread Polars column.
 
 ## Earlier standing, at 1,000,000 rows
 

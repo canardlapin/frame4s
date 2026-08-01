@@ -82,6 +82,17 @@ run_pandas() {
     $quick_flag
 }
 
+# polars==1.43.1 was yanked from PyPI after the R5k.1 receipt, so uv can no
+# longer resolve it. FRAME4S_POLARS_PYTHON names an interpreter that already
+# has numpy==2.5.1 and polars==1.43.1 installed (pip accepts the yanked
+# release under an exact pin). The runner records the versions it imports, so
+# a substituted interpreter cannot silently change the comparator.
+if [[ -n "${FRAME4S_POLARS_PYTHON:-}" ]]; then
+  polars_python=("$FRAME4S_POLARS_PYTHON")
+else
+  polars_python=(uv run --with 'numpy==2.5.1' --with 'polars==1.43.1' python)
+fi
+
 run_polars_pinned() {
   local process_round="$1"
   local sequence_position="$2"
@@ -90,8 +101,8 @@ run_polars_pinned() {
     echo "resume: keeping $component"
     return
   fi
-  POLARS_MAX_THREADS=1 uv run --with 'numpy==2.5.1' --with 'polars==1.43.1' \
-    python scripts/join-matched-endpoint-court.py \
+  POLARS_MAX_THREADS=1 "${polars_python[@]}" \
+    scripts/join-matched-endpoint-court.py \
     --receipt "$component" \
     --backend polars \
     --expected-threads 1 \
@@ -110,8 +121,8 @@ run_polars_default() {
     echo "resume: keeping $component"
     return
   fi
-  env -u POLARS_MAX_THREADS uv run --with 'numpy==2.5.1' --with 'polars==1.43.1' \
-    python scripts/join-matched-endpoint-court.py \
+  env -u POLARS_MAX_THREADS "${polars_python[@]}" \
+    scripts/join-matched-endpoint-court.py \
     --receipt "$component" \
     --backend polars \
     --sizes "$sizes" \
