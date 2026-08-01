@@ -365,6 +365,28 @@ first, then representation/probe refinements that survive the same matrix.
 Large shuffled latency is capped at 1.03x the frozen baseline, small tiers at
 1.05x, and fallback allocation at 1.05x.
 
+## R5k.3 typed gather admitted
+
+The [R5k.3 receipt](../benchmarks/receipts/2026-08-01-r5k3-typed-gather/admission.md)
+admits typed physical gather — monomorphic per-family copy loops into fresh
+owned buffers, replacing generic scalar boxing — plus a run-compressed
+selection for the unique sorted-merge path. All nine precommitted gates pass
+against the frozen R5k.2 matrix, with semantic identity exact on all 69
+cells and the dispatch boundary unchanged.
+
+Deep materialization at 1M aligned rows falls from 140.90 to 45.88 ms
+(3.07x) and allocation from 204.02 to 56.51 MB; at 4M from 654.68 to
+242.40 ms (2.70x) and 816.04 to 194.03 MB. Incremental physical-output
+allocation is now 1.021x the useful payload against roughly 8.5x before.
+The improvement is not fixture-fitted: the fully shuffled hash-fallback
+workload improves 2.50x at 1M and 1.63x at 4M on the same endpoint, and
+small tiers get faster rather than paying for the large-tier win. The
+run-compressed selection separately cuts 4M aligned gather-view allocation
+to 0.75x and construction from 86.31 to 76.28 ms.
+
+The next step is re-running the R5k.1 matched-endpoint court so the pandas
+and Polars construction ratios are restated on the corrected deep endpoint.
+
 ## Earlier standing, at 1,000,000 rows
 
 Single-threaded frame4s candidate, milliseconds per operation, against the

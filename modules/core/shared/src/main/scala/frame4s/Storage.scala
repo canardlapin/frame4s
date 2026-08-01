@@ -150,6 +150,18 @@ object Buffer:
     val state = new BufferState(copied, BufferOwnership.Owned, tracker, () => ())
     new Buffer(state, 0, copied.length, BufferOwnership.Owned, tracker)
 
+  /** Take ownership of a newly allocated buffer without copying it.
+    *
+    * Package-internal kernels may use this only when the array was allocated for the returned
+    * buffer and no alias escapes. Public builders retain their defensive-copy contract.
+    */
+  private[frame4s] def ownedFresh(
+      bytes: Array[Byte],
+      tracker: BufferTracker = new BufferTracker
+  ): Buffer =
+    val state = new BufferState(bytes, BufferOwnership.Owned, tracker, () => ())
+    new Buffer(state, 0, bytes.length, BufferOwnership.Owned, tracker)
+
   def borrowed(
       bytes: Array[Byte],
       release: () => Unit,
@@ -308,6 +320,36 @@ object Validity:
           bytes(byteIndex) = (bytes(byteIndex) | (1 << (index & 7))).toByte
         index += 1
       new Bitmap(Buffer.owned(bytes, tracker), 0, valid.length, nulls)
+
+  private[frame4s] def fromFreshBitmap(
+      length: Int,
+      bytes: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker
+  ): Either[StorageError, Validity] =
+    val expectedBytes = (length + 7) >>> 3
+    if length < 0 || nullCount < 0 || nullCount > length then
+      Left(
+        StorageError.Unexpected(
+          s"invalid fresh validity length=$length nullCount=$nullCount"
+        )
+      )
+    else if nullCount == 0 then Right(new Required(length))
+    else if bytes.length != expectedBytes then
+      Left(
+        StorageError.Unexpected(
+          s"fresh validity buffer length ${bytes.length} does not match $expectedBytes bytes"
+        )
+      )
+    else
+      Right(
+        new Bitmap(
+          Buffer.ownedFresh(bytes, tracker),
+          0,
+          length,
+          nullCount
+        )
+      )
 
 sealed trait ColumnArray:
   def dataType: DataType
@@ -820,6 +862,127 @@ object ColumnArray:
     else Right(Validity.fromFlags(valid, tracker))
 
   private def allValid(length: Int): Array[Boolean] = Array.fill(length)(true)
+
+  private def freshValidity(
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker
+  ): Either[StorageError, Validity] =
+    Validity.fromFreshBitmap(length, valid, nullCount, tracker)
+
+  private def expectedFreshBytes(
+      dataType: DataType,
+      length: Int,
+      actual: Int,
+      width: Int
+  ): Either[StorageError, Unit] =
+    val expected = length.toLong * width.toLong
+    if length < 0 || expected > Int.MaxValue.toLong || actual.toLong != expected then
+      Left(
+        StorageError.Unexpected(
+          s"fresh $dataType buffer length $actual does not match $length values at width $width"
+        )
+      )
+    else Right(())
+
+  private[frame4s] def int32FromFresh(
+      values: Array[Byte],
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, Int32Array] =
+    expectedFreshBytes(DataType.Int32, length, values.length, 4).flatMap: _ =>
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new Int32Array(length, 0, Buffer.ownedFresh(values, tracker), validity)
+
+  private[frame4s] def int64FromFresh(
+      values: Array[Byte],
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, Int64Array] =
+    expectedFreshBytes(DataType.Int64, length, values.length, 8).flatMap: _ =>
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new Int64Array(length, 0, Buffer.ownedFresh(values, tracker), validity)
+
+  private[frame4s] def float32FromFresh(
+      values: Array[Byte],
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, Float32Array] =
+    expectedFreshBytes(DataType.Float32, length, values.length, 4).flatMap: _ =>
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new Float32Array(length, 0, Buffer.ownedFresh(values, tracker), validity)
+
+  private[frame4s] def float64FromFresh(
+      values: Array[Byte],
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, Float64Array] =
+    expectedFreshBytes(DataType.Float64, length, values.length, 8).flatMap: _ =>
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new Float64Array(length, 0, Buffer.ownedFresh(values, tracker), validity)
+
+  private[frame4s] def boolFromFresh(
+      values: Array[Byte],
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, BooleanArray] =
+    val expected = (length + 7) >>> 3
+    if length < 0 || values.length != expected then
+      Left(
+        StorageError.Unexpected(
+          s"fresh Bool buffer length ${values.length} does not match $length values"
+        )
+      )
+    else
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new BooleanArray(length, 0, Buffer.ownedFresh(values, tracker), validity)
+
+  private[frame4s] def utf8FromFresh(
+      offsets: Array[Byte],
+      values: Array[Byte],
+      length: Int,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, Utf8Array] =
+    expectedFreshBytes(DataType.Int32, length + 1, offsets.length, 4).flatMap: _ =>
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new Utf8Array(
+          length,
+          0,
+          Buffer.ownedFresh(offsets, tracker),
+          Buffer.ownedFresh(values, tracker),
+          validity
+        )
+
+  private[frame4s] def timestampFromFresh(
+      values: Array[Byte],
+      length: Int,
+      unit: TimeUnit,
+      valid: Array[Byte],
+      nullCount: Int,
+      tracker: BufferTracker = new BufferTracker
+  ): Either[StorageError, TimestampArray] =
+    expectedFreshBytes(DataType.Timestamp(unit), length, values.length, 8).flatMap: _ =>
+      freshValidity(length, valid, nullCount, tracker).map: validity =>
+        new TimestampArray(
+          unit,
+          length,
+          0,
+          Buffer.ownedFresh(values, tracker),
+          validity
+        )
 
   def int32(
       input: Array[Int],

@@ -903,6 +903,55 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       leftInput.close()
       rightInput.close()
 
+  test("compressed join row runs preserve random and sequential batch/row mapping"):
+    val multiBatch = new JoinRowRunBuilder(singleBatch = false)
+    multiBatch.append(outputIndex = 0, batch = 0, row = 7)
+    multiBatch.append(outputIndex = 1, batch = 0, row = 8)
+    // Output indices 2 and 3 model invalid right-side outer-join slots. No source row is appended.
+    multiBatch.append(outputIndex = 4, batch = 1, row = 3)
+    multiBatch.append(outputIndex = 5, batch = 1, row = 4)
+    multiBatch.append(outputIndex = 6, batch = 1, row = 4)
+    val selected = multiBatch.result()
+
+    assertEquals(selected.batch(0), 0)
+    assertEquals(selected.row(0), 7)
+    assertEquals(selected.batch(1), 0)
+    assertEquals(selected.row(1), 8)
+    assertEquals(selected.batch(4), 1)
+    assertEquals(selected.row(4), 3)
+    assertEquals(selected.batch(5), 1)
+    assertEquals(selected.row(5), 4)
+    assertEquals(selected.batch(6), 1)
+    assertEquals(selected.row(6), 4)
+
+    val cursor = selected.cursor()
+    assertEquals(cursor.batch, 0)
+    assertEquals(cursor.row, 7)
+    cursor.advance()
+    assertEquals(cursor.batch, 0)
+    assertEquals(cursor.row, 8)
+    cursor.advance()
+    cursor.advance()
+    cursor.advance()
+    assertEquals(cursor.batch, 1)
+    assertEquals(cursor.row, 3)
+    cursor.advance()
+    assertEquals(cursor.batch, 1)
+    assertEquals(cursor.row, 4)
+    cursor.advance()
+    assertEquals(cursor.batch, 1)
+    assertEquals(cursor.row, 4)
+
+    val singleBatch = new JoinRowRunBuilder(singleBatch = true)
+    singleBatch.append(outputIndex = 0, batch = 0, row = 10)
+    singleBatch.append(outputIndex = 1, batch = 0, row = 11)
+    singleBatch.append(outputIndex = 2, batch = 0, row = 13)
+    val single = singleBatch.result()
+    assertEquals(single.batch(0), 0)
+    assertEquals(single.row(0), 10)
+    assertEquals(single.row(1), 11)
+    assertEquals(single.row(2), 13)
+
   test("sorted merge preserves sparse kinds and falls back for nullable and empty keys"):
     type Left = (key: Int, leftValue: Long)
     type Right = (rightKey: Int, rightValue: Long)
@@ -1190,19 +1239,43 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
 
   test("selection-backed outer joins gather every primitive family and survive owner closure"):
     type Left =
-      (key: Int, flag: Boolean, ratio: Float, label: String, at: TimestampMicros)
-    type Right = (rightKey: Int, score: Double)
+      (
+          key: Int,
+          code: Option[Int],
+          count: Option[Long],
+          flag: Option[Boolean],
+          ratio: Option[Float],
+          label: Option[String],
+          at: Option[TimestampMicros]
+      )
+    type Right = (rightKey: Int, score: Option[Double])
     val leftRef = reference("columnar-gather-left")
     val rightRef = reference("columnar-gather-right")
     val leftInput = table[Left](
       Vector(
-        (key = 1, flag = true, ratio = 1.5f, label = "one", at = TimestampMicros(7L)),
-        (key = 2, flag = false, ratio = -0.0f, label = "two", at = TimestampMicros(8L))
+        (
+          key = 1,
+          code = Some(11),
+          count = Some(101L),
+          flag = Some(true),
+          ratio = Some(1.5f),
+          label = Some("one"),
+          at = Some(TimestampMicros(7L))
+        ),
+        (
+          key = 2,
+          code = None,
+          count = None,
+          flag = None,
+          ratio = None,
+          label = None,
+          at = None
+        )
       ),
       batchSize = 1
     )
     val rightInput = table[Right](
-      Vector((rightKey = 1, score = Double.NaN)),
+      Vector((rightKey = 1, score = Some(Double.NaN))),
       batchSize = 1
     )
     val left = value(Frame.values[Left](leftRef))
@@ -1229,6 +1302,8 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         Vector(
           Vector(
             ScalarValue.Int32(1),
+            ScalarValue.Int32(11),
+            ScalarValue.Int64(101L),
             ScalarValue.Bool(true),
             ScalarValue.Float32(1.5f),
             ScalarValue.Utf8("one"),
@@ -1238,10 +1313,12 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           ),
           Vector(
             ScalarValue.Int32(2),
-            ScalarValue.Bool(false),
-            ScalarValue.Float32(-0.0f),
-            ScalarValue.Utf8("two"),
-            ScalarValue.Timestamp(8L, TimeUnit.Microsecond),
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
             ScalarValue.Null,
             ScalarValue.Null
           )
@@ -1255,7 +1332,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
             case value                                     => value.toString
       assertEquals(normalized(actual), normalized(expected))
       assertEquals(normalized(preparedActual), normalized(expected))
-      actual.head(6) match
+      actual.head(8) match
         case ScalarValue.Float64(value) =>
           assertEquals(
             java.lang.Double.doubleToRawLongBits(value),
@@ -1263,6 +1340,17 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           )
         case value => fail(s"expected gathered NaN, received $value")
       assertEquals(result.checksum, preparedResult.checksum)
+
+      def physicalRows(value: ColumnarResult): Vector[Vector[ScalarValue]] =
+        val batches = value.recordBatches.fold(reason => fail(reason), identity)
+        try
+          batches.flatMap: batch =>
+            Vector.tabulate(batch.rowCount): row =>
+              batch.columns.map(column => this.value(column.scalar(row)))
+        finally batches.foreach(_.close())
+
+      assertEquals(normalized(physicalRows(result)), normalized(expected))
+      assertEquals(normalized(physicalRows(preparedResult)), normalized(expected))
     finally
       result.close()
       preparedResult.close()

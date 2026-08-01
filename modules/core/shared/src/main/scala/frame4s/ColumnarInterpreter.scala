@@ -23,9 +23,10 @@ private[frame4s] object ColumnarMaterialization:
     var failure: Option[String] = None
     while index < batch.columns.length && failure.isEmpty do
       val vector = batch.columns(index)
-      val converted = toColumnArray(vector) match
+      val dataType = schema.fields(index).dataType
+      val converted = toColumnArray(dataType, vector) match
         case Right(value) => Right(value)
-        case Left(_)      => materialize(schema.fields(index).dataType, vector)
+        case Left(_)      => materialize(dataType, vector)
       converted match
         case Right(value) => columns += value
         case Left(reason) => failure = Some(reason)
@@ -39,17 +40,24 @@ private[frame4s] object ColumnarMaterialization:
         RecordBatch(schema, columns.result()).left.map(_.message)
 
   /** An empty validity array means "no nulls", which is what the builders already expect. */
-  private def toColumnArray(vector: ColumnarVector): Either[String, ColumnArray] =
+  private def toColumnArray(
+      dataType: DataType,
+      vector: ColumnarVector
+  ): Either[String, ColumnArray] =
     val built: Option[Either[StorageError, ColumnArray]] = vector match
-      case Int32Values(values)                => Some(ColumnArray.int32(values))
-      case NullableInt32Values(values, valid) => Some(ColumnArray.int32(values, valid))
-      case Int64Values(values)                => Some(ColumnArray.int64(values))
-      case NullableInt64Values(values, valid) => Some(ColumnArray.int64(values, valid))
-      case Float32Values(values, valid)       => Some(ColumnArray.float32(values, valid))
-      case Float64Values(values, valid)       => Some(ColumnArray.float64(values, valid))
-      case Utf8Values(values)                 => Some(ColumnArray.utf8(values))
-      case NullableUtf8Values(values, valid)  => Some(ColumnArray.utf8(values, valid))
-      case _                                  => None
+      case Int32Values(values)                  => Some(ColumnArray.int32(values))
+      case NullableInt32Values(values, valid)   => Some(ColumnArray.int32(values, valid))
+      case Int64Values(values)                  => Some(ColumnArray.int64(values))
+      case NullableInt64Values(values, valid)   => Some(ColumnArray.int64(values, valid))
+      case Float32Values(values, valid)         => Some(ColumnArray.float32(values, valid))
+      case Float64Values(values, valid)         => Some(ColumnArray.float64(values, valid))
+      case BooleanValues(values, valid)         => Some(ColumnArray.bool(values, valid))
+      case Utf8Values(values)                   => Some(ColumnArray.utf8(values))
+      case NullableUtf8Values(values, valid)    => Some(ColumnArray.utf8(values, valid))
+      case TimestampValues(values, valid, unit) =>
+        Some(ColumnArray.timestamp(values, unit, valid))
+      case values: GatheredVector => return values.toColumnArray(dataType)
+      case _                      => None
     built match
       case None => Left(s"columnar vector ${vector.getClass.getSimpleName} has no batch form")
       case Some(result) => result.left.map(_.message)
@@ -1031,9 +1039,7 @@ final private case class SelectedVector(
 final private case class GatheredVector(
     batches: Vector[DecodedBatch],
     columnIndex: Int,
-    singleBatch: Boolean,
-    selectedBatches: Array[Int],
-    selectedRows: Array[Int],
+    selected: JoinRowSelection,
     length: Int,
     validity: Option[Array[Byte]]
 ) extends ColumnarVector:
@@ -1041,17 +1047,187 @@ final private case class GatheredVector(
     if index < 0 || index >= length then
       Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
     else if !isValid(index) then Right(ScalarValue.Null)
-    else source(index).scalar(selectedRows(index))
+    else source(index).scalar(selected.row(index))
 
   def unsafeScalarHash(index: Int): Long =
     if !isValid(index) then ColumnarVector.NullHash
-    else source(index).unsafeScalarHash(selectedRows(index))
+    else source(index).unsafeScalarHash(selected.row(index))
 
   private def source(index: Int): ColumnarVector =
-    batches(if singleBatch then 0 else selectedBatches(index)).columns(columnIndex)
+    sourceBatch(selected.batch(index))
+
+  private def sourceBatch(batch: Int): ColumnarVector =
+    batches(batch).columns(columnIndex)
 
   private def isValid(index: Int): Boolean =
     validity.forall(bytes => bit(bytes, index))
+
+  /** Materialize a gathered join column directly into fresh owned physical buffers.
+    *
+    * The output buffers contain no aliases to the decoded inputs. Selection validity and source
+    * validity are combined while copying, so left-outer nulls and nullable source values preserve
+    * the same Arrow validity contract as scalar materialization.
+    */
+  def toColumnArray(dataType: DataType): Either[String, ColumnArray] =
+    dataType match
+      case DataType.Int32           => gatherInt32()
+      case DataType.Int64           => gatherInt64()
+      case DataType.Float32         => gatherFloat32()
+      case DataType.Float64         => gatherFloat64()
+      case DataType.Bool            => gatherBoolean()
+      case DataType.Utf8            => gatherUtf8()
+      case DataType.Timestamp(unit) => gatherTimestamp(unit)
+
+  private def gatherInt32(): Either[String, ColumnArray] =
+    val values = new Array[Byte](length * 4)
+    gatherFixed(values, "Int32"):
+      case (source: RawInt32Vector, sourceRow, outputRow) =>
+        if source.unsafeValid(sourceRow) then
+          writeInt(values, outputRow * 4, source.unsafeIntValue(sourceRow))
+          true
+        else false
+    .flatMap: (valid, nullCount) =>
+      ColumnArray.int32FromFresh(values, length, valid, nullCount).left.map(_.message)
+
+  private def gatherInt64(): Either[String, ColumnArray] =
+    val values = new Array[Byte](length * 8)
+    gatherFixed(values, "Int64"):
+      case (source: RawInt64Vector, sourceRow, outputRow) if source.timestampUnit.isEmpty =>
+        if source.unsafeValid(sourceRow) then
+          writeLong(values, outputRow * 8, source.unsafeLongValue(sourceRow))
+          true
+        else false
+    .flatMap: (valid, nullCount) =>
+      ColumnArray.int64FromFresh(values, length, valid, nullCount).left.map(_.message)
+
+  private def gatherFloat32(): Either[String, ColumnArray] =
+    val values = new Array[Byte](length * 4)
+    gatherFixed(values, "Float32"):
+      case (source: RawFloat32Vector, sourceRow, outputRow) =>
+        if source.unsafeValid(sourceRow) then
+          writeInt(
+            values,
+            outputRow * 4,
+            java.lang.Float.floatToRawIntBits(source.unsafeFloatValue(sourceRow))
+          )
+          true
+        else false
+    .flatMap: (valid, nullCount) =>
+      ColumnArray.float32FromFresh(values, length, valid, nullCount).left.map(_.message)
+
+  private def gatherFloat64(): Either[String, ColumnArray] =
+    val values = new Array[Byte](length * 8)
+    gatherFixed(values, "Float64"):
+      case (source: RawFloat64Vector, sourceRow, outputRow) =>
+        if source.unsafeValid(sourceRow) then
+          writeLong(
+            values,
+            outputRow * 8,
+            java.lang.Double.doubleToRawLongBits(source.unsafeDoubleValue(sourceRow))
+          )
+          true
+        else false
+    .flatMap: (valid, nullCount) =>
+      ColumnArray.float64FromFresh(values, length, valid, nullCount).left.map(_.message)
+
+  private def gatherBoolean(): Either[String, ColumnArray] =
+    val values = new Array[Byte]((length + 7) >>> 3)
+    gatherFixed(values, "Bool"):
+      case (source: RawBooleanVector, sourceRow, outputRow) =>
+        if source.unsafeValid(sourceRow) then
+          if source.unsafeBooleanValue(sourceRow) then setBit(values, outputRow)
+          true
+        else false
+    .flatMap: (valid, nullCount) =>
+      ColumnArray.boolFromFresh(values, length, valid, nullCount).left.map(_.message)
+
+  private def gatherTimestamp(unit: TimeUnit): Either[String, ColumnArray] =
+    val values = new Array[Byte](length * 8)
+    gatherFixed(values, s"Timestamp($unit)"):
+      case (source: RawInt64Vector, sourceRow, outputRow) if source.timestampUnit.contains(unit) =>
+        if source.unsafeValid(sourceRow) then
+          writeLong(values, outputRow * 8, source.unsafeLongValue(sourceRow))
+          true
+        else false
+    .flatMap: (valid, nullCount) =>
+      ColumnArray
+        .timestampFromFresh(values, length, unit, valid, nullCount)
+        .left
+        .map(_.message)
+
+  private def gatherUtf8(): Either[String, ColumnArray] =
+    val valid = new Array[Byte]((length + 7) >>> 3)
+    var total = 0L
+    var nullCount = 0
+    var index = 0
+    var failure: Option[String] = None
+    val selection = selected.cursor()
+    while index < length && failure.isEmpty do
+      if !isValid(index) then nullCount += 1
+      else
+        sourceBatch(selection.batch) match
+          case value: RawUtf8Vector =>
+            val sourceRow = selection.row
+            if value.unsafeValid(sourceRow) then
+              setBit(valid, index)
+              total += value.unsafeByteLength(sourceRow).toLong
+              if total > Int.MaxValue.toLong then
+                failure = Some("gathered UTF-8 output exceeds the supported byte length")
+            else nullCount += 1
+          case value =>
+            failure = Some(
+              s"gathered Utf8 column contains ${value.getClass.getSimpleName}"
+            )
+      selection.advance()
+      index += 1
+
+    failure match
+      case Some(reason) => Left(reason)
+      case None         =>
+        val offsets = new Array[Byte]((length + 1) * 4)
+        val values = new Array[Byte](total.toInt)
+        var cursor = 0
+        index = 0
+        val selection = selected.cursor()
+        while index < length do
+          writeInt(offsets, index * 4, cursor)
+          if bit(valid, index) then
+            val input = sourceBatch(selection.batch).asInstanceOf[RawUtf8Vector]
+            cursor += input.unsafeCopyBytes(selection.row, values, cursor)
+          selection.advance()
+          index += 1
+        writeInt(offsets, length * 4, cursor)
+        ColumnArray
+          .utf8FromFresh(offsets, values, length, valid, nullCount)
+          .left
+          .map(_.message)
+
+  private def gatherFixed(
+      values: Array[Byte],
+      expected: String
+  )(
+      copy: PartialFunction[(ColumnarVector, Int, Int), Boolean]
+  ): Either[String, (Array[Byte], Int)] =
+    val valid = new Array[Byte]((length + 7) >>> 3)
+    var nullCount = 0
+    var index = 0
+    var failure: Option[String] = None
+    val selection = selected.cursor()
+    while index < length && failure.isEmpty do
+      if !isValid(index) then nullCount += 1
+      else
+        val input = sourceBatch(selection.batch)
+        val sourceRow = selection.row
+        val arguments = (input, sourceRow, index)
+        if !copy.isDefinedAt(arguments) then
+          failure = Some(
+            s"gathered $expected column contains ${input.getClass.getSimpleName}"
+          )
+        else if copy(arguments) then setBit(valid, index)
+        else nullCount += 1
+      selection.advance()
+      index += 1
+    failure.toLeft((valid, nullCount))
 
 final private case class RawDictionaryVector(
     indices: RawInt32Vector,
@@ -4344,6 +4520,7 @@ final private case class HashJoin(
 ) extends KernelPlan:
   val name = s"HashJoin[$kind,Int32,SortedMergeOrHash,SelectionGather]"
   private val mergeMinimumRows = 16384
+  private val runSelectionMinimumOutputRows = 2000000
 
   def execute(sources: ReferenceSources): KernelAttempt =
     (decode(sources, leftReference, leftSchema), decode(sources, rightReference, rightSchema)) match
@@ -4437,18 +4614,6 @@ final private case class HashJoin(
           materialize(left, right, selections, None)
       case None => hashJoin(left, right)
 
-  private def hashJoin(
-      left: Vector[DecodedBatch],
-      right: Vector[DecodedBatch]
-  ): Either[ExecutionError, ColumnarResult] =
-    build(right).flatMap: built =>
-      if shouldParallelProbe(left) then
-        parallelProbe(left, built).flatMap: selections =>
-          materializeSegments(left, right, selections)
-      else
-        probe(left, built).flatMap: selections =>
-          materialize(left, right, selections, None)
-
   private def sortedJoinKeys(
       left: Vector[DecodedBatch],
       right: Vector[DecodedBatch]
@@ -4469,6 +4634,18 @@ final private case class HashJoin(
                   leftOrder == JoinKeyOrder.StrictlyIncreasing &&
                     rightOrder == JoinKeyOrder.StrictlyIncreasing
                 )
+
+  private def hashJoin(
+      left: Vector[DecodedBatch],
+      right: Vector[DecodedBatch]
+  ): Either[ExecutionError, ColumnarResult] =
+    build(right).flatMap: built =>
+      if shouldParallelProbe(left) then
+        parallelProbe(left, built).flatMap: selections =>
+          materializeSegments(left, right, selections)
+      else
+        probe(left, built).flatMap: selections =>
+          materialize(left, right, selections, None)
 
   private def keyVectors(
       batches: Vector[DecodedBatch],
@@ -4517,21 +4694,28 @@ final private case class HashJoin(
   private def mergeProbe(
       keys: SortedJoinKeys
   ): Either[ExecutionError, JoinSelectionBuilder] =
-    val leftRows = keys.left.foldLeft(0)(_ + _.length)
-    val rightRows = keys.right.foldLeft(0)(_ + _.length)
-    val expectedOutput = kind match
-      case JoinKind.LeftOuter | JoinKind.LeftAnti => leftRows
-      case JoinKind.Inner | JoinKind.LeftSemi     => math.min(leftRows, rightRows)
-    val selections =
-      new JoinSelectionBuilder(
-        RightSelectionMode.forJoin(columns, kind),
-        expectedOutput,
-        leftSingleBatch = keys.left.length == 1,
-        rightSingleBatch = keys.right.length == 1
-      )
+    val selections = selectionBuilder(keys.left, keys.right, keys.unique)
     if keys.unique then mergeUnique(keys.left, keys.right, selections)
     else mergeGroups(keys.left, keys.right, selections)
     Right(selections)
+
+  private def selectionBuilder(
+      left: Vector[RawInt32Vector],
+      right: Vector[RawInt32Vector],
+      unique: Boolean
+  ): JoinSelectionBuilder =
+    val leftRows = left.foldLeft(0)(_ + _.length)
+    val rightRows = right.foldLeft(0)(_ + _.length)
+    val expectedOutput = kind match
+      case JoinKind.LeftOuter | JoinKind.LeftAnti => leftRows
+      case JoinKind.Inner | JoinKind.LeftSemi     => math.min(leftRows, rightRows)
+    new JoinSelectionBuilder(
+      RightSelectionMode.forJoin(columns, kind),
+      expectedOutput,
+      leftSingleBatch = left.length == 1,
+      rightSingleBatch = right.length == 1,
+      compressRuns = unique && expectedOutput >= runSelectionMinimumOutputRows
+    )
 
   private def mergeUnique(
       leftKeys: Vector[RawInt32Vector],
@@ -4982,9 +5166,7 @@ final private case class HashJoin(
         GatheredVector(
           left,
           index,
-          selected.leftSingleBatch,
-          selected.leftBatches,
-          selected.leftRows,
+          selected.left,
           selected.length,
           validity = None
         )
@@ -4992,24 +5174,116 @@ final private case class HashJoin(
         GatheredVector(
           right,
           index,
-          selected.rightSingleBatch,
-          selected.rightBatches,
-          selected.rightRows,
+          selected.right.getOrElse(JoinRowSelection.empty),
           selected.length,
           selected.rightValidity
         )
     ColumnarBatch(outputColumns, selected.length)
 
 final private case class JoinSelection(
-    leftSingleBatch: Boolean,
-    leftBatches: Array[Int],
-    leftRows: Array[Int],
-    rightSingleBatch: Boolean,
-    rightBatches: Array[Int],
-    rightRows: Array[Int],
+    left: JoinRowSelection,
+    right: Option[JoinRowSelection],
     rightValidity: Option[Array[Byte]],
     length: Int
 )
+
+sealed private[frame4s] trait JoinRowSelection:
+  def batch(index: Int): Int
+  def row(index: Int): Int
+  def cursor(): JoinRowCursor
+
+sealed private[frame4s] trait JoinRowCursor:
+  def batch: Int
+  def row: Int
+  def advance(): Unit
+
+private object JoinRowSelection:
+  val empty: JoinRowSelection =
+    ArrayJoinRowSelection(
+      singleBatch = true,
+      Array.emptyIntArray,
+      Array.emptyIntArray
+    )
+
+final private[frame4s] case class ArrayJoinRowSelection(
+    singleBatch: Boolean,
+    batches: Array[Int],
+    rows: Array[Int]
+) extends JoinRowSelection:
+  def batch(index: Int): Int = if singleBatch then 0 else batches(index)
+  def row(index: Int): Int = rows(index)
+  def cursor(): JoinRowCursor = new JoinRowCursor:
+    private var index = 0
+    def batch: Int = if singleBatch then 0 else batches(index)
+    def row: Int = rows(index)
+    def advance(): Unit = index += 1
+
+final private[frame4s] case class RunJoinRowSelection(
+    singleBatch: Boolean,
+    starts: Array[Int],
+    batches: Array[Int],
+    rows: Array[Int],
+    runCount: Int
+) extends JoinRowSelection:
+  def batch(index: Int): Int =
+    if singleBatch then 0 else batches(run(index))
+
+  def row(index: Int): Int =
+    val selectedRun = run(index)
+    rows(selectedRun) + index - starts(selectedRun)
+
+  def cursor(): JoinRowCursor = new JoinRowCursor:
+    private var index = 0
+    private var selectedRun = 0
+    def batch: Int =
+      if singleBatch || runCount == 0 then 0 else batches(selectedRun)
+    def row: Int =
+      if runCount == 0 then 0
+      else rows(selectedRun) + index - starts(selectedRun)
+    def advance(): Unit =
+      index += 1
+      if selectedRun + 1 < runCount && starts(selectedRun + 1) == index then selectedRun += 1
+
+  private def run(index: Int): Int =
+    if runCount == 0 then 0
+    else
+      var low = 0
+      var high = runCount - 1
+      while low < high do
+        val middle = (low + high + 1) >>> 1
+        if starts(middle) <= index then low = middle
+        else high = middle - 1
+      low
+
+final private[frame4s] class JoinRowRunBuilder(singleBatch: Boolean):
+  private var starts = new Array[Int](16)
+  private var batches = if singleBatch then Array.emptyIntArray else new Array[Int](16)
+  private var rows = new Array[Int](16)
+  private var runCount = 0
+
+  def append(outputIndex: Int, batch: Int, row: Int): Unit =
+    val extendsPrevious =
+      if runCount == 0 then false
+      else
+        val previous = runCount - 1
+        val sameBatch = singleBatch || batches(previous) == batch
+        sameBatch && row == rows(previous) + outputIndex - starts(previous)
+    if !extendsPrevious then
+      ensureCapacity(runCount + 1)
+      starts(runCount) = outputIndex
+      if !singleBatch then batches(runCount) = batch
+      rows(runCount) = row
+      runCount += 1
+
+  def result(): JoinRowSelection =
+    RunJoinRowSelection(singleBatch, starts, batches, rows, runCount)
+
+  private def ensureCapacity(required: Int): Unit =
+    if required > starts.length then
+      val next = math.max(required, starts.length * 2)
+      starts = java.util.Arrays.copyOf(starts, next)
+      if !singleBatch then batches = java.util.Arrays.copyOf(batches, next)
+      rows = java.util.Arrays.copyOf(rows, next)
 
 private enum RightSelectionMode:
   case Absent
@@ -5033,19 +5307,28 @@ final private class JoinSelectionBuilder(
     rightMode: RightSelectionMode,
     initialCapacity: Int = 16,
     leftSingleBatch: Boolean = false,
-    rightSingleBatch: Boolean = false
+    rightSingleBatch: Boolean = false,
+    compressRuns: Boolean = false
 ):
   private val boundedInitialCapacity = math.max(0, initialCapacity)
+  private val leftRuns =
+    Option.when(compressRuns)(new JoinRowRunBuilder(leftSingleBatch))
+  private val rightRuns =
+    Option.when(compressRuns && rightMode != RightSelectionMode.Absent)(
+      new JoinRowRunBuilder(rightSingleBatch)
+    )
   private var leftBatches =
-    if leftSingleBatch then Array.emptyIntArray
+    if compressRuns || leftSingleBatch then Array.emptyIntArray
     else new Array[Int](boundedInitialCapacity)
-  private var leftRows = new Array[Int](boundedInitialCapacity)
+  private var leftRows =
+    if compressRuns then Array.emptyIntArray else new Array[Int](boundedInitialCapacity)
   private var rightBatches =
-    if rightMode != RightSelectionMode.Absent && !rightSingleBatch then
+    if !compressRuns && rightMode != RightSelectionMode.Absent && !rightSingleBatch then
       new Array[Int](boundedInitialCapacity)
     else Array.emptyIntArray
   private var rightRows =
-    if rightMode != RightSelectionMode.Absent then new Array[Int](boundedInitialCapacity)
+    if !compressRuns && rightMode != RightSelectionMode.Absent then
+      new Array[Int](boundedInitialCapacity)
     else Array.emptyIntArray
   private var rightValidity =
     if rightMode == RightSelectionMode.Nullable then
@@ -5055,8 +5338,11 @@ final private class JoinSelectionBuilder(
 
   def appendLeftOnly(leftBatch: Int, leftRow: Int): Unit =
     ensureCapacity(length + 1)
-    if !leftSingleBatch then leftBatches(length) = leftBatch
-    leftRows(length) = leftRow
+    leftRuns match
+      case Some(runs) => runs.append(length, leftBatch, leftRow)
+      case None       =>
+        if !leftSingleBatch then leftBatches(length) = leftBatch
+        leftRows(length) = leftRow
     length += 1
 
   def appendMatched(
@@ -5066,11 +5352,17 @@ final private class JoinSelectionBuilder(
       rightRow: Int
   ): Unit =
     ensureCapacity(length + 1)
-    if !leftSingleBatch then leftBatches(length) = leftBatch
-    leftRows(length) = leftRow
+    leftRuns match
+      case Some(runs) => runs.append(length, leftBatch, leftRow)
+      case None       =>
+        if !leftSingleBatch then leftBatches(length) = leftBatch
+        leftRows(length) = leftRow
     if rightMode != RightSelectionMode.Absent then
-      if !rightSingleBatch then rightBatches(length) = rightBatch
-      rightRows(length) = rightRow
+      rightRuns match
+        case Some(runs) => runs.append(length, rightBatch, rightRow)
+        case None       =>
+          if !rightSingleBatch then rightBatches(length) = rightBatch
+          rightRows(length) = rightRow
       if rightMode == RightSelectionMode.Nullable then
         val byte = length >>> 3
         rightValidity(byte) = (rightValidity(byte).toInt | (1 << (length & 7))).toByte
@@ -5078,18 +5370,24 @@ final private class JoinSelectionBuilder(
 
   def result(): JoinSelection =
     new JoinSelection(
-      leftSingleBatch,
-      leftBatches,
-      leftRows,
-      rightSingleBatch,
-      rightBatches,
-      rightRows,
+      leftRuns.fold[JoinRowSelection](
+        ArrayJoinRowSelection(leftSingleBatch, leftBatches, leftRows)
+      )(_.result()),
+      Option.when(rightMode != RightSelectionMode.Absent):
+        rightRuns.fold[JoinRowSelection](
+          ArrayJoinRowSelection(rightSingleBatch, rightBatches, rightRows)
+        )(_.result())
+      ,
       Option.when(rightMode == RightSelectionMode.Nullable)(rightValidity),
       length
     )
 
   private def ensureCapacity(required: Int): Unit =
-    if required > leftRows.length then
+    if compressRuns then
+      if rightMode == RightSelectionMode.Nullable && required > rightValidity.length * 8 then
+        val next = math.max(required, rightValidity.length * 16)
+        rightValidity = java.util.Arrays.copyOf(rightValidity, (next + 7) >>> 3)
+    else if required > leftRows.length then
       val next = math.max(required, leftRows.length * 2)
       if !leftSingleBatch then leftBatches = java.util.Arrays.copyOf(leftBatches, next)
       leftRows = java.util.Arrays.copyOf(leftRows, next)
@@ -5762,6 +6060,10 @@ private def writeInt(bytes: Array[Byte], offset: Int, value: Int): Unit =
   bytes(offset + 1) = (value >>> 8).toByte
   bytes(offset + 2) = (value >>> 16).toByte
   bytes(offset + 3) = (value >>> 24).toByte
+
+private def writeLong(bytes: Array[Byte], offset: Int, value: Long): Unit =
+  writeInt(bytes, offset, value.toInt)
+  writeInt(bytes, offset + 4, (value >>> 32).toInt)
 
 private def bit(bytes: Array[Byte], index: Int): Boolean =
   ((bytes(index >>> 3).toInt >>> (index & 7)) & 1) == 1

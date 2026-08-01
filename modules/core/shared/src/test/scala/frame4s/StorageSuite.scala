@@ -24,6 +24,19 @@ class StorageSuite extends munit.FunSuite:
     assertEquals(array.value(1), Left(StorageError.NullValue(1)))
     array.close()
 
+  test("public column builders remain detached from caller-owned arrays"):
+    val values = Array(7, 8)
+    val valid = Array(true, false)
+    val array = value(ColumnArray.int32(values, valid))
+
+    values(0) = 99
+    valid(0) = false
+    valid(1) = true
+
+    assertEquals(array.scalar(0), Right(ScalarValue.Int32(7)))
+    assertEquals(array.scalar(1), Right(ScalarValue.Null))
+    array.close()
+
   test("booleans pack values and validity independently"):
     val array = value(
       ColumnArray.bool(
