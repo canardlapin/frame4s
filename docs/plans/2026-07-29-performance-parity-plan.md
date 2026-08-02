@@ -404,6 +404,18 @@ confirms the Phase 3 redirection: parallelism lands where access streams,
 and the gather copy loops stream on output even when selection access is
 random.
 
+The [R5k.4 matched-endpoint court](../benchmarks/receipts/2026-08-01-r5k4-matched-endpoints/admission.md)
+restates the cross-runtime picture. frame4s now matches default
+14-thread Polars on sorted deep construction at 4M (58.57 against
+59.68 ms, 0.98x — the progression on that cell is 6.28x at R5k.1, 3.15x
+after typed gather, 0.98x after parallel gather), and shuffled deep beats
+pinned Polars at 1M (0.72x–0.74x) with parity at 4M (1.02x–1.03x). The
+remaining deep-output gaps are shuffled construction against pandas
+(1.40x–1.75x) and against default Polars (2.63x–3.28x), now dominated by
+probe and selection construction rather than the copy, and the serial
+matched-consumption sum, which is no longer small relative to
+construction.
+
 ## R5k.3 matched-endpoint restatement
 
 The [re-run matched-endpoint court](../benchmarks/receipts/2026-08-01-r5k3-matched-endpoints/admission.md)
