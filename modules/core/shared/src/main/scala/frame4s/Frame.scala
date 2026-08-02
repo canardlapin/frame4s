@@ -24,6 +24,8 @@ enum BindingIssue:
   * instead of throwing.
   */
 enum FrameError:
+  case NullSourceId
+  case NullSourceName
   case InvalidSourceId(id: String)
   case InvalidSourceName(name: String)
   case InvalidSchema(error: SchemaError)
@@ -44,6 +46,8 @@ enum FrameError:
   case JoinKeyType(name: String, left: DataType, right: DataType)
 
   def message: String = this match
+    case NullSourceId            => "source id is null"
+    case NullSourceName          => "source name is null"
     case InvalidSourceId(id)     => s"source id '$id' is empty"
     case InvalidSourceName(name) => s"source name '$name' is empty"
     case InvalidSchema(error)    => error.message

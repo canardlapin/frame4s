@@ -724,6 +724,11 @@ Acceptance criteria:
 - Explain identifies both children, the output schema, order guarantee, and
   selected backend/fallback.
 
+Runtime realization (2026-08-02): the public `SourceBinding` stream route now
+concatenates union branches lazily. A cross-platform pull-count test proves
+that a limit satisfied by the left branch does not pull the right branch; batch
+and source finalizers are asserted after completion.
+
 ### R4.5 Semi and anti joins
 
 Treat semi and anti as foundational `JoinKind` extensions. Before

@@ -7,7 +7,7 @@ import cats.effect.IO
 import cats.effect.unsafe.implicits.global
 
 import frame4s.*
-import frame4s.fs2.FrameRuntime
+import frame4s.fs2.{EngineId, FrameRuntime}
 
 /** Measures the public materializing collect against the internal engine path.
   *
@@ -23,9 +23,10 @@ object PublicPathCourtRunner:
   type Left = (key: Int, leftValue: Long)
   type Right = (rightKey: Int, rightValue: Long)
   type Joined = (key: Int, leftValue: Long, rightKey: Int, rightValue: Long)
+  type Grouped = (key: Int, n: Long)
 
-  private val Warmup = 3
-  private val Iterations = 7
+  private val Warmup = 5
+  private val Iterations = 15
 
   final private case class Measured(
       workload: String,
@@ -94,10 +95,74 @@ object PublicPathCourtRunner:
       outputRows = rows
     )
 
+  /** Measure two endpoints as alternating pairs so neither endpoint always receives the later,
+    * warmer part of the process lifetime.
+    */
+  private def measurePair(
+      workload: String,
+      firstEndpoint: String,
+      secondEndpoint: String
+  )(
+      first: () => Long,
+      second: () => Long
+  ): Vector[Measured] =
+    def sample(work: () => Long): (Double, Long) =
+      val start = System.nanoTime()
+      val rows = work()
+      ((System.nanoTime() - start) / 1e6, rows)
+
+    var index = 0
+    while index < Warmup do
+      if (index & 1) == 0 then
+        val _ = first()
+        val _ = second()
+      else
+        val _ = second()
+        val _ = first()
+      index += 1
+
+    val firstSamples = Vector.newBuilder[Double]
+    val secondSamples = Vector.newBuilder[Double]
+    var firstRows = 0L
+    var secondRows = 0L
+    index = 0
+    while index < Iterations do
+      if (index & 1) == 0 then
+        val firstResult = sample(first)
+        val secondResult = sample(second)
+        firstSamples += firstResult(0)
+        secondSamples += secondResult(0)
+        firstRows = firstResult(1)
+        secondRows = secondResult(1)
+      else
+        val secondResult = sample(second)
+        val firstResult = sample(first)
+        secondSamples += secondResult(0)
+        firstSamples += firstResult(0)
+        secondRows = secondResult(1)
+        firstRows = firstResult(1)
+      index += 1
+
+    def result(endpoint: String, samples: Vector[Double], rows: Long): Measured =
+      val sorted = samples.sorted
+      Measured(
+        workload,
+        endpoint,
+        medianMs = sorted(sorted.length / 2),
+        minMs = sorted.head,
+        maxMs = sorted.last,
+        outputRows = rows
+      )
+
+    Vector(
+      result(firstEndpoint, firstSamples.result(), firstRows),
+      result(secondEndpoint, secondSamples.result(), secondRows)
+    )
+
   private def publicCollect[S <: scala.NamedTuple.AnyNamedTuple](
       runtime: FrameRuntime[IO],
       query: Frame[S],
-      expectedBackend: String,
+      expectedEngine: EngineId,
       expectedPlan: String
   ): Long =
     runtime
@@ -107,9 +172,9 @@ object PublicPathCourtRunner:
           val engine = execution.receipt.engine.getOrElse(
             sys.error("public collect produced no engine receipt")
           )
-          if engine.backend != expectedBackend then
+          if engine.engine != expectedEngine then
             sys.error(
-              s"expected backend $expectedBackend, measured ${engine.backend} " +
+              s"expected engine $expectedEngine, measured ${engine.engine} " +
                 s"(fallback=${engine.fallback})"
             )
           if !engine.physicalPlan.contains(expectedPlan) then
@@ -117,10 +182,23 @@ object PublicPathCourtRunner:
           execution.table.rowCount
       .unsafeRunSync()
 
-  private def engineCollect(plan: LogicalPlan, sources: ReferenceSources): Long =
+  private def engineCollect(
+      plan: LogicalPlan,
+      sources: ReferenceSources,
+      expectedPlan: String
+  ): Long =
     ColumnarInterpreter.collect(plan, sources) match
       case Left(reason)     => sys.error(s"engine declined: $reason")
       case Right(collected) =>
+        if collected.receipt.fallback.nonEmpty then
+          sys.error(
+            s"expected direct engine execution, measured fallback ${collected.receipt.fallback}"
+          )
+        if !collected.receipt.physicalPlan.contains(expectedPlan) then
+          sys.error(
+            s"expected engine plan containing $expectedPlan, measured " +
+              collected.receipt.physicalPlan
+          )
         val rows = collected.batches.map(_.rowCount.toLong).sum
         collected.batches.foreach(_.close())
         rows
@@ -153,22 +231,35 @@ object PublicPathCourtRunner:
     val joined: Frame[Joined] =
       left.innerJoin(right)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
     val filtered: Frame[Left] = left.filter(row => row.col("key") > rows / 2)
+    val grouped: Frame[Grouped] =
+      left
+        .groupBy(row => Tuple1(row.col("key").as("key")))
+        .aggregate(_ => Tuple1(Aggregate.count.as("n")))
 
-    val results = Vector(
-      measure("filter", "engine-collect")(() => engineCollect(filtered.plan, sources)),
-      measure("filter", "public-collect")(() =>
-        publicCollect(runtime, filtered, "columnar", "Filter")
-      ),
-      measure("one-to-one-join-shuffled", "engine-collect")(() =>
-        engineCollect(joined.plan, sources)
-      ),
-      measure("one-to-one-join-shuffled", "public-collect")(() =>
-        publicCollect(runtime, joined, "columnar", "HashJoin")
-      ),
-      measure("bare-scan-fallback", "public-collect")(() =>
-        publicCollect(runtime, left, "reference", "ReferenceWholePlan")
-      )
+    val filterResults = measurePair("filter", "engine-collect", "public-collect")(
+      () => engineCollect(filtered.plan, sources, "Filter"),
+      () => publicCollect(runtime, filtered, EngineId.Columnar, "Filter")
     )
+    val joinResults = measurePair(
+      "one-to-one-join-shuffled",
+      "engine-collect",
+      "public-collect"
+    )(
+      () => engineCollect(joined.plan, sources, "HashJoin"),
+      () => publicCollect(runtime, joined, EngineId.Columnar, "HashJoin")
+    )
+    val groupResults = measurePair(
+      "high-cardinality-group-shuffled",
+      "engine-collect",
+      "public-collect"
+    )(
+      () => engineCollect(grouped.plan, sources, "HashAggregate"),
+      () => publicCollect(runtime, grouped, EngineId.Columnar, "HashAggregate")
+    )
+    val results = filterResults ++ joinResults ++ groupResults :+
+      measure("bare-scan-fallback", "public-collect")(() =>
+        publicCollect(runtime, left, EngineId.Reference, "ReferenceWholePlan")
+      )
 
     val metrics = new StringBuilder
     metrics.append("workload\tendpoint\tmedian_ms\tmin_ms\tmax_ms\toutput_rows\n")

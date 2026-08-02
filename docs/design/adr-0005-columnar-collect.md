@@ -23,21 +23,22 @@ anything else agrees with it, which the reusable conformance boundary in
 `collect` runs the columnar engine and falls back to the reference interpreter
 whenever that engine declines.
 
-`stream` keeps running the reference cursor. This is the part worth stating
-plainly, because promoting both would have been the simpler change and looked
-like a bigger win. The columnar engine materializes its entire result before
-yielding anything. Promoting it under `stream` would convert an incremental
-stream into materialize-then-emit while the type signature, the documentation,
-and the tests all stayed green. Callers streaming a large result to bound memory
-would silently lose that property. `collect` already materializes by contract,
-so it gives up nothing.
+`stream` keeps reference semantics rather than routing through the columnar
+engine. The columnar engine materializes its entire result before yielding
+anything. Promoting it under `stream` would convert a non-blocking plan into
+materialize-then-emit while the type signature stayed unchanged. ADR-0007
+implements the normal `SourceBinding` route directly over scoped FS2 batches
+for non-blocking plans and retains explicit reference materialization for
+aggregate, join, and sort. `collect` already materializes by contract, so it
+gives up nothing.
 
-`ColumnarInterpreter.collectBatches` returns a `Left` for any plan the engine
-will not answer: no kernel matched, a kernel hit a capability residual,
-execution errored, or the result holds a vector with no batch form. A `Left` is
-a decline, never a failed query. The reference path then runs and remains the
-definition of correct behaviour, so declining is always safe and the reason is
-meant to be reported rather than swallowed.
+`ColumnarInterpreter.collect` returns an in-engine reference result when no
+kernel matches or a kernel reaches a capability residual. It returns `Left`
+only when execution fails or the result has no batch representation. Under the
+default `EnginePolicy.Auto`, the runtime then runs the reference path and
+reports a typed decline reason. `RequireColumnar` instead returns a structured
+policy failure. The reference interpreter remains the definition of correct
+behavior, but fallback is never hidden from the caller.
 
 ## Materialization bridge
 
@@ -71,6 +72,5 @@ It caught precisely that during development: the first bridge had no
 Widening the fast path is additive. Each addition should arrive with a
 conformance test, and none of it changes what a decline means.
 
-Promoting `stream` remains open and needs its own decision, because it is a
-change to the streaming contract rather than to performance. Chunked or
-incremental columnar execution would remove the tension entirely.
+Chunked or incremental columnar execution could become a future streaming
+engine, but only behind the bounded contract in ADR-0007.

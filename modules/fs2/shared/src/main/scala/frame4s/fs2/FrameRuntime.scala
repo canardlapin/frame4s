@@ -6,6 +6,7 @@ import cats.effect.Resource
 import cats.effect.kernel.Outcome
 import cats.effect.syntax.all.*
 import cats.syntax.all.*
+import fs2.Pull
 import fs2.Stream
 import scala.NamedTuple
 import frame4s.*
@@ -123,18 +124,40 @@ final case class SourceExecutionReceipt(
     pushdown: PushdownReceipt
 )
 
-/** Which engine answered a materializing collect, and why.
-  *
-  * `backend` is `"columnar"` when the optimized engine executed the plan and `"reference"` when the
-  * semantic reference interpreter did. `fallback` carries the engine's stated reason whenever the
-  * reference interpreter answered; it is never a failure, because the reference path defines
-  * correct behaviour. Streaming executions carry no engine receipt: `stream` deliberately stays on
-  * the incremental reference cursor.
-  */
+enum EngineId:
+  case Reference
+  case Columnar
+
+enum EnginePolicy:
+  case Auto
+  case ReferenceOnly
+  case RequireColumnar
+
+enum EngineFallbackReason:
+  case UnsupportedLogicalShape(nodeName: String)
+  case CapabilityResidual(detail: String)
+  case ColumnarDeclined(detail: String)
+
+  def message: String = this match
+    case UnsupportedLogicalShape(nodeName) => s"unsupported logical shape $nodeName"
+    case CapabilityResidual(detail)        => s"columnar capability residual: $detail"
+    case ColumnarDeclined(detail)          => s"columnar execution declined: $detail"
+
+enum EnginePolicyError:
+  case RequiredEngineUnavailable(required: EngineId, reason: EngineFallbackReason)
+
+  def message: String = this match
+    case RequiredEngineUnavailable(required, reason) =>
+      s"required engine $required is unavailable: ${reason.message}"
+
+final case class EnginePolicyFailure(error: EnginePolicyError)
+    extends RuntimeException(error.message)
+
+/** Which engine answered a materializing collect, and why. */
 final case class EngineReceipt(
-    backend: String,
+    engine: EngineId,
     physicalPlan: String,
-    fallback: Option[String]
+    fallback: Option[EngineFallbackReason]
 )
 
 final case class ExecutionReceipt(
@@ -161,6 +184,7 @@ sealed private trait AcquiredBinding[F[_]]:
   def reference: SourceRef
   def expected: Schema
   def inspection: SourceInspection
+  def plan(request: ScanRequest)(using F: Async[F]): F[PlannedBinding[F]]
   def materialize(request: ScanRequest)(using
       F: Async[F]
   ): Resource[F, MaterializedBinding]
@@ -176,72 +200,89 @@ final private class TypedAcquiredBinding[
   val reference: SourceRef = binding.reference
   val expected: Schema = binding.descriptor.schema
 
+  private def plannedScan(request: ScanRequest)(using F: Async[F]): F[PlannedScan[F]] =
+    source
+      .plan(request)
+      .flatMap:
+        case Left(error) =>
+          F.raiseError(RuntimeBindingFailure(RuntimeBindingError.Source(reference.id, error)))
+        case Right(scan) if scan.schema != expected =>
+          F.raiseError(
+            RuntimeBindingFailure(
+              RuntimeBindingError.SourceSchema(reference.id, expected, scan.schema)
+            )
+          )
+        case Right(scan) => F.pure(scan)
+
+  def plan(request: ScanRequest)(using F: Async[F]): F[PlannedBinding[F]] =
+    plannedScan(request).map: scan =>
+      val batches = scan.batches.handleErrorWith:
+        case SourceFailure(error) =>
+          Stream.raiseError[F](
+            RuntimeBindingFailure(RuntimeBindingError.Source(reference.id, error))
+          )
+        case other => Stream.raiseError[F](other)
+      PlannedBinding(
+        reference,
+        batches,
+        SourceExecutionReceipt(reference, inspection, scan.receipt)
+      )
+
   def materialize(
       request: ScanRequest
   )(using F: Async[F]): Resource[F, MaterializedBinding] =
     Resource
       .makeFull[F, (Table[S], PushdownReceipt)](poll =>
-        source
-          .plan(request)
-          .flatMap:
-            case Left(error) =>
-              F.raiseError(RuntimeBindingFailure(RuntimeBindingError.Source(reference.id, error)))
-            case Right(scan) if scan.schema != expected =>
-              F.raiseError(
-                RuntimeBindingFailure(
-                  RuntimeBindingError.SourceSchema(reference.id, expected, scan.schema)
-                )
-              )
-            case Right(scan) =>
-              Ref
-                .of[F, Vector[RecordBatch]](Vector.empty)
-                .flatMap: retained =>
-                  def closeRetained: F[Unit] =
-                    retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
+        plannedScan(request).flatMap: scan =>
+          Ref
+            .of[F, Vector[RecordBatch]](Vector.empty)
+            .flatMap: retained =>
+              def closeRetained: F[Unit] =
+                retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
 
-                  val copy = scan.batches.evalMap: batch =>
-                    F.uncancelable: _ =>
-                      F.delay(batch.slice(0, batch.rowCount))
-                        .flatMap:
-                          case Right(value) => F.pure(value)
-                          case Left(error)  =>
-                            F.raiseError(
-                              RuntimeBindingFailure(
-                                RuntimeBindingError.Source(
-                                  reference.id,
-                                  SourceError.Storage(error)
-                                )
-                              )
-                            )
-                        .flatTap(value => retained.update(_ :+ value))
-
-                  poll(
-                    copy.compile.drain.handleErrorWith:
-                      case SourceFailure(error) =>
+              val copy = scan.batches.evalMap: batch =>
+                F.uncancelable: _ =>
+                  F.delay(batch.slice(0, batch.rowCount))
+                    .flatMap:
+                      case Right(value) => F.pure(value)
+                      case Left(error)  =>
                         F.raiseError(
                           RuntimeBindingFailure(
-                            RuntimeBindingError.Source(reference.id, error)
+                            RuntimeBindingError.Source(
+                              reference.id,
+                              SourceError.Storage(error)
+                            )
                           )
                         )
-                      case other => F.raiseError(other)
-                  )
-                    .guaranteeCase:
-                      case Outcome.Succeeded(_) => F.unit
-                      case _                    => closeRetained
-                    .flatMap: _ =>
-                      retained.get.flatMap: batches =>
-                        Table[S](batches)(using binding.descriptor) match
-                          case Right(table) => F.pure((table, scan.receipt))
-                          case Left(error)  =>
-                            closeRetained *>
-                              F.raiseError[(Table[S], PushdownReceipt)](
-                                RuntimeBindingFailure(
-                                  RuntimeBindingError.Source(
-                                    reference.id,
-                                    SourceError.Storage(error)
-                                  )
-                                )
+                    .flatTap(value => retained.update(_ :+ value))
+
+              poll(
+                copy.compile.drain.handleErrorWith:
+                  case SourceFailure(error) =>
+                    F.raiseError(
+                      RuntimeBindingFailure(
+                        RuntimeBindingError.Source(reference.id, error)
+                      )
+                    )
+                  case other => F.raiseError(other)
+              )
+                .guaranteeCase:
+                  case Outcome.Succeeded(_) => F.unit
+                  case _                    => closeRetained
+                .flatMap: _ =>
+                  retained.get.flatMap: batches =>
+                    Table[S](batches)(using binding.descriptor) match
+                      case Right(table) => F.pure((table, scan.receipt))
+                      case Left(error)  =>
+                        closeRetained *>
+                          F.raiseError[(Table[S], PushdownReceipt)](
+                            RuntimeBindingFailure(
+                              RuntimeBindingError.Source(
+                                reference.id,
+                                SourceError.Storage(error)
                               )
+                            )
+                          )
       )((table, _) => F.delay(table.close()))
       .map: (table, receipt) =>
         MaterializedBinding(
@@ -254,10 +295,34 @@ final private case class MaterializedBinding(
     receipt: SourceExecutionReceipt
 )
 
+final private case class PlannedBinding[F[_]](
+    reference: SourceRef,
+    batches: Stream[F, RecordBatch],
+    receipt: SourceExecutionReceipt
+)
+
 final private case class PreparedExecution(
     sources: ReferenceSources,
     receipt: ExecutionReceipt
 )
+
+final private case class PreparedStream[F[_]](
+    sources: Map[String, PlannedBinding[F]],
+    receipt: ExecutionReceipt
+)
+
+sealed private trait CollectedBatches[F[_]]:
+  def engine: EngineReceipt
+
+final private case class OwnedCollectedBatches[F[_]](
+    engine: EngineReceipt,
+    batches: Vector[RecordBatch]
+) extends CollectedBatches[F]
+
+final private case class ScopedCollectedBatches[F[_]](
+    engine: EngineReceipt,
+    batches: Stream[F, RecordBatch]
+) extends CollectedBatches[F]
 
 /** Effectful execution boundary for pure `Frame` values.
   *
@@ -273,8 +338,9 @@ final private case class PreparedExecution(
   * in-memory workflows bind `FrameSource` values directly.
   */
 final class FrameRuntime[F[_]] private (
-    bindings: Vector[AcquiredBinding[F]],
-    legacySources: Option[ReferenceSources]
+    private[fs2] val bindings: Vector[AcquiredBinding[F]],
+    legacySources: Option[ReferenceSources],
+    enginePolicy: EnginePolicy
 )(using F: Async[F]):
   private def executionFailure[A](result: Either[ExecutionError, A]): F[A] =
     F.fromEither(result.left.map(ExecutionFailure.apply))
@@ -300,6 +366,66 @@ final class FrameRuntime[F[_]] private (
       )(cursor => F.delay(cursor.close()))
       .flatMap(batches)
 
+  private def scopedBatch(acquire: F[RecordBatch]): Stream[F, RecordBatch] =
+    Stream.bracket(acquire)(batch => F.delay(batch.close())).flatMap(Stream.emit)
+
+  private def transformBatches(
+      input: Stream[F, RecordBatch]
+  )(
+      transform: RecordBatch => Either[ExecutionError, RecordBatch]
+  ): Stream[F, RecordBatch] =
+    input.flatMap: batch =>
+      scopedBatch(F.delay(transform(batch)).flatMap(executionFailure))
+
+  private def limitBatches(
+      input: Stream[F, RecordBatch],
+      requested: Int
+  ): Stream[F, RecordBatch] =
+    def loop(
+        remainingInput: Stream[F, RecordBatch],
+        remainingRows: Long
+    ): Pull[F, RecordBatch, Unit] =
+      if remainingRows <= 0L then Pull.done
+      else
+        remainingInput.pull.uncons1.flatMap:
+          case None                                                          => Pull.done
+          case Some((batch, tail)) if batch.rowCount.toLong <= remainingRows =>
+            Pull.output1(batch) >> loop(tail, remainingRows - batch.rowCount.toLong)
+          case Some((batch, _)) =>
+            val sliced = F
+              .delay(batch.slice(0, remainingRows.toInt).leftMap(ExecutionError.Storage.apply))
+              .flatMap(executionFailure)
+            scopedBatch(sliced).pull.echo
+
+    loop(input, requested.toLong).stream
+
+  private def incrementalBatches(
+      plan: LogicalPlan,
+      sources: Map[String, PlannedBinding[F]]
+  ): Stream[F, RecordBatch] =
+    plan match
+      case LogicalPlan.Source(reference, _) =>
+        sources.get(reference.id.value) match
+          case Some(source) => source.batches
+          case None         =>
+            Stream.raiseError[F](
+              RuntimeBindingFailure(RuntimeBindingError.MissingSource(reference.id))
+            )
+      case LogicalPlan.Project(input, expressions, schema) =>
+        transformBatches(incrementalBatches(input, sources)): batch =>
+          ReferenceInterpreter.projectBatch(batch, expressions, schema)
+      case LogicalPlan.Filter(input, predicate, schema) =>
+        transformBatches(incrementalBatches(input, sources)): batch =>
+          ReferenceInterpreter.filterBatch(batch, predicate, schema)
+      case LogicalPlan.Limit(input, count, _) =>
+        limitBatches(incrementalBatches(input, sources), count)
+      case LogicalPlan.UnionAll(left, right, _) =>
+        incrementalBatches(left, sources) ++ incrementalBatches(right, sources)
+      case other =>
+        Stream.raiseError[F](
+          ExecutionFailure(ExecutionError.UnsupportedNode(s"incremental ${other.nodeName}"))
+        )
+
   /** Batches for a materializing collect, from the optimized engine when it will take the plan.
     *
     * Only `collect` routes here. `stream` deliberately stays on the reference cursor: the optimized
@@ -315,30 +441,70 @@ final class FrameRuntime[F[_]] private (
   private def collectBatches(
       frame: Frame[?],
       sources: ReferenceSources
-  ): F[(EngineReceipt, Stream[F, RecordBatch])] =
-    F.delay(ColumnarInterpreter.collect(frame.plan, sources))
-      .map:
-        case Right(collected) =>
-          val backend =
-            if collected.receipt.fallback.isDefined then "reference" else "columnar"
-          val stream = Stream
-            .emits(collected.batches)
-            .covary[F]
-            .flatMap: batch =>
-              Stream.bracket(F.pure(batch))(value => F.delay(value.close()))
-          (
-            EngineReceipt(backend, collected.receipt.physicalPlan, collected.receipt.fallback),
-            stream
-          )
-        case Left(reason) =>
-          (
-            EngineReceipt(
-              "reference",
-              ReferenceInterpreter.prepare(frame.plan, sources).physicalExplain,
-              Some(reason)
-            ),
-            referenceBatches(frame, sources)
-          )
+  ): F[CollectedBatches[F]] =
+    def reference(
+        fallback: Option[EngineFallbackReason]
+    ): CollectedBatches[F] =
+      ScopedCollectedBatches(
+        EngineReceipt(
+          EngineId.Reference,
+          ReferenceInterpreter.prepare(frame.plan, sources).physicalExplain,
+          fallback
+        ),
+        referenceBatches(frame, sources)
+      )
+
+    def reject(reason: EngineFallbackReason): F[CollectedBatches[F]] =
+      F.raiseError(
+        EnginePolicyFailure(
+          EnginePolicyError.RequiredEngineUnavailable(EngineId.Columnar, reason)
+        )
+      )
+
+    def typedFallback(collected: ColumnarCollect): Option[EngineFallbackReason] =
+      (collected.receipt.fallback, collected.receipt.fallbackKind) match
+        case (Some(_), Some(ColumnarFallbackKind.UnsupportedLogicalShape)) =>
+          Some(EngineFallbackReason.UnsupportedLogicalShape(frame.plan.nodeName))
+        case (Some(reason), Some(ColumnarFallbackKind.CapabilityResidual)) =>
+          Some(EngineFallbackReason.CapabilityResidual(reason))
+        case (Some(reason), None) => Some(EngineFallbackReason.ColumnarDeclined(reason))
+        case _                    => None
+
+    enginePolicy match
+      case EnginePolicy.ReferenceOnly => F.pure(reference(None))
+      case EnginePolicy.Auto          =>
+        F.delay(ColumnarInterpreter.collect(frame.plan, sources))
+          .flatMap:
+            case Right(collected) =>
+              val fallback = typedFallback(collected)
+              val engine = fallback.fold(EngineId.Columnar)(_ => EngineId.Reference)
+              F.pure(
+                OwnedCollectedBatches(
+                  EngineReceipt(engine, collected.receipt.physicalPlan, fallback),
+                  collected.batches
+                )
+              )
+            case Left(reason) =>
+              val fallback = EngineFallbackReason.ColumnarDeclined(reason)
+              F.pure(reference(Some(fallback)))
+      case EnginePolicy.RequireColumnar =>
+        F.delay(ColumnarInterpreter.collectRequired(frame.plan, sources))
+          .flatMap:
+            case Right(collected) =>
+              F.pure(
+                OwnedCollectedBatches(
+                  EngineReceipt(EngineId.Columnar, collected.receipt.physicalPlan, None),
+                  collected.batches
+                )
+              )
+            case Left(RequiredColumnarFailure.UnsupportedLogicalShape(nodeName)) =>
+              reject(EngineFallbackReason.UnsupportedLogicalShape(nodeName))
+            case Left(RequiredColumnarFailure.CapabilityResidual(detail)) =>
+              reject(EngineFallbackReason.CapabilityResidual(detail))
+            case Left(RequiredColumnarFailure.ResultMaterialization(detail)) =>
+              reject(EngineFallbackReason.ColumnarDeclined(detail))
+            case Left(RequiredColumnarFailure.Execution(error)) =>
+              F.raiseError(ExecutionFailure(error))
 
   private def prepare(frame: Frame[?]): Resource[F, PreparedExecution] =
     legacySources match
@@ -375,6 +541,25 @@ final class FrameRuntime[F[_]] private (
                             ExecutionReceipt(current.receipt.sources :+ materialized.receipt)
                           )
 
+  private def prepareStream(frame: Frame[?]): Resource[F, PreparedStream[F]] =
+    Resource
+      .eval(F.fromEither(planSources(frame.plan).leftMap(RuntimeBindingFailure.apply)))
+      .flatMap: required =>
+        val available = bindings.map(binding => binding.reference.id.value -> binding).toMap
+        Resource.eval:
+          required.traverse: source =>
+            available.get(source.reference.id.value) match
+              case None =>
+                F.raiseError[PlannedBinding[F]](
+                  RuntimeBindingFailure(RuntimeBindingError.MissingSource(source.reference.id))
+                )
+              case Some(binding) => binding.plan(source.request)
+      .map: planned =>
+        PreparedStream(
+          planned.map(source => source.reference.id.value -> source).toMap,
+          ExecutionReceipt(planned.map(_.receipt))
+        )
+
   /** Execute as a re-runnable stream and expose the accepted/residual pushdown receipt.
     *
     * Each acquisition opens a new invocation. The stream and its batches must be consumed inside
@@ -383,11 +568,19 @@ final class FrameRuntime[F[_]] private (
   def streamWithReceipt[S <: NamedTuple.AnyNamedTuple](
       frame: Frame[S]
   ): Resource[F, StreamedExecution[F]] =
-    prepare(frame).map: prepared =>
-      StreamedExecution(
-        prepared.receipt,
-        referenceBatches(frame, prepared.sources)
-      )
+    val shape = ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).shape
+    if legacySources.isDefined || !shape.streaming then
+      prepare(frame).map: prepared =>
+        StreamedExecution(
+          prepared.receipt,
+          referenceBatches(frame, prepared.sources)
+        )
+    else
+      prepareStream(frame).map: prepared =>
+        StreamedExecution(
+          prepared.receipt,
+          incrementalBatches(frame.plan, prepared.sources)
+        )
 
   /** Convenience streaming path. Use `streamWithReceipt` when the negotiation receipt is needed. */
   def stream[S <: NamedTuple.AnyNamedTuple](frame: Frame[S]): Stream[F, RecordBatch] =
@@ -422,27 +615,40 @@ final class FrameRuntime[F[_]] private (
           def closeRetained: F[Unit] =
             retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
 
-          collectBatches(frame, sources).flatMap: (engine, engineBatches) =>
-            val copyBatches = engineBatches.evalMap: batch =>
-              F.uncancelable: _ =>
-                F.delay(batch.slice(0, batch.rowCount))
-                  .flatMap(result =>
-                    executionFailure(result.left.map(ExecutionError.Storage.apply))
-                  )
-                  .flatTap(copy => retained.update(_ :+ copy))
-            poll(copyBatches.compile.drain)
-              .guaranteeCase:
-                case Outcome.Succeeded(_) => F.unit
-                case _                    => closeRetained
-              .flatMap: _ =>
-                retained.get.flatMap: batches =>
-                  Table[S](batches)(using frame.descriptor) match
-                    case Right(table) => F.pure((engine, table))
-                    case Left(error)  =>
-                      closeRetained *> F.raiseError[(EngineReceipt, Table[S])](
-                        ExecutionFailure(ExecutionError.Storage(error))
-                      )
+          collectBatches(frame, sources).flatMap:
+            case OwnedCollectedBatches(engine, batches) =>
+              Table[S](batches)(using frame.descriptor) match
+                case Right(table) => F.pure((engine, table))
+                case Left(error)  =>
+                  batches.traverse_(batch => F.delay(batch.close())) *>
+                    F.raiseError[(EngineReceipt, Table[S])](
+                      ExecutionFailure(ExecutionError.Storage(error))
+                    )
+            case ScopedCollectedBatches(engine, engineBatches) =>
+              val copyBatches = engineBatches.evalMap: batch =>
+                F.uncancelable: _ =>
+                  F.delay(batch.slice(0, batch.rowCount))
+                    .flatMap(result =>
+                      executionFailure(result.left.map(ExecutionError.Storage.apply))
+                    )
+                    .flatTap(copy => retained.update(_ :+ copy))
+              poll(copyBatches.compile.drain)
+                .guaranteeCase:
+                  case Outcome.Succeeded(_) => F.unit
+                  case _                    => closeRetained
+                .flatMap: _ =>
+                  retained.get.flatMap: batches =>
+                    Table[S](batches)(using frame.descriptor) match
+                      case Right(table) => F.pure((engine, table))
+                      case Left(error)  =>
+                        closeRetained *> F.raiseError[(EngineReceipt, Table[S])](
+                          ExecutionFailure(ExecutionError.Storage(error))
+                        )
     )(acquired => F.delay(acquired(1).close()))
+
+  /** The physical reference route used by `stream`, including any blocking operators. */
+  def streamPhysicalExplain[S <: NamedTuple.AnyNamedTuple](frame: Frame[S]): String =
+    ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).physicalExplain
 
   /** The physical plan a materializing collect would execute, including the engine decision.
     *
@@ -450,13 +656,20 @@ final class FrameRuntime[F[_]] private (
     * executions always use the reference cursor regardless of what this reports.
     */
   def physicalExplain[S <: NamedTuple.AnyNamedTuple](frame: Frame[S]): String =
-    val columnar = ColumnarInterpreter.prepare(frame.plan, ReferenceSources.empty)
-    try
-      columnar.kernelName match
-        case Some(_) => columnar.physicalExplain
-        case None    =>
-          ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).physicalExplain
-    finally columnar.close()
+    enginePolicy match
+      case EnginePolicy.ReferenceOnly =>
+        ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).physicalExplain
+      case EnginePolicy.Auto | EnginePolicy.RequireColumnar =>
+        val columnar = ColumnarInterpreter.prepare(frame.plan, ReferenceSources.empty)
+        try
+          columnar.kernelName match
+            case Some(_)                                   => columnar.physicalExplain
+            case None if enginePolicy == EnginePolicy.Auto =>
+              ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).physicalExplain
+            case None =>
+              val reason = EngineFallbackReason.UnsupportedLogicalShape(frame.plan.nodeName)
+              s"ColumnarExecution(operator=Unavailable, policy=RequireColumnar, reason=${reason.message})"
+        finally columnar.close()
 
 final private case class RequiredSource(
     reference: SourceRef,
@@ -660,7 +873,15 @@ object FrameRuntime:
                         Resource.pure(
                           current :+ typedAcquired(binding, source, inspection)
                         )
-          .map(acquired => new FrameRuntime(acquired, None))
+          .map(acquired => new FrameRuntime(acquired, None, EnginePolicy.Auto))
+
+  /** Acquire sources with an explicit materializing-engine policy. */
+  def resource[F[_]](
+      policy: EnginePolicy,
+      first: SourceBinding[F, ? <: NamedTuple.AnyNamedTuple],
+      rest: SourceBinding[F, ? <: NamedTuple.AnyNamedTuple]*
+  )(using F: Async[F]): Resource[F, FrameRuntime[F]] =
+    resource(first, rest*).map(runtime => new FrameRuntime(runtime.bindings, None, policy))
 
   private def typedAcquired[
       F[_],
@@ -674,4 +895,8 @@ object FrameRuntime:
 
   /** Semantic-oracle fixture constructor. Normal user workflows should use `resource`. */
   def apply[F[_]: Async](sources: ReferenceSources): FrameRuntime[F] =
-    new FrameRuntime(Vector.empty, Some(sources))
+    new FrameRuntime(Vector.empty, Some(sources), EnginePolicy.Auto)
+
+  /** Semantic-oracle fixture constructor with an explicit materializing-engine policy. */
+  def apply[F[_]: Async](sources: ReferenceSources, policy: EnginePolicy): FrameRuntime[F] =
+    new FrameRuntime(Vector.empty, Some(sources), policy)

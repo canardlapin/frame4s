@@ -239,6 +239,43 @@ object ReferenceInterpreter:
       () => open(plan, sources)
     )
 
+  /** Apply one non-blocking project node to an owned input batch.
+    *
+    * The input is consumed and closed. The caller owns the returned batch. This package boundary
+    * lets the effectful runtime preserve the oracle's expression semantics while it controls source
+    * pulling with FS2.
+    */
+  private[frame4s] def projectBatch(
+      input: RecordBatch,
+      expressions: Vector[NamedExpression],
+      schema: Schema
+  ): Either[ExecutionError, RecordBatch] =
+    transformBatch(input, cursor => new ProjectCursor(cursor, expressions, schema))
+
+  /** Apply one non-blocking filter node to an owned input batch.
+    *
+    * The input is consumed and closed. The caller owns the returned batch.
+    */
+  private[frame4s] def filterBatch(
+      input: RecordBatch,
+      predicate: ResolvedExpr,
+      schema: Schema
+  ): Either[ExecutionError, RecordBatch] =
+    transformBatch(input, cursor => new FilterCursor(cursor, predicate, schema))
+
+  private def transformBatch(
+      input: RecordBatch,
+      transform: ExecutionCursor => ExecutionCursor
+  ): Either[ExecutionError, RecordBatch] =
+    val cursor = transform(new SingleBatchCursor(input))
+    try
+      cursor
+        .nextBatch()
+        .flatMap:
+          case Some(batch) => Right(batch)
+          case None        => Left(ExecutionError.UnsupportedNode("empty batch transform"))
+    finally cursor.close()
+
   private def blockingNodes(plan: LogicalPlan): Vector[String] = plan match
     case _: LogicalPlan.Aggregate => Vector("Aggregate") ++ plan.children.flatMap(blockingNodes)
     case _: LogicalPlan.Join      => Vector("Join") ++ plan.children.flatMap(blockingNodes)
@@ -289,6 +326,22 @@ object ReferenceInterpreter:
             Left(error)
     case LogicalPlan.Sort(input, order, schema) =>
       open(input, sources).map(new SortCursor(_, order, schema))
+
+  final private class SingleBatchCursor(batch: RecordBatch) extends ExecutionCursor:
+    private var emitted = false
+    private var closed = false
+
+    def nextBatch(): Either[ExecutionError, Option[RecordBatch]] =
+      if closed then Left(ExecutionError.Storage(StorageError.SourceClosed))
+      else if emitted then Right(None)
+      else
+        emitted = true
+        Right(Some(batch))
+
+    def close(): Unit =
+      if !closed then
+        closed = true
+        batch.close()
 
   final private class ProjectCursor(
       input: ExecutionCursor,

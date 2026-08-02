@@ -32,6 +32,14 @@ batch. Completion, structured failure, early termination, and cancellation
 close cursor and batch leases exactly once. A borrowed input remains owned by
 its caller; an owning source closes its input in its source resource.
 
+Source, filter, project, `withColumn`, limit, and `unionAll` plans pull batches
+on demand. A satisfied limit stops source pulls, including before the right
+branch of a union when the left branch supplies enough rows. Aggregate, join,
+and sort are blocking in the semantic runtime: `stream` materializes their
+required inputs inside its resource before it emits a result batch. Use
+`runtime.streamPhysicalExplain(frame)` to inspect this distinction; it reports
+`mode=streaming` or `mode=blocking` and names the blocking operators.
+
 `Table` is a materialized read view, not a second query algebra. Use its typed
 `row`, `cell`, and `column` decoders or its bounded `show` methods inside the
 resource scope; decoded values are detached immutable Scala values and may be
@@ -74,7 +82,25 @@ def joined(
 pushdown receipt, and errors. frame4s rejects an attempt to combine
 single-source convenience bindings and directs the caller to these
 constructors. `FrameRuntime` also remains the public route when a caller needs
-an execution receipt or backend selection.
+an execution receipt or engine selection. The convenience route uses
+`EnginePolicy.Auto`. Select a stricter policy at the resource boundary:
+
+```scala mdoc:compile-only
+import cats.effect.{IO, Resource}
+import frame4s.fs2.*
+
+type BoundRow = (id: Int, label: String)
+
+def columnarOnly(
+    binding: SourceBinding[IO, BoundRow]
+): Resource[IO, FrameRuntime[IO]] =
+  FrameRuntime.resource(EnginePolicy.RequireColumnar, binding)
+```
+
+`ReferenceOnly` bypasses the optimized engine. `RequireColumnar` fails with
+`EnginePolicyFailure` when the plan is not admitted. Read `EngineReceipt.engine`
+and `EngineReceipt.fallback` as ADTs; `physicalPlan` is explanatory text and
+must not be parsed for control flow.
 
 Next, review the [semantic and explain](semantics-and-explain.md) guarantees
 that every backend must preserve.

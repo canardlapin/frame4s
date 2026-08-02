@@ -169,7 +169,7 @@ class FrameRuntimeSuite extends munit.FunSuite:
           val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
           // A silent decline here would make every runtime comparison vacuous, because both
           // sides would be the reference interpreter.
-          assertEquals(engine.backend, "columnar")
+          assertEquals(engine.engine, EngineId.Columnar)
           assertEquals(engine.fallback, None)
           assert(engine.physicalPlan.contains("FilterSelection"), engine.physicalPlan)
           assertEquals(ids(execution.table), Vector(2, 3).map(ScalarValue.Int32.apply))
@@ -179,10 +179,10 @@ class FrameRuntimeSuite extends munit.FunSuite:
           .use: execution =>
             IO:
               val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
-              assertEquals(engine.backend, "reference")
-              assert(
-                engine.fallback.exists(_.contains("unsupported logical shape")),
-                engine.fallback
+              assertEquals(engine.engine, EngineId.Reference)
+              assertEquals(
+                engine.fallback,
+                Some(EngineFallbackReason.UnsupportedLogicalShape("Values"))
               )
               assertEquals(ids(execution.table), Vector(1, 2, 3).map(ScalarValue.Int32.apply))
       .flatMap: _ =>
@@ -201,6 +201,74 @@ class FrameRuntimeSuite extends munit.FunSuite:
       "ReferenceExecution(mode=streaming, blocking=none, operators=Values, estimatedRows=unknown, fallback=none)"
     )
     input.close()
+
+  test("engine policies are explicit, typed, and enforced"):
+    val tracker = new BufferTracker
+    val input = table(tracker, Vector(Array(Int.MaxValue, 2, 3)))
+    val sources = ReferenceSources.empty.bind(reference, input)
+    val supported = frame.filter(row => row.col("id") > 1)
+    val unsupportedOverflow = frame
+      .withColumn("next")(_.col("id") + 1)
+      .limit(1)
+      .fold(error => fail(error.message), identity)
+    val referenceOnly = FrameRuntime[IO](sources, EnginePolicy.ReferenceOnly)
+    val requireColumnar = FrameRuntime[IO](sources, EnginePolicy.RequireColumnar)
+    val baseline = tracker.snapshot
+
+    referenceOnly
+      .collectWithReceipt(supported)
+      .use: execution =>
+        IO:
+          val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+          assertEquals(engine.engine, EngineId.Reference)
+          assertEquals(engine.fallback, None)
+          assert(engine.physicalPlan.startsWith("ReferenceExecution"), engine.physicalPlan)
+      .flatMap: _ =>
+        requireColumnar
+          .collectWithReceipt(supported)
+          .use: execution =>
+            IO:
+              val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+              assertEquals(engine.engine, EngineId.Columnar)
+              assertEquals(engine.fallback, None)
+      .flatMap: _ =>
+        requireColumnar.collectWithReceipt(frame).use(_ => IO.unit).attempt
+      .flatMap:
+        case Left(
+              EnginePolicyFailure(
+                EnginePolicyError.RequiredEngineUnavailable(
+                  EngineId.Columnar,
+                  EngineFallbackReason.UnsupportedLogicalShape("Values")
+                )
+              )
+            ) =>
+          IO.unit
+        case other => IO(fail(s"expected a typed require-columnar failure, found $other"))
+      .flatMap: _ =>
+        requireColumnar.collectWithReceipt(unsupportedOverflow).use(_ => IO.unit).attempt
+      .flatMap:
+        case Left(
+              EnginePolicyFailure(
+                EnginePolicyError.RequiredEngineUnavailable(
+                  EngineId.Columnar,
+                  EngineFallbackReason.UnsupportedLogicalShape("Limit")
+                )
+              )
+            ) =>
+          IO.unit
+        case other =>
+          IO(fail(s"expected require-columnar to decline before reference overflow, found $other"))
+      .flatMap: _ =>
+        IO:
+          assertEquals(tracker.snapshot, baseline)
+          assertEquals(
+            requireColumnar.physicalExplain(frame),
+            "ColumnarExecution(operator=Unavailable, policy=RequireColumnar, " +
+              "reason=unsupported logical shape Values)"
+          )
+          input.close()
+          assertEquals(tracker.snapshot.activeOwners, 0)
+      .unsafeToFuture()
 
   test("union and existential joins release execution leases on cancellation"):
     type Right = (key: Int)
@@ -313,6 +381,7 @@ class FrameRuntimeSuite extends munit.FunSuite:
             result.receipt.residual.map(_._2),
             Vector(PushdownFeature.BatchSize, PushdownFeature.BatchSize)
           )
+          assertEquals(result.receipt.engine.map(_.engine), Some(EngineId.Columnar))
       .guarantee(IO(leftTable.close()) *> IO(rightTable.close()))
       .unsafeToFuture()
 

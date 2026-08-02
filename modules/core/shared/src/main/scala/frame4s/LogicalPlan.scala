@@ -72,7 +72,9 @@ object SourceRef:
       kind: SourceKind,
       order: OrderGuarantee
   ): Either[FrameError, SourceRef] =
-    if id.trim.isEmpty then Left(FrameError.InvalidSourceId(id))
+    if id == null then Left(FrameError.NullSourceId)
+    else if displayName == null then Left(FrameError.NullSourceName)
+    else if id.trim.isEmpty then Left(FrameError.InvalidSourceId(id))
     else if displayName.trim.isEmpty then Left(FrameError.InvalidSourceName(displayName))
     else Right(SourceRef(SourceId.unsafe(id), displayName, kind, order))
 

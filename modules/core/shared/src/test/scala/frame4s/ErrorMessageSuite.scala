@@ -35,6 +35,8 @@ class ErrorMessageSuite extends munit.FunSuite:
 
   test("frame planning diagnostics cover every public branch"):
     val errors = Vector(
+      FrameError.NullSourceId,
+      FrameError.NullSourceName,
       FrameError.InvalidSourceId(""),
       FrameError.InvalidSourceName(""),
       FrameError.InvalidSchema(SchemaError.EmptyFieldName(0)),
@@ -56,6 +58,8 @@ class ErrorMessageSuite extends munit.FunSuite:
     )
 
     assert(errors.forall(_.message.nonEmpty))
+    assertEquals(FrameError.NullSourceId.message, "source id is null")
+    assertEquals(FrameError.NullSourceName.message, "source name is null")
     assertEquals(
       FrameError.DuplicateOutputNames(Vector("id", "score")).message,
       "output column names are duplicated: id, score"

@@ -256,26 +256,48 @@ filter/fusion, aggregation, join, distinct, and union shapes; unsupported
 shapes use one explicit whole-plan reference fallback with a receipt. Its
 detached results obey a close protocol, and reusable JVM/Scala.js differential
 laws compare schemas, values, failures, and ordering with the oracle. The
+physical vector boundary is isolated in `ColumnarVectors.scala`: raw borrowed
+views, owned value vectors, selection/gather materialization, physical-buffer
+copying, checksums, and the `RecordBatch` bridge remain package-private there.
+`ColumnarInterpreter.scala` retains execution admission and kernels behind the
+same facade. Unsafe indexed access and physical casts do not cross that
+package-private performance boundary. The
 public runtime's materializing `collect` executes through it (ADR-0005), the
 engine decision is surfaced in the execution receipt rather than hidden
-(ADR-0006), and `stream` deliberately stays on the incremental reference
-cursor.
+(ADR-0006), and `stream` uses the incremental reference route.
+
+Engine selection is an effect-boundary policy, not ambient state.
+`EnginePolicy.Auto` is the `SourceBinding` convenience default,
+`ReferenceOnly` bypasses columnar execution, and `RequireColumnar` fails with a
+structured `EnginePolicyError` when the optimized engine cannot answer.
+`EngineReceipt` exposes an `EngineId` and typed `EngineFallbackReason`; only the
+physical explain remains free-form diagnostic text.
 
 `frame4s-fs2` binds immutable typed `SourceBinding` descriptions through one
 invocation-scoped `FrameRuntime.resource`. All acquired sources are inspected
-against their exact ordered typed schemas before a reference execution cursor
-opens. Multi-source bindings support joins without a user-managed
+against their exact ordered typed schemas before execution. Multi-source
+bindings support joins without a user-managed
 `ReferenceSources`; that type remains an oracle-fixture boundary only.
 
-`FrameRuntime.stream` releases its source materializations, execution cursor,
-and each emitted batch on completion, failure, early termination, or
-cancellation. `FrameRuntime.collect` retains output batches into a
-`Resource[F, Table[Schema]]`; failed or canceled acquisition closes every
-retained batch, and the resource finalizer closes the materialized table.
+For non-blocking source, project, filter, limit, and union plans,
+`FrameRuntime.stream` pulls planned source batches on demand and retains only
+the active operator pipeline. Limit stops upstream pulls at its row budget, and
+union does not pull its right branch until the left branch ends. Aggregate,
+join, and sort use an explicit materializing reference route. Both routes
+release source state, cursors, and emitted batches on completion, failure,
+early termination, or cancellation. `FrameRuntime.collect` retains output
+batches into a `Resource[F, Table[Schema]]`; failed or canceled acquisition
+closes every retained batch, and the resource finalizer closes the materialized
+table. Already-owned columnar results transfer directly into that table;
+batches from the scoped reference stream are detached before the stream scope
+closes.
+`streamPhysicalExplain` reports the reference stream's blocking boundary;
+`physicalExplain` reports the engine selected for materializing collect.
 `streamWithReceipt` and `collectWithReceipt` expose requested, accepted, and
 residual source pushdown, and `collectWithReceipt` additionally carries an
 `EngineReceipt` naming which engine answered, its physical plan, and any
-fallback reason. Unsupported work stays in the logical reference path.
+typed fallback reason. Unsupported work stays in the logical reference path
+under `Auto`; `RequireColumnar` rejects it.
 
 CSV and TSV byte/character sources parse incrementally into bounded batches;
 UTF-8 decoding and quoted records may cross arbitrary input chunks. JVM path
@@ -321,4 +343,6 @@ The accepted release plan is authoritative. The first usable release includes:
 Full outer joins, windows, reshape, generic first/last aggregates, ambient
 runtime schema inference, Parquet, distributed execution, and a pandas-sized
 convenience surface are later work.
-Most importantly, 0.1 does not build a production columnar execution engine.
+The public runtime does include an in-process optimized columnar engine for its
+admitted materializing plans. It is not a general spill engine, distributed
+runtime, or claim of production-scale coverage beyond the ratified courts.

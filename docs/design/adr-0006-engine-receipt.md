@@ -1,6 +1,6 @@
 # ADR 0006: Surface the engine decision in the execution receipt
 
-Accepted 2026-08-01.
+Accepted 2026-08-01; amended 2026-08-02.
 
 ## Context
 
@@ -34,29 +34,38 @@ semantic change.
    There the runtime re-runs the reference path, which stays the
    definition of correct behaviour.
 
-2. **`ExecutionReceipt` gains an engine field.**
-   `collectWithReceipt` attaches `EngineReceipt(backend, physicalPlan,
-   fallback)`: `backend` is `"columnar"` or `"reference"`, matching the
-   testkit backend names; `physicalPlan` is the executed engine's plan;
-   `fallback` carries the engine's stated reason whenever the reference
-   interpreter answered. A fallback is never a failure. Streaming
-   executions carry `engine = None`: `stream` deliberately stays on the
-   incremental reference cursor per ADR-0005, and its promotion still
-   needs its own decision.
+2. **Engine choice and receipts are typed.** `EngineId` distinguishes
+   `Reference` from `Columnar`. `EngineFallbackReason` distinguishes an
+   unsupported logical shape, a kernel capability residual, and a columnar
+   execution decline. `collectWithReceipt` attaches
+   `EngineReceipt(engine, physicalPlan, fallback)`; callers do not compare
+   backend or fallback strings. Streaming executions carry no engine receipt
+   because they use the incremental reference route.
 
-3. **`physicalExplain` describes the composite.** Plans the engine admits
-   report the columnar operator; plans it declines report the reference
-   plan they actually run on, preserving the reference explain format for
-   fallback shapes.
+3. **Selection is explicit at the effectful boundary.** `EnginePolicy.Auto`
+   keeps the default behavior: use an admitted columnar kernel and otherwise
+   report reference fallback. `ReferenceOnly` bypasses columnar execution.
+   `RequireColumnar` returns `EnginePolicyFailure` when the engine cannot
+   answer; its required-only collect path does not open the reference
+   interpreter. The default
+   `SourceBinding` conveniences use `Auto`, while `FrameRuntime.resource`
+   accepts an explicit policy for callers that need a stricter contract.
+
+4. **`physicalExplain` follows the selected policy.** `ReferenceOnly` reports
+   the reference plan. `Auto` reports an admitted columnar plan or the
+   reference plan it would run. `RequireColumnar` reports the columnar plan or
+   an explicit unavailable result; it does not describe a reference plan that
+   the policy forbids.
 
 ## Consequences
 
-- The silent-decline regression named by ADR-0005 — both sides of a
-  comparison quietly becoming the reference interpreter — is now
-  detectable from the public API, and the runtime suite asserts
-  non-vacuity: a supported plan must produce `backend = "columnar"` with
-  no fallback, and a bare-source plan must produce `backend = "reference"`
-  with its reason.
+- The silent-decline regression named by ADR-0005 is detectable from the
+  public API. Runtime tests assert that a supported plan produces
+  `EngineId.Columnar`, while an unsupported shape under `Auto` reports
+  `EngineId.Reference` and a typed reason.
+- Applications that require predictable engine admission can select
+  `RequireColumnar` and handle one structured failure instead of inspecting
+  explanatory text.
 - Fallback plans no longer execute twice. The reference re-run survives
   only on the error and no-batch-form channels, where the reference path
   is re-executed to surface behaviour in its canonical shape.

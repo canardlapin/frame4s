@@ -314,6 +314,17 @@ class FrameApiSuite extends munit.FunSuite:
       Left(FrameError.NotValuesSource(scanRef.id, SourceKind.Scan))
     )
 
+  test("source constructors reject null identifiers without throwing"):
+    assertEquals(SourceRef.scan(null, "people"), Left(FrameError.NullSourceId))
+    assertEquals(SourceRef.values("people", null), Left(FrameError.NullSourceName))
+    assertEquals(SourceRef.scan(" ", "people"), Left(FrameError.InvalidSourceId(" ")))
+    assertEquals(SourceRef.scan("people", " "), Left(FrameError.InvalidSourceName(" ")))
+    assertEquals(Frame.source[People](null), Left(FrameError.NullSourceId))
+    assertEquals(
+      DynamicFrame.source(null, Vector(DynamicFrame.field("id", DataType.Int32, false))),
+      Left(FrameError.NullSourceId)
+    )
+
   test("missing and mistyped columns are rejected at compile time"):
     val missing = typeCheckErrors("""
       import frame4s.*

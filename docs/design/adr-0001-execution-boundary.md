@@ -51,6 +51,10 @@ The contract, not this ADR, fixes those surface spellings.
 ### Backend selection
 
 - The execution backend is selected explicitly at the effectful boundary.
+- `EnginePolicy.Auto` is the convenience default; `ReferenceOnly` and
+  `RequireColumnar` make a caller's stronger selection requirement explicit.
+- Engine identity, fallback reasons, and a failed required-engine selection are
+  ADTs. Human-readable physical plans remain diagnostic text, not control data.
 - The semantic reference backend is always available, but it is not selected
   through global mutable state or embedded in a `Frame`.
 - Optional optimized backends depend on the core/fs2 contracts; core and fs2 do

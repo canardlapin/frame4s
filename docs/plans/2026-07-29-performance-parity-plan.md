@@ -229,18 +229,21 @@ execution receipt rather than hiding it, and ships with an ADR recording the
 rationale and a dated receipt measuring the public path. This runs last so the
 engine being promoted is the improved one.
 
-**Complete.** `collect` was routed through the engine by ADR-0005; ADR-0006
-finishes the promotion by honouring the reporting commitment. The engine's
-in-engine fallback result is now returned rather than discarded, so fallback
-plans execute exactly once; `collectWithReceipt` carries an `EngineReceipt`
-naming the backend, physical plan, and any fallback reason; `physicalExplain`
-reports the composite; and the runtime suite asserts non-vacuity in both
-directions. The
-[public-path receipt](../benchmarks/receipts/2026-08-01-p4-public-path/summary.md)
-measures the public collect within 3.9–5.7% of the internal engine on the
-filter and shuffled-join workloads at 1M rows, with every iteration's engine
-receipt asserted. `stream` deliberately remains on the incremental reference
-cursor and its promotion still needs its own decision.
+**Complete with replacement evidence, 2026-08-02.** `collect` is routed through
+the engine by ADR-0005, and ADR-0006 exposes typed engine identity, fallback
+reasons, and explicit selection policy. The runtime suite asserts non-vacuity
+in both directions. The
+[2026-08-01 public-path receipt](../benchmarks/receipts/2026-08-01-p4-public-path/summary.md)
+remains invalid and its 3.9–5.7% claim remains retracted. The
+[replacement court](../benchmarks/receipts/2026-08-02-p4-public-path/summary.md)
+binds an exact 18-file source set, passes the missing/extra/mismatch verifier,
+and uses alternating paired measurements to avoid endpoint-order bias. At 1M
+rows it measures +0.7% for filter, +0.1% for shuffled join, and +1.0% for
+shuffled high-cardinality grouping against direct engine collect. Every direct
+and public optimized iteration asserts the expected physical operator and no
+fallback. `stream` remains on reference semantics; ADR-0007 preserves bounded
+source pulling for its non-blocking public path and records the explicit
+materialization boundary for aggregate, join, and sort.
 
 ## R5i join result, at 1,000,000 rows
 
