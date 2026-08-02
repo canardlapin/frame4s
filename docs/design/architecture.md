@@ -250,14 +250,16 @@ logical explain and reports streaming/blocking nodes, row estimates, and
 `fallback=none`. It is deliberately not a production optimizer, spill engine,
 SIMD framework, or performance competitor.
 
-`ColumnarInterpreter` is a package-internal optimized-kernel court, physically
+`ColumnarInterpreter` is a package-internal optimized engine, physically
 separate from the oracle. It specializes admitted scan/projection,
 filter/fusion, aggregation, join, distinct, and union shapes; unsupported
 shapes use one explicit whole-plan reference fallback with a receipt. Its
 detached results obey a close protocol, and reusable JVM/Scala.js differential
-laws compare schemas, values, failures, and ordering with the oracle. It is not
-selected by the public 0.1.0 runtime; public backend packaging remains a
-separate design and ownership decision.
+laws compare schemas, values, failures, and ordering with the oracle. The
+public runtime's materializing `collect` executes through it (ADR-0005), the
+engine decision is surfaced in the execution receipt rather than hidden
+(ADR-0006), and `stream` deliberately stays on the incremental reference
+cursor.
 
 `frame4s-fs2` binds immutable typed `SourceBinding` descriptions through one
 invocation-scoped `FrameRuntime.resource`. All acquired sources are inspected
@@ -271,8 +273,9 @@ cancellation. `FrameRuntime.collect` retains output batches into a
 `Resource[F, Table[Schema]]`; failed or canceled acquisition closes every
 retained batch, and the resource finalizer closes the materialized table.
 `streamWithReceipt` and `collectWithReceipt` expose requested, accepted, and
-residual source pushdown. Unsupported work stays in the logical reference
-path.
+residual source pushdown, and `collectWithReceipt` additionally carries an
+`EngineReceipt` naming which engine answered, its physical plan, and any
+fallback reason. Unsupported work stays in the logical reference path.
 
 CSV and TSV byte/character sources parse incrementally into bounded batches;
 UTF-8 decoding and quoted records may cross arbitrary input chunks. JVM path

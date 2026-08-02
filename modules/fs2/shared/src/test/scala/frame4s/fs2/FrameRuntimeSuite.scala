@@ -151,6 +151,46 @@ class FrameRuntimeSuite extends munit.FunSuite:
           assertEquals(tracker.snapshot.activeOwners, 0)
       .unsafeToFuture()
 
+  test("collect surfaces the engine decision in the execution receipt"):
+    val tracker = new BufferTracker
+    val input = table(tracker, Vector(Array(1, 2, 3)))
+    val runtime = FrameRuntime[IO](ReferenceSources.empty.bind(reference, input))
+    val supported = frame.filter(row => row.col("id") > 1)
+
+    def ids(output: Table[Input]): Vector[ScalarValue] =
+      output.batches.flatMap: batch =>
+        val column = storage(batch.column("id"))
+        Vector.tabulate(batch.rowCount)(index => storage(column.scalar(index)))
+
+    runtime
+      .collectWithReceipt(supported)
+      .use: execution =>
+        IO:
+          val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+          // A silent decline here would make every runtime comparison vacuous, because both
+          // sides would be the reference interpreter.
+          assertEquals(engine.backend, "columnar")
+          assertEquals(engine.fallback, None)
+          assert(engine.physicalPlan.contains("FilterSelection"), engine.physicalPlan)
+          assertEquals(ids(execution.table), Vector(2, 3).map(ScalarValue.Int32.apply))
+      .flatMap: _ =>
+        runtime
+          .collectWithReceipt(frame)
+          .use: execution =>
+            IO:
+              val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+              assertEquals(engine.backend, "reference")
+              assert(
+                engine.fallback.exists(_.contains("unsupported logical shape")),
+                engine.fallback
+              )
+              assertEquals(ids(execution.table), Vector(1, 2, 3).map(ScalarValue.Int32.apply))
+      .flatMap: _ =>
+        IO:
+          input.close()
+          assertEquals(tracker.snapshot.activeOwners, 0)
+      .unsafeToFuture()
+
   test("physical explain names the selected backend and forbids fallback"):
     val tracker = new BufferTracker
     val input = table(tracker, Vector(Array(1)))

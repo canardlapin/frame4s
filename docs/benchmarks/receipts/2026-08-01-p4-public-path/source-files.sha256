@@ -1,0 +1,3 @@
+b6181e840f0a4d822a18755c323c4afba00138a8b70044a99678b146877bbc59  modules/core/shared/src/main/scala/frame4s/ColumnarInterpreter.scala
+514ffebbba5909854e39b2e6afd242bfc0d1b063a9089f654ca36a9042d87c3f  modules/fs2/shared/src/main/scala/frame4s/fs2/FrameRuntime.scala
+624d92108bd44665831948f0c648617c5f2d39d731661860e2c3ba35bf0f0bbb  modules/benchmarks/src/main/scala/frame4s/benchmarks/PublicPathCourtRunner.scala

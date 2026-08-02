@@ -181,29 +181,28 @@ private[frame4s] object ColumnarInterpreter:
       case None =>
         Left(SecondaryIndexError.UnsupportedLogicalShape(plan.nodeName))
 
-  /** Materialize a plan with the optimized engine, or decline with a reason.
+  /** Materialize a plan, preferring the optimized engine, and report which engine answered.
     *
-    * A `Left` is never a failed query, only a statement that this engine will not answer it: the
-    * plan has no kernel, a kernel hit a capability residual, execution errored, or the result
-    * contains a vector with no batch form. The caller runs the semantic reference path instead,
-    * which stays the definition of correct behaviour. Declining is therefore always safe, and the
+    * When the plan has no kernel or a kernel hits a capability residual, the execution falls back
+    * to the reference interpreter in-engine and the result is still returned, with the receipt
+    * carrying the fallback reason — the plan executes exactly once either way. A `Left` is never a
+    * failed query, only a statement that this path will not answer it: execution errored, or the
+    * result contains a vector with no batch form. The caller runs the semantic reference path
+    * instead, which stays the definition of correct behaviour, so declining is always safe, and the
     * reason is meant to be reported rather than swallowed.
     */
-  def collectBatches(
+  def collect(
       plan: LogicalPlan,
       sources: ReferenceSources
-  ): Either[String, Vector[RecordBatch]] =
+  ): Either[String, ColumnarCollect] =
     val execution = prepare(plan, sources)
     try
       val run = execution.run()
-      run.receipt.fallback match
-        case Some(reason) => Left(reason)
-        case None         =>
-          run.result match
-            case Left(error)   => Left(error.message)
-            case Right(result) =>
-              try result.recordBatches
-              finally result.close()
+      run.result match
+        case Left(error)   => Left(error.message)
+        case Right(result) =>
+          try result.recordBatches.map(batches => ColumnarCollect(run.receipt, batches))
+          finally result.close()
     finally execution.close()
 
   def columnChecksum(column: ColumnArray): Either[ExecutionError, Long] =
@@ -216,6 +215,11 @@ private[frame4s] object ColumnarInterpreter:
 final private[frame4s] case class ColumnarReceipt(
     physicalPlan: String,
     fallback: Option[String]
+)
+
+final private[frame4s] case class ColumnarCollect(
+    receipt: ColumnarReceipt,
+    batches: Vector[RecordBatch]
 )
 
 final private[frame4s] case class ColumnarRun(
@@ -239,6 +243,8 @@ final private[frame4s] class ColumnarExecution private[frame4s] (
     kernel: Option[KernelPlan]
 ):
   private var closed = false
+
+  def kernelName: Option[String] = kernel.map(_.name)
 
   def physicalExplain: String =
     kernel match
@@ -1290,9 +1296,8 @@ final private case class GatheredVector(
 
   /** Chunk boundaries for parallel gathering, aligned to 64 output rows.
     *
-    * Alignment keeps every validity and Bool bit any two chunks write in disjoint bytes, so
-    * workers never share a read-modify-write byte and the result is byte-identical to the
-    * sequential pass.
+    * Alignment keeps every validity and Bool bit any two chunks write in disjoint bytes, so workers
+    * never share a read-modify-write byte and the result is byte-identical to the sequential pass.
     */
   private def gatherChunkStarts(): Array[Int] =
     val workers = Parallelism.partitions(length, Scheduler.default)

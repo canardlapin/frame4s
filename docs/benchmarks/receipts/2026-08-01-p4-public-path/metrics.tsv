@@ -1,0 +1,6 @@
+workload	endpoint	median_ms	min_ms	max_ms	output_rows
+filter	engine-collect	18.685042	14.853500	33.040958	499999
+filter	public-collect	19.741250	16.117875	27.652709	499999
+one-to-one-join-shuffled	engine-collect	70.710959	62.764625	137.754542	1000000
+one-to-one-join-shuffled	public-collect	73.495667	69.686958	84.701084	1000000
+bare-scan-fallback	public-collect	65.033958	55.194167	101.644792	1000000

@@ -229,6 +229,19 @@ execution receipt rather than hiding it, and ships with an ADR recording the
 rationale and a dated receipt measuring the public path. This runs last so the
 engine being promoted is the improved one.
 
+**Complete.** `collect` was routed through the engine by ADR-0005; ADR-0006
+finishes the promotion by honouring the reporting commitment. The engine's
+in-engine fallback result is now returned rather than discarded, so fallback
+plans execute exactly once; `collectWithReceipt` carries an `EngineReceipt`
+naming the backend, physical plan, and any fallback reason; `physicalExplain`
+reports the composite; and the runtime suite asserts non-vacuity in both
+directions. The
+[public-path receipt](../benchmarks/receipts/2026-08-01-p4-public-path/summary.md)
+measures the public collect within 3.9–5.7% of the internal engine on the
+filter and shuffled-join workloads at 1M rows, with every iteration's engine
+receipt asserted. `stream` deliberately remains on the incremental reference
+cursor and its promotion still needs its own decision.
+
 ## R5i join result, at 1,000,000 rows
 
 The join court now measures detached-result construction separately from the

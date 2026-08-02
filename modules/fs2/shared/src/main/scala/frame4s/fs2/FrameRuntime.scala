@@ -123,7 +123,24 @@ final case class SourceExecutionReceipt(
     pushdown: PushdownReceipt
 )
 
-final case class ExecutionReceipt(sources: Vector[SourceExecutionReceipt]):
+/** Which engine answered a materializing collect, and why.
+  *
+  * `backend` is `"columnar"` when the optimized engine executed the plan and `"reference"` when the
+  * semantic reference interpreter did. `fallback` carries the engine's stated reason whenever the
+  * reference interpreter answered; it is never a failure, because the reference path defines
+  * correct behaviour. Streaming executions carry no engine receipt: `stream` deliberately stays on
+  * the incremental reference cursor.
+  */
+final case class EngineReceipt(
+    backend: String,
+    physicalPlan: String,
+    fallback: Option[String]
+)
+
+final case class ExecutionReceipt(
+    sources: Vector[SourceExecutionReceipt],
+    engine: Option[EngineReceipt] = None
+):
   def accepted: Vector[(SourceRef, PushdownFeature)] =
     sources.flatMap(source => source.pushdown.accepted.map(source.reference -> _))
 
@@ -290,23 +307,38 @@ final class FrameRuntime[F[_]] private (
     * quietly turn an incremental stream into materialize-then-emit, which is a change in what
     * callers are promised rather than an optimization.
     *
-    * The engine declines rather than fails, and the reference path defines correct behaviour, so a
-    * decline is always safe.
+    * When the engine has no kernel for the plan or hits a capability residual it falls back to the
+    * reference interpreter in-engine, so the plan executes exactly once and the receipt names the
+    * reason. The residual `Left` channel — execution errors and results with no batch form —
+    * re-runs the reference path here, which stays the definition of correct behaviour.
     */
   private def collectBatches(
       frame: Frame[?],
       sources: ReferenceSources
-  ): Stream[F, RecordBatch] =
-    Stream
-      .eval(F.delay(ColumnarInterpreter.collectBatches(frame.plan, sources)))
-      .flatMap:
-        case Left(_)        => referenceBatches(frame, sources)
-        case Right(batches) =>
-          Stream
-            .emits(batches)
+  ): F[(EngineReceipt, Stream[F, RecordBatch])] =
+    F.delay(ColumnarInterpreter.collect(frame.plan, sources))
+      .map:
+        case Right(collected) =>
+          val backend =
+            if collected.receipt.fallback.isDefined then "reference" else "columnar"
+          val stream = Stream
+            .emits(collected.batches)
             .covary[F]
             .flatMap: batch =>
               Stream.bracket(F.pure(batch))(value => F.delay(value.close()))
+          (
+            EngineReceipt(backend, collected.receipt.physicalPlan, collected.receipt.fallback),
+            stream
+          )
+        case Left(reason) =>
+          (
+            EngineReceipt(
+              "reference",
+              ReferenceInterpreter.prepare(frame.plan, sources).physicalExplain,
+              Some(reason)
+            ),
+            referenceBatches(frame, sources)
+          )
 
   private def prepare(frame: Frame[?]): Resource[F, PreparedExecution] =
     legacySources match
@@ -370,8 +402,8 @@ final class FrameRuntime[F[_]] private (
       frame: Frame[S]
   ): Resource[F, MaterializedExecution[S]] =
     prepare(frame).flatMap: prepared =>
-      collectPrepared(frame, prepared.sources).map: table =>
-        MaterializedExecution(prepared.receipt, table)
+      collectPrepared(frame, prepared.sources).map: (engine, table) =>
+        MaterializedExecution(prepared.receipt.copy(engine = Some(engine)), table)
 
   /** Collect into an owned typed table scoped by the returned `Resource`. */
   def collect[S <: NamedTuple.AnyNamedTuple](
@@ -382,35 +414,49 @@ final class FrameRuntime[F[_]] private (
   private def collectPrepared[S <: NamedTuple.AnyNamedTuple](
       frame: Frame[S],
       sources: ReferenceSources
-  ): Resource[F, Table[S]] =
-    Resource.makeFull[F, Table[S]](poll =>
+  ): Resource[F, (EngineReceipt, Table[S])] =
+    Resource.makeFull[F, (EngineReceipt, Table[S])](poll =>
       Ref
         .of[F, Vector[RecordBatch]](Vector.empty)
         .flatMap: retained =>
           def closeRetained: F[Unit] =
             retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
 
-          val copyBatches = collectBatches(frame, sources).evalMap: batch =>
-            F.uncancelable: _ =>
-              F.delay(batch.slice(0, batch.rowCount))
-                .flatMap(result => executionFailure(result.left.map(ExecutionError.Storage.apply)))
-                .flatTap(copy => retained.update(_ :+ copy))
-          poll(copyBatches.compile.drain)
-            .guaranteeCase:
-              case Outcome.Succeeded(_) => F.unit
-              case _                    => closeRetained
-            .flatMap: _ =>
-              retained.get.flatMap: batches =>
-                Table[S](batches)(using frame.descriptor) match
-                  case Right(table) => F.pure(table)
-                  case Left(error)  =>
-                    closeRetained *> F.raiseError[Table[S]](
-                      ExecutionFailure(ExecutionError.Storage(error))
-                    )
-    )(table => F.delay(table.close()))
+          collectBatches(frame, sources).flatMap: (engine, engineBatches) =>
+            val copyBatches = engineBatches.evalMap: batch =>
+              F.uncancelable: _ =>
+                F.delay(batch.slice(0, batch.rowCount))
+                  .flatMap(result =>
+                    executionFailure(result.left.map(ExecutionError.Storage.apply))
+                  )
+                  .flatTap(copy => retained.update(_ :+ copy))
+            poll(copyBatches.compile.drain)
+              .guaranteeCase:
+                case Outcome.Succeeded(_) => F.unit
+                case _                    => closeRetained
+              .flatMap: _ =>
+                retained.get.flatMap: batches =>
+                  Table[S](batches)(using frame.descriptor) match
+                    case Right(table) => F.pure((engine, table))
+                    case Left(error)  =>
+                      closeRetained *> F.raiseError[(EngineReceipt, Table[S])](
+                        ExecutionFailure(ExecutionError.Storage(error))
+                      )
+    )(acquired => F.delay(acquired(1).close()))
 
+  /** The physical plan a materializing collect would execute, including the engine decision.
+    *
+    * Plans the optimized engine declines report the reference plan they actually run on. Streaming
+    * executions always use the reference cursor regardless of what this reports.
+    */
   def physicalExplain[S <: NamedTuple.AnyNamedTuple](frame: Frame[S]): String =
-    ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).physicalExplain
+    val columnar = ColumnarInterpreter.prepare(frame.plan, ReferenceSources.empty)
+    try
+      columnar.kernelName match
+        case Some(_) => columnar.physicalExplain
+        case None    =>
+          ReferenceInterpreter.prepare(frame.plan, ReferenceSources.empty).physicalExplain
+    finally columnar.close()
 
 final private case class RequiredSource(
     reference: SourceRef,

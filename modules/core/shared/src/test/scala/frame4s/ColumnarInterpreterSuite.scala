@@ -1560,7 +1560,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       direct.close()
       dictionary.close()
 
-  test("collectBatches materializes Arrow batches matching the reference interpreter"):
+  test("collect materializes Arrow batches matching the reference interpreter"):
     type Input = (id: Int, value: Option[Double], label: String)
     type Output = (id: Int, value: Option[Double], label: String)
     val ref = reference("columnar-collect")
@@ -1575,11 +1575,14 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     val query: Frame[Output] = source.filter(row => row.col("id") > 1)
     val sources = ReferenceSources.empty.bind(ref, input)
 
-    // The engine must actually take this plan; a silent decline would make the comparison
+    // The engine must actually take this plan; a silent fallback would make the comparison
     // below vacuous, because both sides would then be the reference interpreter.
-    val batches = ColumnarInterpreter.collectBatches(query.plan, sources) match
+    val collected = ColumnarInterpreter.collect(query.plan, sources) match
       case Left(reason) => fail(s"columnar engine declined a supported plan: $reason")
       case Right(value) => value
+    assertEquals(collected.receipt.fallback, None)
+    assert(collected.receipt.physicalPlan.contains("FilterSelection"))
+    val batches = collected.batches
 
     val produced = batches.flatMap: batch =>
       (0 until batch.rowCount).toVector.map: row =>
