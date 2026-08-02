@@ -3627,9 +3627,16 @@ private object AggregateRequirements:
       case _                            => false
     AggregateRequirements(count, numeric, sum, mean, variance)
 
+/** Open-addressed Int32-to-group table with the key and group packed into one slot word.
+  *
+  * A slot is `key << 32 | (group + 1)`, with all-zero meaning empty, so a probe reads one cache
+  * line where the previous parallel `keys`/`groups` arrays read two. At a million groups the table
+  * is far larger than cache and every probe is a miss, so halving the lines touched per probe is
+  * the point of the layout; the group is biased by one so freshly allocated (zeroed) arrays are
+  * already empty and growth never needs a fill pass.
+  */
 final private class IntGroupIndex:
-  private var keys = new Array[Int](32)
-  private var groups = filledIntArray(32, -1)
+  private var slots = new Array[Long](32)
   private var size = 0
   private var projected = 0
 
@@ -3640,32 +3647,38 @@ final private class IntGroupIndex:
   def hintCapacity(expected: Int): Unit =
     if expected > projected then projected = expected
 
-  def find(key: Int): Int =
-    var slot = mix(key) & (groups.length - 1)
-    while groups(slot) >= 0 && keys(slot) != key do slot = (slot + 1) & (groups.length - 1)
-    groups(slot)
-
-  def put(key: Int, group: Int): Unit =
-    if (size + 1) * 2 >= groups.length then grow()
-    var slot = mix(key) & (groups.length - 1)
-    while groups(slot) >= 0 do slot = (slot + 1) & (groups.length - 1)
-    keys(slot) = key
-    groups(slot) = group
-    size += 1
+  /** Existing group for `key`, or -1 after binding `key` to `group`.
+    *
+    * One probe sequence serves both the lookup and the insert; the previous `find`-then-`put` pair
+    * walked the same slots twice on every new group, and new groups are nearly every row in a
+    * high-cardinality build.
+    */
+  def findOrPut(key: Int, group: Int): Int =
+    if (size + 1) * 2 >= slots.length then grow()
+    val mask = slots.length - 1
+    var slot = mix(key) & mask
+    var word = slots(slot)
+    while word != 0L && (word >>> 32).toInt != key do
+      slot = (slot + 1) & mask
+      word = slots(slot)
+    if word != 0L then (word & 0xffffffffL).toInt - 1
+    else
+      slots(slot) = (key.toLong << 32) | ((group + 1).toLong & 0xffffffffL)
+      size += 1
+      -1
 
   private def grow(): Unit =
-    val oldKeys = keys
-    val oldGroups = groups
-    val target = IntGroupIndex.targetCapacity(oldGroups.length, projected)
-    keys = new Array[Int](target)
-    groups = filledIntArray(target, -1)
+    val old = slots
+    val target = IntGroupIndex.targetCapacity(old.length, projected)
+    slots = new Array[Long](target)
+    val mask = target - 1
     var index = 0
-    while index < oldGroups.length do
-      if oldGroups(index) >= 0 then
-        var slot = mix(oldKeys(index)) & (groups.length - 1)
-        while groups(slot) >= 0 do slot = (slot + 1) & (groups.length - 1)
-        keys(slot) = oldKeys(index)
-        groups(slot) = oldGroups(index)
+    while index < old.length do
+      val word = old(index)
+      if word != 0L then
+        var slot = mix((word >>> 32).toInt) & mask
+        while slots(slot) != 0L do slot = (slot + 1) & mask
+        slots(slot) = word
       index += 1
 
   private def mix(value: Int): Int =
@@ -4264,14 +4277,13 @@ final private class Int32AggregateAccumulator(requirements: AggregateRequirement
 
   def add(key: Int, valid: Boolean, value: Double): Unit =
     rowsObserved += 1L
-    val found = groups.find(key)
+    val found = groups.findOrPut(key, size)
     val group =
       if found >= 0 then found
       else
         ensureCapacity()
         val created = size
         keys(created) = key
-        groups.put(key, created)
         size += 1
         created
 
@@ -4408,13 +4420,10 @@ final private case class HashAggregate(
                       var row = 0
                       while row < batch.rowCount do
                         val actual = key.unsafeIntValue(row)
-                        val found = intGroups.find(actual)
+                        val found = intGroups.findOrPut(actual, groups.length)
                         val groupIndex =
                           if found >= 0 then found
-                          else
-                            val created = appendGroup(groups, ScalarValue.Int32(actual))
-                            intGroups.put(actual, created)
-                            created
+                          else appendGroup(groups, ScalarValue.Int32(actual))
                         add(groups(groupIndex), numeric, row)
                         row += 1
                     case _ =>
@@ -5730,11 +5739,10 @@ final private case class Int32Distinct(
                   var row = 0
                   while row < length do
                     val actual = readInt(bytes, start + (logicalOffset + row) * 4)
-                    if groups.find(actual) < 0 then
+                    if groups.findOrPut(actual, size) < 0 then
                       if size == values.length then
                         values = java.util.Arrays.copyOf(values, size * 2)
                       values(size) = actual
-                      groups.put(actual, size)
                       size += 1
                     row += 1
               borrowed match

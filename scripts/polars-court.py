@@ -214,6 +214,12 @@ def fixtures(rows: int) -> tuple[dict[str, pl.DataFrame], dict[str, Workload]]:
             pl.col("value").var(ddof=0).alias("variancePop"),
         )
 
+    def grouped_high() -> pl.DataFrame:
+        return facts.group_by("id", maintain_order=False).agg(
+            pl.len().alias("n"),
+            pl.col("value").sum().alias("sum"),
+        )
+
     def join(right: pl.DataFrame) -> Callable[[], pl.DataFrame]:
         def run() -> pl.DataFrame:
             return left.join(
@@ -297,6 +303,18 @@ def fixtures(rows: int) -> tuple[dict[str, pl.DataFrame], dict[str, Workload]]:
             note=(
                 "Different legal floating moment algorithms and unordered groups; "
                 "row/schema and invariant validated, not raw-bit ranked."
+            ),
+        ),
+        "groupedHighCardinality": Workload(
+            "groupedHighCardinality",
+            "ReferenceBenchmarks.groupedHighCardinality",
+            grouped_high,
+            rows,
+            ("id", "n", "sum"),
+            exact_checksum=False,
+            note=(
+                "One group per Int32 id; group order is not maintained, so "
+                "output is invariant-validated."
             ),
         ),
         "joinOneToOne": Workload(
