@@ -1157,12 +1157,59 @@ final private case class GatheredVector(
 
   private def gatherUtf8(): Either[String, ColumnArray] =
     val valid = new Array[Byte]((length + 7) >>> 3)
+    val chunks = gatherChunkStarts()
+    val chunkCount = chunks.length - 1
+    val nullCounts = new Array[Int](chunkCount)
+    val byteTotals = new Array[Long](chunkCount)
+    val failures = new Array[String](chunkCount)
+    runGatherChunks(chunkCount): ordinal =>
+      measureUtf8Range(valid, chunks(ordinal), chunks(ordinal + 1)) match
+        case Left(reason)          => failures(ordinal) = reason
+        case Right((nulls, bytes)) =>
+          nullCounts(ordinal) = nulls
+          byteTotals(ordinal) = bytes
+
+    val failure = firstFailure(failures)
+    val total = byteTotals.sum
+    if failure != null then Left(failure)
+    else if total > Int.MaxValue.toLong then
+      Left("gathered UTF-8 output exceeds the supported byte length")
+    else
+      val offsets = new Array[Byte]((length + 1) * 4)
+      val values = new Array[Byte](total.toInt)
+      val bases = new Array[Long](chunkCount)
+      var chunk = 0
+      var base = 0L
+      while chunk < chunkCount do
+        bases(chunk) = base
+        base += byteTotals(chunk)
+        chunk += 1
+      runGatherChunks(chunkCount): ordinal =>
+        writeUtf8Range(
+          valid,
+          offsets,
+          values,
+          chunks(ordinal),
+          chunks(ordinal + 1),
+          bases(ordinal).toInt
+        )
+      writeInt(offsets, length * 4, total.toInt)
+      ColumnArray
+        .utf8FromFresh(offsets, values, length, valid, nullCounts.sum)
+        .left
+        .map(_.message)
+
+  private def measureUtf8Range(
+      valid: Array[Byte],
+      from: Int,
+      until: Int
+  ): Either[String, (Int, Long)] =
     var total = 0L
     var nullCount = 0
-    var index = 0
-    var failure: Option[String] = None
-    val selection = selected.cursor()
-    while index < length && failure.isEmpty do
+    var index = from
+    var failure: String = null
+    val selection = selected.cursorAt(from)
+    while index < until && failure == null do
       if !isValid(index) then nullCount += 1
       else
         sourceBatch(selection.batch) match
@@ -1171,36 +1218,31 @@ final private case class GatheredVector(
             if value.unsafeValid(sourceRow) then
               setBit(valid, index)
               total += value.unsafeByteLength(sourceRow).toLong
-              if total > Int.MaxValue.toLong then
-                failure = Some("gathered UTF-8 output exceeds the supported byte length")
             else nullCount += 1
           case value =>
-            failure = Some(
-              s"gathered Utf8 column contains ${value.getClass.getSimpleName}"
-            )
+            failure = s"gathered Utf8 column contains ${value.getClass.getSimpleName}"
       selection.advance()
       index += 1
+    if failure != null then Left(failure) else Right((nullCount, total))
 
-    failure match
-      case Some(reason) => Left(reason)
-      case None         =>
-        val offsets = new Array[Byte]((length + 1) * 4)
-        val values = new Array[Byte](total.toInt)
-        var cursor = 0
-        index = 0
-        val selection = selected.cursor()
-        while index < length do
-          writeInt(offsets, index * 4, cursor)
-          if bit(valid, index) then
-            val input = sourceBatch(selection.batch).asInstanceOf[RawUtf8Vector]
-            cursor += input.unsafeCopyBytes(selection.row, values, cursor)
-          selection.advance()
-          index += 1
-        writeInt(offsets, length * 4, cursor)
-        ColumnArray
-          .utf8FromFresh(offsets, values, length, valid, nullCount)
-          .left
-          .map(_.message)
+  private def writeUtf8Range(
+      valid: Array[Byte],
+      offsets: Array[Byte],
+      values: Array[Byte],
+      from: Int,
+      until: Int,
+      base: Int
+  ): Unit =
+    var cursor = base
+    var index = from
+    val selection = selected.cursorAt(from)
+    while index < until do
+      writeInt(offsets, index * 4, cursor)
+      if bit(valid, index) then
+        val input = sourceBatch(selection.batch).asInstanceOf[RawUtf8Vector]
+        cursor += input.unsafeCopyBytes(selection.row, values, cursor)
+      selection.advance()
+      index += 1
 
   private def gatherFixed(
       values: Array[Byte],
@@ -1209,25 +1251,82 @@ final private case class GatheredVector(
       copy: PartialFunction[(ColumnarVector, Int, Int), Boolean]
   ): Either[String, (Array[Byte], Int)] =
     val valid = new Array[Byte]((length + 7) >>> 3)
+    val chunks = gatherChunkStarts()
+    val chunkCount = chunks.length - 1
+    val nullCounts = new Array[Int](chunkCount)
+    val failures = new Array[String](chunkCount)
+    runGatherChunks(chunkCount): ordinal =>
+      gatherFixedRange(valid, chunks(ordinal), chunks(ordinal + 1), expected)(copy) match
+        case Left(reason)     => failures(ordinal) = reason
+        case Right(nullCount) => nullCounts(ordinal) = nullCount
+    val failure = firstFailure(failures)
+    if failure != null then Left(failure) else Right((valid, nullCounts.sum))
+
+  private def gatherFixedRange(
+      valid: Array[Byte],
+      from: Int,
+      until: Int,
+      expected: String
+  )(
+      copy: PartialFunction[(ColumnarVector, Int, Int), Boolean]
+  ): Either[String, Int] =
     var nullCount = 0
-    var index = 0
-    var failure: Option[String] = None
-    val selection = selected.cursor()
-    while index < length && failure.isEmpty do
+    var index = from
+    var failure: String = null
+    val selection = selected.cursorAt(from)
+    while index < until && failure == null do
       if !isValid(index) then nullCount += 1
       else
         val input = sourceBatch(selection.batch)
         val sourceRow = selection.row
         val arguments = (input, sourceRow, index)
         if !copy.isDefinedAt(arguments) then
-          failure = Some(
-            s"gathered $expected column contains ${input.getClass.getSimpleName}"
-          )
+          failure = s"gathered $expected column contains ${input.getClass.getSimpleName}"
         else if copy(arguments) then setBit(valid, index)
         else nullCount += 1
       selection.advance()
       index += 1
-    failure.toLeft((valid, nullCount))
+    if failure != null then Left(failure) else Right(nullCount)
+
+  /** Chunk boundaries for parallel gathering, aligned to 64 output rows.
+    *
+    * Alignment keeps every validity and Bool bit any two chunks write in disjoint bytes, so
+    * workers never share a read-modify-write byte and the result is byte-identical to the
+    * sequential pass.
+    */
+  private def gatherChunkStarts(): Array[Int] =
+    val workers = Parallelism.partitions(length, Scheduler.default)
+    if workers <= 1 then Array(0, length)
+    else
+      val target = math.max(Parallelism.MinimumChunkRows, length / (workers * 4) + 1)
+      val aligned = (target + 63) & ~63
+      val count = ((length + aligned - 1) / aligned).max(1)
+      val starts = new Array[Int](count + 1)
+      var index = 0
+      while index < count do
+        starts(index) = index * aligned
+        index += 1
+      starts(count) = length
+      starts
+
+  private def runGatherChunks(chunkCount: Int)(work: Int => Unit): Unit =
+    if chunkCount <= 1 then
+      if chunkCount == 1 then work(0)
+    else
+      val tasks = new Array[Runnable](chunkCount)
+      var chunk = 0
+      while chunk < chunkCount do
+        val ordinal = chunk
+        tasks(chunk) = () => work(ordinal)
+        chunk += 1
+      Scheduler.default.runAll(tasks)
+
+  private def firstFailure(failures: Array[String]): String =
+    var index = 0
+    while index < failures.length do
+      if failures(index) != null then return failures(index)
+      index += 1
+    null
 
 final private case class RawDictionaryVector(
     indices: RawInt32Vector,
@@ -5190,7 +5289,8 @@ final private case class JoinSelection(
 sealed private[frame4s] trait JoinRowSelection:
   def batch(index: Int): Int
   def row(index: Int): Int
-  def cursor(): JoinRowCursor
+  def cursorAt(start: Int): JoinRowCursor
+  final def cursor(): JoinRowCursor = cursorAt(0)
 
 sealed private[frame4s] trait JoinRowCursor:
   def batch: Int
@@ -5212,8 +5312,8 @@ final private[frame4s] case class ArrayJoinRowSelection(
 ) extends JoinRowSelection:
   def batch(index: Int): Int = if singleBatch then 0 else batches(index)
   def row(index: Int): Int = rows(index)
-  def cursor(): JoinRowCursor = new JoinRowCursor:
-    private var index = 0
+  def cursorAt(start: Int): JoinRowCursor = new JoinRowCursor:
+    private var index = start
     def batch: Int = if singleBatch then 0 else batches(index)
     def row: Int = rows(index)
     def advance(): Unit = index += 1
@@ -5232,9 +5332,9 @@ final private[frame4s] case class RunJoinRowSelection(
     val selectedRun = run(index)
     rows(selectedRun) + index - starts(selectedRun)
 
-  def cursor(): JoinRowCursor = new JoinRowCursor:
-    private var index = 0
-    private var selectedRun = 0
+  def cursorAt(start: Int): JoinRowCursor = new JoinRowCursor:
+    private var index = start
+    private var selectedRun = run(start)
     def batch: Int =
       if singleBatch || runCount == 0 then 0 else batches(selectedRun)
     def row: Int =

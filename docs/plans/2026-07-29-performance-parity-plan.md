@@ -384,6 +384,28 @@ small tiers get faster rather than paying for the large-tier win. The
 run-compressed selection separately cuts 4M aligned gather-view allocation
 to 0.75x and construction from 86.31 to 76.28 ms.
 
+## R5k.4 chunk-parallel gather admitted
+
+The [R5k.4 receipt](../benchmarks/receipts/2026-08-01-r5k4-parallel-gather/admission.md)
+admits chunk-parallel physical gather: 64-row-aligned output chunks,
+positioned cursors, disjoint slices of shared fresh buffers, byte-identical
+by construction. Against the R5k.3 receipt, sorted deep materialization
+improves 2.63x at 1M (17.45 ms) and 2.98x at 4M (81.38 ms); shuffled
+improves 1.63x and 1.55x; matched consumption improves on all 29 large
+cells with allocation within 0.1% of sequential. An initial court sample
+showed fork-level scatter on untouched cells and one small-tier gate
+failure; the fresh confirmation court required by protocol passes all nine
+gates and is the receipt of record, with the initial sample retained. One
+reproduced boundary is documented: 256K nullable-key deep regresses 1.25x
+from concurrent random-access gathering at a cache-resident tier.
+
+This is the plan's first admitted parallel materialization, and it
+confirms the Phase 3 redirection: parallelism lands where access streams,
+and the gather copy loops stream on output even when selection access is
+random.
+
+## R5k.3 matched-endpoint restatement
+
 The [re-run matched-endpoint court](../benchmarks/receipts/2026-08-01-r5k3-matched-endpoints/admission.md)
 restates the cross-runtime ratios on the corrected deep endpoint. Sorted
 deep construction moves from 42.62x to 20.51x pandas at 1M and 47.37x to

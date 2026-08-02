@@ -942,6 +942,19 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     assertEquals(cursor.batch, 1)
     assertEquals(cursor.row, 4)
 
+    val positioned = selected.cursorAt(4)
+    assertEquals(positioned.batch, 1)
+    assertEquals(positioned.row, 3)
+    positioned.advance()
+    assertEquals(positioned.batch, 1)
+    assertEquals(positioned.row, 4)
+
+    val gapPositioned = selected.cursorAt(2)
+    gapPositioned.advance()
+    gapPositioned.advance()
+    assertEquals(gapPositioned.batch, 1)
+    assertEquals(gapPositioned.row, 3)
+
     val singleBatch = new JoinRowRunBuilder(singleBatch = true)
     singleBatch.append(outputIndex = 0, batch = 0, row = 10)
     singleBatch.append(outputIndex = 1, batch = 0, row = 11)
@@ -951,6 +964,74 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     assertEquals(single.row(0), 10)
     assertEquals(single.row(1), 11)
     assertEquals(single.row(2), 13)
+    val singlePositioned = single.cursorAt(2)
+    assertEquals(singlePositioned.row, 13)
+
+  test("chunk-parallel gather materialization matches row-computed output above the threshold"):
+    type Left = (key: Int, label: Option[String], amount: Long)
+    type Right = (rightKey: Int, score: Option[Double])
+    val rows = 70000
+    val leftRef = reference("parallel-gather-left")
+    val rightRef = reference("parallel-gather-right")
+    val leftInput = table[Left](
+      Vector.tabulate(rows): i =>
+        (
+          key = i,
+          label = if i % 7 == 0 then None else Some(s"v$i"),
+          amount = i.toLong * 3L
+        ),
+      batchSize = 16384
+    )
+    val rightInput = table[Right](
+      Vector.tabulate(rows / 2): j =>
+        (
+          rightKey = j * 2,
+          score = if j % 5 == 0 then None else Some(j * 0.5)
+        ),
+      batchSize = 16384
+    )
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val query =
+      left.leftJoin(right): (lhs, rhs) =>
+        lhs.col("key") === rhs.col("rightKey")
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val execution = ColumnarInterpreter.prepare(query.plan, sources)
+    val result = completed(execution.run())
+    execution.close()
+    leftInput.close()
+    rightInput.close()
+    try
+      val batches = result.recordBatches.fold(reason => fail(reason), identity)
+      try
+        assertEquals(batches.map(_.rowCount).sum, rows)
+        var index = 0
+        batches.foreach: batch =>
+          var row = 0
+          while row < batch.rowCount do
+            val expectedLabel =
+              if index % 7 == 0 then ScalarValue.Null else ScalarValue.Utf8(s"v$index")
+            val (expectedRightKey, expectedScore) =
+              if index % 2 == 0 then
+                val j = index / 2
+                (
+                  ScalarValue.Int32(index),
+                  if j % 5 == 0 then ScalarValue.Null else ScalarValue.Float64(j * 0.5)
+                )
+              else (ScalarValue.Null, ScalarValue.Null)
+            assertEquals(value(batch.columns(0).scalar(row)), ScalarValue.Int32(index))
+            assertEquals(value(batch.columns(1).scalar(row)), expectedLabel)
+            assertEquals(
+              value(batch.columns(2).scalar(row)),
+              ScalarValue.Int64(index.toLong * 3L)
+            )
+            assertEquals(value(batch.columns(3).scalar(row)), expectedRightKey)
+            assertEquals(value(batch.columns(4).scalar(row)), expectedScore)
+            row += 1
+            index += 1
+      finally batches.foreach(_.close())
+    finally result.close()
 
   test("sorted merge preserves sparse kinds and falls back for nullable and empty keys"):
     type Left = (key: Int, leftValue: Long)
