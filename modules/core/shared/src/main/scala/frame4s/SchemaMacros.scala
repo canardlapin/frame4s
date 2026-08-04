@@ -30,18 +30,25 @@ private[frame4s] object SchemaMacros:
                   report.errorAndAbort(
                     s"Internal schema derivation error: ${other.show} is not a singleton field name."
                   )
-              val columnType = Expr
-                .summon[ColumnType[value]]
-                .getOrElse:
-                  report.errorAndAbort(
-                    s"Schema field '$fieldName' has unsupported type ${Type.show[value]}."
-                  )
-              '{
-                SchemaDescriptor.field[value](
-                  ${ Expr(fieldName) },
-                  $columnType
-                )
-              } :: fields(TypeRepr.of[nameTail], TypeRepr.of[valueTail])
+              val field = Expr.summon[ColumnType[value]] match
+                case Some(columnType) =>
+                  '{
+                    SchemaDescriptor.field[value](
+                      ${ Expr(fieldName) },
+                      $columnType
+                    )
+                  }
+                case None =>
+                  // Keep derivation available long enough for a nested ColumnLookup to emit its
+                  // offending singleton name. Aborting this macro here makes the outer
+                  // SchemaDescriptor failure mask the useful lookup diagnostic.
+                  val message =
+                    if TypeRepr.of[value].dealias.simplified =:= TypeRepr.of[Nothing]
+                    then
+                      s"Column '$fieldName' has no supported field type. Check the spelling or declare a supported frame4s column type."
+                    else s"Schema field '$fieldName' has unsupported type ${Type.show[value]}."
+                  '{ scala.compiletime.error(${ Expr(message) }) }
+              field :: fields(TypeRepr.of[nameTail], TypeRepr.of[valueTail])
             case _ =>
               report.errorAndAbort(
                 "Internal schema derivation error: field names and values have different lengths."

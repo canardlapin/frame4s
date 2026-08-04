@@ -14,7 +14,7 @@ class ApiContractCourtSuite extends munit.FunSuite:
     val message = firstMessage(errors)
     val expectedIndex = message.indexOf(expected)
     val internalIndex = message.indexOf("match type")
-    assert(expectedIndex >= 0, message)
+    assert(expectedIndex >= 0, clues(errors.map(_.message)))
     assert(internalIndex < 0 || expectedIndex < internalIndex, message)
 
   test("the public API rejects a scalar with the wrong exact type"):
@@ -118,7 +118,7 @@ class ApiContractCourtSuite extends munit.FunSuite:
         def invalid(frame: Frame[People]) =
           frame.select(row => Tuple1(row.col("missing")))
       """),
-      "Column 'missing' does not exist"
+      "Column 'missing' has no supported field type"
     )
 
   test("name-preserving raw columns retain path-dependent provenance"):

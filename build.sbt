@@ -459,7 +459,7 @@ addCommandAlias(
 )
 addCommandAlias(
   "testAll",
-  ";coreJVM/test;coreJS/test;testkitJVM/test;testkitJS/test;fs2JVM/test;fs2JS/test;arrow/test"
+  ";coreJVM/test;coreJS/test;testkitJVM/test;testkitJS/test;fs2JVM/test;fs2JS/test;arrow/test;firstContact/test"
 )
 addCommandAlias("benchmarkSmoke", ";benchmarks/Jmh/compile")
 addCommandAlias(
