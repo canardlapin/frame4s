@@ -5,12 +5,11 @@ patch release in the `0.1.x` line will receive correctness and security fixes;
 older `0.1.x` releases will not be maintained in parallel. Supported lines will
 be updated here when that changes.
 
-Do not open a public issue for an undisclosed vulnerability. This public
-repository does not currently have private vulnerability reporting enabled,
-so there is no safe private reporting path and publication is blocked. Before
-the first release candidate is approved, the owner must enable and test
-**Security → Report a vulnerability**. This policy will then link directly to
-that live private form.
+Do not open a public issue for an undisclosed vulnerability. Report it through
+GitHub's private
+[**Report a vulnerability**](https://github.com/canardlapin/frame4s/security/advisories/new)
+form. GitHub sends the report privately to the maintainers for assessment and
+coordinated disclosure.
 
 The maintainer will:
 
