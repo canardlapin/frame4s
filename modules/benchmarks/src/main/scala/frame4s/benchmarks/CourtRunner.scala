@@ -146,6 +146,11 @@ object CourtRunner:
             reference.fusedFilterProjectArithmetic(referenceState)
           ),
           validation(
+            "ReferenceBenchmarks.fusedFilterProjectArithmeticScattered",
+            rows - rows / 2,
+            reference.fusedFilterProjectArithmeticScattered(referenceState)
+          ),
+          validation(
             "ReferenceBenchmarks.groupedLowCardinality",
             math.min(16, rows),
             reference.groupedLowCardinality(referenceState)
@@ -241,7 +246,13 @@ object CourtRunner:
         "SaddleBenchmarks.filterProjectArithmetic",
         rows - rows / 2,
         saddle.filterProjectArithmetic(saddleState),
-        "semantically equivalent materialized pipeline"
+        "contiguous-suffix materialized pipeline; retained as a diagnostic shape"
+      ),
+      validation(
+        "SaddleBenchmarks.filterProjectArithmeticScattered",
+        rows - rows / 2,
+        saddle.filterProjectArithmeticScattered(saddleState),
+        "semantically equivalent scattered-selection materialized pipeline"
       ),
       Validation(
         "SaddleBenchmarks.groupedLowCardinality",
@@ -272,7 +283,13 @@ object CourtRunner:
         "SpecializedArrayBenchmarks.fusedFilterProjectArithmetic",
         rows - rows / 2,
         arrays.fusedFilterProjectArithmetic(arrayState),
-        "specialized lower-bound baseline"
+        "contiguous-suffix specialized lower-bound baseline"
+      ),
+      validation(
+        "SpecializedArrayBenchmarks.fusedFilterProjectArithmeticScattered",
+        rows - rows / 2,
+        arrays.fusedFilterProjectArithmeticScattered(arrayState),
+        "scattered-selection specialized lower-bound baseline"
       )
     )
 
@@ -326,6 +343,12 @@ object CourtRunner:
             "ColumnarBenchmarks.fusedFilterProjectArithmetic",
             rows - rows / 2,
             columnar.fusedFilterProjectArithmetic(columnarState),
+            status
+          ),
+          validation(
+            "ColumnarBenchmarks.fusedFilterProjectArithmeticScattered",
+            rows - rows / 2,
+            columnar.fusedFilterProjectArithmeticScattered(columnarState),
             status
           ),
           validation(
@@ -409,6 +432,7 @@ object CourtRunner:
 
   private def writeEnvironment(configuration: Configuration): Unit =
     val runtime = Runtime.getRuntime
+    val scatteredIds = FusedPipelineFixture.scatteredIds(configuration.rows)
     val properties = Vector(
       "receipt_format=1",
       "suite=frame4s-performance-court",
@@ -442,7 +466,9 @@ object CourtRunner:
       "sbt-jmh.version=0.4.8",
       "saddle.version=4.0.0-M14",
       "frame4s.backends=semantic-reference,columnar-candidate",
-      "frame4s.columnar.fallback=forbidden-in-candidate-benchmarks"
+      "frame4s.columnar.fallback=forbidden-in-candidate-benchmarks",
+      s"fused.scattered.seed.unsigned=${java.lang.Long.toUnsignedString(FusedPipelineFixture.Seed)}",
+      s"fused.scattered.permutation.sha256=${FusedPipelineFixture.digest(scatteredIds)}"
     )
     write(
       configuration.receipt.resolve("environment.properties"),
@@ -493,11 +519,14 @@ object CourtRunner:
         """@The semantic reference interpreter is an executable oracle, not the optimized backend.
            @Every `ColumnarBenchmarks` row refuses fallback and must carry the same checksum and
            @output cardinality as its corresponding `ReferenceBenchmarks` row.
-           @The materialized primitive projection, fused filter/project, and materialized nullable
-           @grouped-sum Saddle rows are comparable. The raw primitive scan and scalar grouped
-           @reduction remain explicit lower bounds, not win/loss comparators. SQL duplicate-key
-           @joins, dictionary layout, CSV acquisition, and owned-table construction have no claimed
-           @Saddle-equivalent result. Scautable is intentionally excluded from relational rankings."""
+           @The materialized primitive projection, both fused filter/project fixtures, and
+           @materialized nullable grouped-sum Saddle rows are comparable. The contiguous fused
+           @fixture is retained for the ratified historical threshold; the deterministic scattered
+           @fixture governs general-selection comparisons. The raw primitive scan and scalar
+           @grouped reduction remain explicit lower bounds, not win/loss comparators. SQL
+           @duplicate-key joins, dictionary layout, CSV acquisition, and owned-table construction
+           @have no claimed Saddle-equivalent result. Scautable is intentionally excluded from
+           @relational rankings."""
           .stripMargin('@')
       case Tier.Scale =>
         s"""@Scale tier at ${configuration.rows} rows. Only the columnar candidate runs.
@@ -575,6 +604,14 @@ object CourtRunner:
     val pairs = Vector(
       "SaddleBenchmarks.primitiveMaterializedProjection" ->
         "ReferenceBenchmarks.primitiveScan",
+      "SaddleBenchmarks.filterProjectArithmetic" ->
+        "ReferenceBenchmarks.fusedFilterProjectArithmetic",
+      "SaddleBenchmarks.filterProjectArithmeticScattered" ->
+        "ReferenceBenchmarks.fusedFilterProjectArithmeticScattered",
+      "SpecializedArrayBenchmarks.fusedFilterProjectArithmetic" ->
+        "ReferenceBenchmarks.fusedFilterProjectArithmetic",
+      "SpecializedArrayBenchmarks.fusedFilterProjectArithmeticScattered" ->
+        "ReferenceBenchmarks.fusedFilterProjectArithmeticScattered",
       "SaddleBenchmarks.groupedLowCardinalitySumOnly" ->
         "ReferenceBenchmarks.groupedLowCardinalitySumOnly"
     )

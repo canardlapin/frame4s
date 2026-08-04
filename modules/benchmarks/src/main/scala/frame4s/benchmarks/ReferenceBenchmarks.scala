@@ -55,6 +55,16 @@ private[benchmarks] object BenchmarkSupport:
     try checksum(table)
     finally table.close()
 
+private[benchmarks] object FusedPipelineFixture:
+  /** Fixed SplitMix64/Fisher-Yates seed shared with the Pandas and Polars courts. */
+  val Seed = 0x3c6ef372fe94f82bL
+
+  def scatteredIds(rows: Int): Array[Int] =
+    JoinRegimeFixture.permutation(rows, Seed)
+
+  def digest(ids: Array[Int]): String =
+    JoinRegimeFixture.digest(ids)
+
 @State(org.openjdk.jmh.annotations.Scope.Benchmark)
 class ReferenceState:
   import BenchmarkSupport.*
@@ -82,6 +92,7 @@ class ReferenceState:
 
   var sources: ReferenceSources = ReferenceSources.empty
   var factsTable: Table[Facts] = scala.compiletime.uninitialized
+  var scatteredFactsTable: Table[Facts] = scala.compiletime.uninitialized
   var joinLeftTable: Table[JoinLeft] = scala.compiletime.uninitialized
   var joinOneTable: Table[JoinRight] = scala.compiletime.uninitialized
   var joinManyTable: Table[JoinRight] = scala.compiletime.uninitialized
@@ -94,6 +105,7 @@ class ReferenceState:
   var nullableScan: Frame[Nullable] = scala.compiletime.uninitialized
   var filterOnly: Frame[Facts] = scala.compiletime.uninitialized
   var filterProject: Frame[FilterProject] = scala.compiletime.uninitialized
+  var scatteredFilterProject: Frame[FilterProject] = scala.compiletime.uninitialized
   var groupLow: Frame[GroupedString] = scala.compiletime.uninitialized
   var groupLowSum: Frame[GroupedSum] = scala.compiletime.uninitialized
   var groupHigh: Frame[GroupedInt] = scala.compiletime.uninitialized
@@ -114,6 +126,8 @@ class ReferenceState:
   private[benchmarks] var columnarFilter: ColumnarExecution =
     scala.compiletime.uninitialized
   private[benchmarks] var columnarFused: ColumnarExecution =
+    scala.compiletime.uninitialized
+  private[benchmarks] var columnarFusedScattered: ColumnarExecution =
     scala.compiletime.uninitialized
   private[benchmarks] var columnarGroupLow: ColumnarExecution =
     scala.compiletime.uninitialized
@@ -207,7 +221,12 @@ class ReferenceState:
     val groups = Array.tabulate(rows)(index => s"g${index % 16}")
     val values = Array.tabulate(rows)(index => index.toDouble / 8.0)
     val valid = Array.tabulate(rows)(index => index % 7 != 0)
+    val scatteredIds = FusedPipelineFixture.scatteredIds(rows)
+    val scatteredGroups = scatteredIds.map(index => groups(index))
+    val scatteredValues = scatteredIds.map(index => values(index))
+    val scatteredValid = scatteredIds.map(index => valid(index))
     val factsRef = valuesRef("bench-facts")
+    val scatteredFactsRef = valuesRef("bench-facts-scattered")
     val leftRef = valuesRef("bench-left")
     val oneRef = valuesRef("bench-right-one")
     val manyRef = valuesRef("bench-right-many")
@@ -216,6 +235,12 @@ class ReferenceState:
     val unionRef = valuesRef("bench-union-right")
 
     factsTable = facts(ids, groups, values, valid)
+    scatteredFactsTable = facts(
+      scatteredIds,
+      scatteredGroups,
+      scatteredValues,
+      scatteredValid
+    )
     joinLeftTable = joinLeft(ids, Array.tabulate(rows)(_.toLong))
     joinOneTable = joinRight(ids, Array.tabulate(rows)(index => index.toLong * 2L))
     joinManyTable = joinRight(
@@ -232,10 +257,18 @@ class ReferenceState:
     )
 
     val factsFrame = frame(Frame.values[Facts](factsRef))
+    val scatteredFactsFrame = frame(Frame.values[Facts](scatteredFactsRef))
     primitiveScan = factsFrame.select(row => Tuple1(row.col("id").as("id")))
     nullableScan = factsFrame.select(row => Tuple1(row.col("value").as("value")))
     filterOnly = factsFrame.filter(row => row.col("id") >= Expr.literal(rows / 2))
     filterProject = factsFrame
+      .filter(row => row.col("id") >= Expr.literal(rows / 2))
+      .select: row =>
+        (
+          row.col("id").as("id"),
+          (row.col("id") + Expr.literal(1)).as("next")
+        )
+    scatteredFilterProject = scatteredFactsFrame
       .filter(row => row.col("id") >= Expr.literal(rows / 2))
       .select: row =>
         (
@@ -282,6 +315,7 @@ class ReferenceState:
 
     sources = ReferenceSources.empty
       .bind(factsRef, factsTable)
+      .bind(scatteredFactsRef, scatteredFactsTable)
       .bind(leftRef, joinLeftTable)
       .bind(oneRef, joinOneTable)
       .bind(manyRef, joinManyTable)
@@ -293,6 +327,7 @@ class ReferenceState:
     columnarNullable = ColumnarInterpreter.prepare(nullableScan.plan, sources)
     columnarFilter = ColumnarInterpreter.prepare(filterOnly.plan, sources)
     columnarFused = ColumnarInterpreter.prepare(filterProject.plan, sources)
+    columnarFusedScattered = ColumnarInterpreter.prepare(scatteredFilterProject.plan, sources)
     columnarGroupLow = ColumnarInterpreter.prepare(groupLow.plan, sources)
     columnarGroupLowSum = ColumnarInterpreter.prepare(groupLowSum.plan, sources)
     columnarGroupHigh = ColumnarInterpreter.prepare(groupHigh.plan, sources)
@@ -327,6 +362,7 @@ class ReferenceState:
   @TearDown(Level.Trial)
   def tearDown(): Unit =
     factsTable.close()
+    scatteredFactsTable.close()
     joinLeftTable.close()
     joinOneTable.close()
     joinManyTable.close()
@@ -358,6 +394,10 @@ class ReferenceBenchmarks:
   @Benchmark
   def fusedFilterProjectArithmetic(state: ReferenceState): Long =
     collectChecksum(state.filterProject, state.sources)
+
+  @Benchmark
+  def fusedFilterProjectArithmeticScattered(state: ReferenceState): Long =
+    collectChecksum(state.scatteredFilterProject, state.sources)
 
   @Benchmark
   def groupedLowCardinality(state: ReferenceState): Long =
@@ -485,6 +525,7 @@ class SaddleState:
   var rows: Int = 0
 
   var ids: org.saddle.Series[Int, Int] = scala.compiletime.uninitialized
+  var scatteredIds: org.saddle.Series[Int, Int] = scala.compiletime.uninitialized
   var grouped: org.saddle.Series[String, Double] = scala.compiletime.uninitialized
   var groupedNullable: org.saddle.Series[String, Double] = scala.compiletime.uninitialized
   var groupOrder: Array[String] = Array.empty[String]
@@ -492,6 +533,7 @@ class SaddleState:
   @Setup(Level.Trial)
   def setup(): Unit =
     ids = org.saddle.Series(org.saddle.Vec(Array.tabulate(rows)(identity)))
+    scatteredIds = org.saddle.Series(org.saddle.Vec(FusedPipelineFixture.scatteredIds(rows)))
     val raw = Array.tabulate(rows)(index => index.toDouble / 8.0)
     grouped = org.saddle.Series(
       org.saddle.Vec(raw),
@@ -545,6 +587,18 @@ class SaddleBenchmarks:
     hash
 
   @Benchmark
+  def filterProjectArithmeticScattered(state: SaddleState): Long =
+    val filtered = state.scatteredIds.filter(_ >= state.rows / 2)
+    val next = filtered.mapValues(_ + 1)
+    var hash = filtered.length.toLong
+    var index = 0
+    while index < filtered.length do
+      hash = hash * 31L + filtered.raw(index).toLong
+      hash = hash * 31L + next.raw(index).toLong
+      index += 1
+    hash
+
+  @Benchmark
   def groupedLowCardinality(state: SaddleState): Double =
     state.grouped.groupBy.combine(_.sum).sum
 
@@ -566,12 +620,14 @@ class ArrayState:
   var rows: Int = 0
 
   var ids: Array[Int] = Array.emptyIntArray
+  var scatteredIds: Array[Int] = Array.emptyIntArray
   var values: Array[Double] = Array.emptyDoubleArray
   var valid: Array[Boolean] = Array.emptyBooleanArray
 
   @Setup(Level.Trial)
   def setup(): Unit =
     ids = Array.tabulate(rows)(identity)
+    scatteredIds = FusedPipelineFixture.scatteredIds(rows)
     values = Array.tabulate(rows)(index => index.toDouble / 8.0)
     valid = Array.tabulate(rows)(index => index % 7 != 0)
 
@@ -600,5 +656,17 @@ class SpecializedArrayBenchmarks:
     while index < state.rows do
       hash = hash * 31L + state.ids(index).toLong
       hash = hash * 31L + state.ids(index).toLong + 1L
+      index += 1
+    hash
+
+  @Benchmark
+  def fusedFilterProjectArithmeticScattered(state: ArrayState): Long =
+    var hash = (state.rows - state.rows / 2).toLong
+    var index = 0
+    while index < state.rows do
+      val id = state.scatteredIds(index)
+      if id >= state.rows / 2 then
+        hash = hash * 31L + id.toLong
+        hash = hash * 31L + id.toLong + 1L
       index += 1
     hash

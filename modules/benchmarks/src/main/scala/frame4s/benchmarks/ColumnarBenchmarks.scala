@@ -140,6 +140,10 @@ class ColumnarBenchmarks:
     checksum(state.columnarFused)
 
   @Benchmark
+  def fusedFilterProjectArithmeticScattered(state: ReferenceState): Long =
+    checksum(state.columnarFusedScattered)
+
+  @Benchmark
   def groupedLowCardinality(state: ReferenceState): Long =
     checksum(state.columnarGroupLow)
 

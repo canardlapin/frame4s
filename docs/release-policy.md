@@ -35,6 +35,25 @@ support claim. sbt 1.11 and newer supply the Central Portal staging and release
 commands used by `sbt-ci-release` 1.11.x; ordinary development and the
 cross-platform court remain on the repository-pinned sbt 1.10.5.
 
+## Assurance workload
+
+Every randomized conformance property runs at least 200 successful cases on
+both the JVM and Scala.js. The court uses one worker so shrinking, ownership,
+and failure order remain deterministic across runtimes. Seeds are deliberately
+not fixed: successive runs explore new values, and MUnit reports the failing
+ScalaCheck seed for exact replay.
+
+The exact-main Temurin 21 coverage job currently measures 72.89% statement and
+60.17% branch coverage in `frame4s-core`. CI enforces conservative floors of
+70% and 55%, respectively. These floors detect a broad collapse in exercised
+code; they are not adequacy claims and cannot substitute for semantic,
+backend-conformance, structured-failure, or ownership laws. Mutation testing
+is not a `0.1` release gate.
+
+`frame4s-testkit` remains cross-built but repository-internal. Publishing it
+before frame4s admits an external backend SPI would freeze test infrastructure
+as unsupported public API merely to improve an audit score.
+
 The core remains dependency-free and cross-platform. Cats Effect, FS2, and
 filesystem access remain in the cross-platform adapter. Apache Arrow remains
 in the separate JVM-only `frame4s-arrow` adapter; base FS2 consumers neither

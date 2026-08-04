@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -28,6 +29,8 @@ MASK_64 = (1 << 64) - 1
 NULL_HASH = 0x61C8864680B583EB
 EXPECTED_NUMPY = "2.4.3"
 EXPECTED_PANDAS = "3.0.1"
+FUSED_PIPELINE_SEED = 0x3C6EF372FE94F82B
+SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 
 
 @dataclass(frozen=True)
@@ -80,12 +83,33 @@ def checksum(frame: pd.DataFrame) -> str:
     return str(result)
 
 
+def scattered_ids(rows: int) -> np.ndarray:
+    """Match frame4s' fixed-seed SplitMix64/Fisher-Yates permutation."""
+    values = np.arange(rows, dtype=np.int32)
+    state = FUSED_PIPELINE_SEED
+    for index in range(rows - 1, 0, -1):
+        state = (state + SPLITMIX_GAMMA) & MASK_64
+        mixed = state
+        mixed = ((mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9) & MASK_64
+        mixed = ((mixed ^ (mixed >> 27)) * 0x94D049BB133111EB) & MASK_64
+        mixed ^= mixed >> 31
+        selected = mixed % (index + 1)
+        values[index], values[selected] = values[selected], values[index]
+    return values
+
+
+def permutation_digest(values: np.ndarray) -> str:
+    return hashlib.sha256(values.astype("<i4", copy=False).tobytes()).hexdigest()
+
+
 def fixtures(rows: int) -> tuple[dict[str, pd.DataFrame], dict[str, Workload]]:
     ids = np.arange(rows, dtype=np.int32)
     groups = np.asarray([f"g{index % 16}" for index in range(rows)], dtype=object)
     values = np.arange(rows, dtype=np.float64) / 8.0
     values[np.arange(rows) % 7 == 0] = np.nan
     facts = pd.DataFrame({"id": ids, "group": groups, "value": values})
+    scattered_order = scattered_ids(rows)
+    scattered_facts = facts.iloc[scattered_order].reset_index(drop=True)
     left = pd.DataFrame(
         {"key": ids, "leftValue": np.arange(rows, dtype=np.int64)}
     )
@@ -121,6 +145,13 @@ def fixtures(rows: int) -> tuple[dict[str, pd.DataFrame], dict[str, Workload]]:
 
     def fused() -> pd.DataFrame:
         result = facts.loc[facts["id"] >= rows // 2, ["id"]].copy()
+        result["next"] = result["id"] + 1
+        return result
+
+    def fused_scattered() -> pd.DataFrame:
+        result = scattered_facts.loc[
+            scattered_facts["id"] >= rows // 2, ["id"]
+        ].copy()
         result["next"] = result["id"] + 1
         return result
 
@@ -166,6 +197,7 @@ def fixtures(rows: int) -> tuple[dict[str, pd.DataFrame], dict[str, Workload]]:
 
     data = {
         "facts": facts,
+        "scattered_facts": scattered_facts,
         "left": left,
         "right_one": right_one,
         "right_many": right_many,
@@ -184,6 +216,13 @@ def fixtures(rows: int) -> tuple[dict[str, pd.DataFrame], dict[str, Workload]]:
             "fusedFilterProjectArithmetic",
             "ReferenceBenchmarks.fusedFilterProjectArithmetic",
             fused,
+            rows - rows // 2,
+            ("id", "next"),
+        ),
+        "fusedFilterProjectArithmeticScattered": Workload(
+            "fusedFilterProjectArithmeticScattered",
+            "ReferenceBenchmarks.fusedFilterProjectArithmeticScattered",
+            fused_scattered,
             rows - rows // 2,
             ("id", "next"),
         ),
@@ -271,6 +310,18 @@ def read_oracle(path: Path) -> dict[str, tuple[int, str]]:
         }
 
 
+def resolve_oracle(
+    oracle: dict[str, tuple[int, str]], name: str
+) -> tuple[tuple[int, str], str]:
+    """Resolve a semantic-oracle row or an explicitly weaker scale-tier row."""
+    if name in oracle:
+        return oracle[name], "semantic-reference"
+    candidate = name.replace("ReferenceBenchmarks.", "ColumnarBenchmarks.")
+    if candidate in oracle:
+        return oracle[candidate], "columnar-candidate"
+    raise KeyError(name)
+
+
 def read_frame4s_times(path: Path | None) -> dict[str, Frame4sTiming]:
     if path is None:
         return {}
@@ -333,7 +384,9 @@ def write_receipt(
     for workload in workloads.values():
         output = workload.run()
         actual_checksum = checksum(output)
-        oracle_rows, oracle_checksum = oracle[workload.oracle]
+        (oracle_rows, oracle_checksum), provenance = resolve_oracle(
+            oracle, workload.oracle
+        )
         actual_columns = tuple(str(column) for column in output.columns)
         if len(output) != workload.expected_rows or len(output) != oracle_rows:
             raise RuntimeError(
@@ -357,6 +410,7 @@ def write_receipt(
             {
                 "benchmark": f"PandasBenchmarks.{workload.name}",
                 "oracle": workload.oracle,
+                "oracle_provenance": provenance,
                 "output_rows": len(output),
                 "checksum": actual_checksum,
                 "status": status,
@@ -419,6 +473,10 @@ def write_receipt(
         "frame4s.timing": (
             "execution-only-preferred; serial-checksum fallback is explicitly labeled"
         ),
+        "fused.scattered.seed.unsigned": str(FUSED_PIPELINE_SEED),
+        "fused.scattered.permutation.sha256": permutation_digest(
+            scattered_ids(args.rows)
+        ),
     }
     (receipt / "environment.properties").write_text(
         "".join(f"{key}={value}\n" for key, value in environment.items()),
@@ -436,6 +494,8 @@ def write_receipt(
         "",
         "Pandas runs eagerly in a pinned single-thread Python process. It is not invoked",
         "through JMH, and Python allocation is not compared with JVM GC allocation.",
+        "The contiguous-suffix fused fixture is diagnostic; the deterministic scattered",
+        "fixture governs general-selection comparisons.",
         "",
         "| Workload | Pandas median | Range | frame4s JMH | frame4s path | Pandas/frame4s |",
         "|---|---:|---:|---:|---|---:|",
@@ -453,8 +513,16 @@ def write_receipt(
                 else "n/a | n/a | n/a |"
             )
         )
+    provenances = sorted({str(row["oracle_provenance"]) for row in validation_rows})
     lines.extend(
         [
+            "",
+            "## Validation limits",
+            "",
+            f"Oracle provenance for this receipt: {', '.join(provenances)}. A",
+            "`columnar-candidate` provenance means the validation row came from the",
+            "scale tier, where the semantic reference interpreter cannot execute. The",
+            "agreement is cross-runtime candidate validation, not independent oracle proof.",
             "",
             "Exact checksum comparisons include primitive materialized projection, fused",
             "filter/project, grouped sum, joins, distinct, semi/anti join, and unionAll.",
@@ -491,13 +559,16 @@ def main() -> None:
         )
     _, workloads = fixtures(args.rows)
     oracle = read_oracle(args.oracle_validation)
-    missing = sorted(
-        workload.oracle
-        for workload in workloads.values()
-        if workload.oracle not in oracle
-    )
+    missing = []
+    for workload in workloads.values():
+        try:
+            resolve_oracle(oracle, workload.oracle)
+        except KeyError:
+            missing.append(workload.oracle)
     if missing:
-        raise RuntimeError(f"oracle validation is missing: {', '.join(missing)}")
+        raise RuntimeError(
+            f"oracle validation is missing: {', '.join(sorted(missing))}"
+        )
     frame4s_times = read_frame4s_times(args.frame4s_jmh)
     write_receipt(args.receipt, args, workloads, oracle, frame4s_times)
 

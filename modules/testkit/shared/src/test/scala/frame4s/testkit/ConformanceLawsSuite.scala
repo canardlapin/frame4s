@@ -3,8 +3,18 @@ package frame4s.testkit
 import frame4s.*
 import munit.ScalaCheckSuite
 import org.scalacheck.Prop.forAll
+import org.scalacheck.Test
 
 class ConformanceLawsSuite extends ScalaCheckSuite:
+  /** Deliberately keep the seed random so successive courts explore new cases. MUnit prints the
+    * failing seed for exact replay; one worker keeps shrinking and resource ownership deterministic
+    * on both the JVM and Scala.js.
+    */
+  override def scalaCheckTestParameters: Test.Parameters =
+    super.scalaCheckTestParameters
+      .withMinSuccessfulTests(200)
+      .withWorkers(1)
+
   type LeftKeys = (key: Option[Int])
   type RightKeys = (rightKey: Option[Int])
   type StatisticInput = (value: Option[Double])

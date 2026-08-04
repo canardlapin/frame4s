@@ -84,6 +84,13 @@ lazy val core =
       name := "frame4s-core",
       description := "Immutable, typed local dataframe library for Scala 3."
     )
+    .jvmSettings(
+      // These are anti-collapse floors below the exact-main JDK 21 baseline of
+      // 72.89% statements and 60.17% branches. They do not replace semantic laws.
+      coverageMinimumStmtTotal := 70,
+      coverageMinimumBranchTotal := 55,
+      coverageFailOnMinimum := true
+    )
     .jsSettings(
       scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
       Test / jsEnv := new org.scalajs.jsenv.nodejs.NodeJSEnv()
@@ -461,7 +468,10 @@ addCommandAlias(
   "testAll",
   ";coreJVM/test;coreJS/test;testkitJVM/test;testkitJS/test;fs2JVM/test;fs2JS/test;arrow/test;firstContact/test"
 )
-addCommandAlias("benchmarkSmoke", ";benchmarks/Jmh/compile")
+addCommandAlias(
+  "benchmarkSmoke",
+  ";benchmarks/Jmh/compile;benchmarks/runMain frame4s.benchmarks.CourtRunner --receipt target/benchmark-smoke --rows 1000 --validate-only --tier small"
+)
 addCommandAlias(
   "formatCheck",
   ";scalafmtCheckAll;benchmarks/scalafmtCheck;stagedConsumerJVM/scalafmtCheck;stagedConsumerJS/scalafmtCheck;stagedConsumerArrow/scalafmtCheck;scalafmtSbtCheck"

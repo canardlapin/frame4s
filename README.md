@@ -159,7 +159,8 @@ Run every supported platform:
 sbt compileAll testAll
 ```
 
-CI additionally compiles the generated JMH harness with `benchmarkSmoke`.
+CI additionally compiles the generated JMH harness and executes its untimed
+1,000-row oracle/comparator parity court with `benchmarkSmoke`.
 Performance claims are governed by the
 [measurement court](docs/benchmarks/court.md) and
 [ratified budgets](docs/benchmarks/budgets.md); the published receipt includes
