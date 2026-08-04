@@ -37,4 +37,9 @@ if test -z "${gh_bin:-}" || ! test -x "$gh_bin"; then
 fi
 
 export GH_CONFIG_DIR="$profile_dir"
+
+# GitHub CLI environment tokens override credentials stored in the selected
+# profile. Keep this repository pinned to its isolated, Keychain-backed account.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+
 exec "$gh_bin" "$@"

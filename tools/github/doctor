@@ -49,21 +49,56 @@ else
   status=1
 fi
 
+config_base=${XDG_CONFIG_HOME:-"$HOME/.config"}
+profile_dir="$config_base/gh-$expected_account"
+hosts_file="$profile_dir/hosts.yml"
+
 auth_output=$(mktemp "${TMPDIR:-/tmp}/frame4s-gh-auth.XXXXXX")
-trap 'rm -f "$auth_output"' EXIT HUP INT TERM
+token_output=$(mktemp "${TMPDIR:-/tmp}/frame4s-gh-token.XXXXXX")
+api_output=$(mktemp "${TMPDIR:-/tmp}/frame4s-gh-api.XXXXXX")
+trap 'rm -f "$auth_output" "$token_output" "$api_output"' EXIT HUP INT TERM
+
+credential_store_unavailable=0
 if "$script_dir/gh-repo" auth status >"$auth_output" 2>&1; then
   printf 'ok   %-20s valid\n' "GitHub API token"
+
+  if api_account=$("$script_dir/gh-repo" api user --jq .login 2>"$api_output"); then
+    check_equal "GitHub API account" "$api_account" "$expected_account"
+  else
+    printf 'fail %-20s request failed\n' "GitHub API account" >&2
+    sed -n '1,8p' "$api_output" >&2
+    status=1
+  fi
+elif ! "$script_dir/gh-repo" auth token >/dev/null 2>"$token_output" &&
+    test -f "$hosts_file" &&
+    grep -Fq "$expected_account:" "$hosts_file" &&
+    grep -Fq "no oauth token found" "$token_output"; then
+  printf 'unverified %-16s credential store unavailable to this process\n' "GitHub API token" >&2
+  credential_store_unavailable=1
+  status=1
 else
-  printf 'fail %-20s invalid or unavailable\n' "GitHub API token" >&2
+  printf 'fail %-20s authentication check failed\n' "GitHub API token" >&2
   sed -n '1,8p' "$auth_output" >&2
   status=1
 fi
 
-if test "$status" -ne 0; then
+if test "$credential_store_unavailable" -eq 1; then
   cat >&2 <<'EOF'
 
-Git pushes use SSH and are independent of the gh API token.
-To repair only the isolated canardlapin API profile, run:
+Git pushes use SSH and are independent of the gh API credential.
+The isolated profile names canardlapin, but this process could not retrieve its
+credential from the system store. Sandboxed processes commonly cannot read the
+macOS Keychain even when the credential is present and valid.
+
+Do not reauthenticate yet. Rerun tools/github/doctor with authorized Keychain
+access. Reauthenticate only if that check also fails.
+EOF
+elif test "$status" -ne 0; then
+  cat >&2 <<'EOF'
+
+Git pushes use SSH and are independent of the gh API credential.
+If this check was run with authorized Keychain access and the isolated
+canardlapin API credential is invalid, repair only that profile with:
 
   tools/github/gh-repo auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key
 
