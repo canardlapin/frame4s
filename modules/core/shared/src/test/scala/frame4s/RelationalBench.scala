@@ -41,7 +41,7 @@ object RelationalBench:
     val factValues = Array.tabulate(length)(index => index.toDouble / 10.0)
     val factValidity = Array.tabulate(length)(index => index % 11 != 0)
     val facts = storage:
-      Table[Facts](
+      Table.takeOwnership[Facts](
         Vector(
           storage:
             RecordBatch(
@@ -55,7 +55,7 @@ object RelationalBench:
         )
       )
     val groups = storage:
-      Table[Groups](
+      Table.takeOwnership[Groups](
         Vector(
           storage:
             RecordBatch(
@@ -111,7 +111,7 @@ object RelationalBench:
       var index = 0
       while index < length do
         storage(utf8.scalar(index)) match
-          case ScalarValue.Utf8(value) => total += value.length.toLong
+          case ScalarValue.Utf8(value) => total += value.value.length.toLong
           case other => throw new IllegalStateException(s"unexpected UTF-8 value $other")
         index += 1
       total

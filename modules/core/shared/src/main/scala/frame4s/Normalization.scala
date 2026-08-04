@@ -139,15 +139,25 @@ object PlanNormalizer:
 
   private def and(left: ResolvedExpr, right: ResolvedExpr): ResolvedExpr =
     ResolvedExpr(
-      ExprId.derived(s"And(${left.id.value},${right.id.value})"),
+      ExprId.binary(
+        BinaryOperator.And,
+        left.id,
+        right.id,
+        DataType.Bool,
+        left.nullable || right.nullable
+      ),
       DataType.Bool,
       nullable = left.nullable || right.nullable,
       ExprNode.Binary(BinaryOperator.And, left, right)
     )
 
   private def isTotal(expression: ResolvedExpr): Boolean = expression.node match
-    case ExprNode.Column(_, _, _, _, _) | ExprNode.Literal(_)               => true
-    case ExprNode.Unary(UnaryOperator.IsNull | UnaryOperator.IsTrue, input) =>
+    case ExprNode.Column(_, _, _, _, _) | ExprNode.Literal(_) => true
+    case ExprNode.Unary(
+          UnaryOperator.IsNull | UnaryOperator.IsNotNull | UnaryOperator.IsTrue |
+          UnaryOperator.IsFalse,
+          input
+        ) =>
       isTotal(input)
     case ExprNode.Unary(UnaryOperator.Negate, input) =>
       isFloating(input.dataType) && isTotal(input)
@@ -204,7 +214,12 @@ object PlanNormalizer:
     case ExprNode.Unary(operator, input) =>
       substitute(input, inputs).map: rewritten =>
         expression.copy(
-          id = ExprId.derived(s"$operator(${rewritten.id.value})"),
+          id = ExprId.unary(
+            operator,
+            rewritten.id,
+            expression.dataType,
+            expression.nullable
+          ),
           node = ExprNode.Unary(operator, rewritten)
         )
     case ExprNode.Binary(operator, left, right) =>
@@ -212,6 +227,12 @@ object PlanNormalizer:
         lhs <- substitute(left, inputs)
         rhs <- substitute(right, inputs)
       yield expression.copy(
-        id = ExprId.derived(s"$operator(${lhs.id.value},${rhs.id.value})"),
+        id = ExprId.binary(
+          operator,
+          lhs.id,
+          rhs.id,
+          expression.dataType,
+          expression.nullable
+        ),
         node = ExprNode.Binary(operator, lhs, rhs)
       )

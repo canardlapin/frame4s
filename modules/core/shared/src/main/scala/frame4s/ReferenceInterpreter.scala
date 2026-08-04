@@ -27,16 +27,17 @@ enum ExecutionError:
     case SourceSchema(expected, actual) =>
       s"source schema $actual does not match resolved schema $expected"
     case InvalidColumnIndex(id, input, index, width) =>
-      s"expression ${id.value} references $input column $index in a $width-column batch"
+      s"expression ${ExprId.diagnostic(id)} references $input column $index in a $width-column batch"
     case ExpressionType(id, expected, actual) =>
-      s"expression ${id.value} expected $expected but evaluated to $actual"
+      s"expression ${ExprId.diagnostic(id)} expected $expected but evaluated to $actual"
     case IncompatibleValues(id, left, right) =>
-      s"expression ${id.value} cannot combine $left with $right"
+      s"expression ${ExprId.diagnostic(id)} cannot combine $left with $right"
     case PredicateType(id, actual) =>
-      s"predicate ${id.value} evaluated to $actual instead of boolean or null"
+      s"predicate ${ExprId.diagnostic(id)} evaluated to $actual instead of boolean or null"
     case IntegerOverflow(id, operator) =>
-      s"integer overflow in ${operator.toString} for expression ${id.value}"
-    case DivisionByZero(id)    => s"division by zero in expression ${id.value}"
+      s"integer overflow in ${operator.toString} for expression ${ExprId.diagnostic(id)}"
+    case DivisionByZero(id) =>
+      s"division by zero in expression ${ExprId.diagnostic(id)}"
     case UnsupportedNode(node) => s"reference interpreter does not implement $node"
     case InvalidLiteral(value) => s"literal $value is not valid"
 
@@ -220,11 +221,9 @@ final class ReferenceExecution private[frame4s] (
             batches.foreach(_.close())
             Left(value)
           case None =>
-            Table[S](batches.toVector) match
+            Table.takeOwnership[S](batches.toVector) match
               case Right(table) => Right(table)
-              case Left(value)  =>
-                batches.foreach(_.close())
-                Left(ExecutionError.Storage(value))
+              case Left(value)  => Left(ExecutionError.Storage(value))
       finally cursor.close()
 
 object ReferenceInterpreter:
@@ -730,7 +729,7 @@ object ReferenceInterpreter:
       case ScalarValue.Float64(actual) =>
         val normalized = if actual == 0.0 then 0.0 else actual
         KeyAtom.Float64(java.lang.Double.doubleToLongBits(normalized))
-      case ScalarValue.Utf8(actual)            => KeyAtom.Utf8(actual)
+      case ScalarValue.Utf8(actual)            => KeyAtom.Utf8(actual.value)
       case ScalarValue.Timestamp(actual, unit) => KeyAtom.Timestamp(actual, unit)
 
   private def drain(cursor: ExecutionCursor): Either[ExecutionError, Vector[RecordBatch]] =
@@ -1070,9 +1069,11 @@ object ReferenceInterpreter:
       operator: UnaryOperator,
       input: ScalarValue
   ): Either[ExecutionError, ScalarValue] = operator match
-    case UnaryOperator.IsNull => Right(ScalarValue.Bool(input == ScalarValue.Null))
-    case UnaryOperator.IsTrue => Right(ScalarValue.Bool(input == ScalarValue.Bool(true)))
-    case UnaryOperator.Negate =>
+    case UnaryOperator.IsNull    => Right(ScalarValue.Bool(input == ScalarValue.Null))
+    case UnaryOperator.IsNotNull => Right(ScalarValue.Bool(input != ScalarValue.Null))
+    case UnaryOperator.IsTrue    => Right(ScalarValue.Bool(input == ScalarValue.Bool(true)))
+    case UnaryOperator.IsFalse   => Right(ScalarValue.Bool(input == ScalarValue.Bool(false)))
+    case UnaryOperator.Negate    =>
       input match
         case ScalarValue.Null                                  => Right(ScalarValue.Null)
         case ScalarValue.Int32(value) if value == Int.MinValue =>
@@ -1168,7 +1169,8 @@ object ReferenceInterpreter:
     case (ScalarValue.Float32(a), ScalarValue.Float32(b)) =>
       Right(compareFloat(a.toDouble, b.toDouble))
     case (ScalarValue.Float64(a), ScalarValue.Float64(b)) => Right(compareFloat(a, b))
-    case (ScalarValue.Utf8(a), ScalarValue.Utf8(b))       => Right(compareUtf8(a, b))
+    case (ScalarValue.Utf8(a), ScalarValue.Utf8(b))       =>
+      Right(compareUtf8(a.value, b.value))
     case (ScalarValue.Timestamp(a, unitA), ScalarValue.Timestamp(b, unitB)) if unitA == unitB =>
       Right(a.compare(b))
     case _ => Left(ExecutionError.IncompatibleValues(id, left, right))
@@ -1342,7 +1344,7 @@ object ReferenceInterpreter:
         var index = 0
         while index < values.length do
           values(index) match
-            case ScalarValue.Utf8(value) => output(index) = value
+            case ScalarValue.Utf8(value) => output(index) = value.value
             case ScalarValue.Null        => output(index) = ""
             case other                   => return mismatch(other)
           index += 1

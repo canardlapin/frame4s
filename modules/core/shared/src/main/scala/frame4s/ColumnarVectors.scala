@@ -139,7 +139,7 @@ private[frame4s] object ColumnarMaterialization:
             var index = 0
             while index < length do
               values(index) match
-                case ScalarValue.Utf8(actual) => output(index) = actual
+                case ScalarValue.Utf8(actual) => output(index) = actual.value
                 case _                        => ()
               index += 1
             ColumnArray.utf8(output, valid)
@@ -419,7 +419,7 @@ final private[frame4s] case class RawUtf8Vector(
 ) extends ColumnarVector:
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     checked(index).map: absolute =>
-      if isValid(index) then ScalarValue.Utf8(decode(absolute))
+      if isValid(index) then ScalarValue.checkedUtf8(decode(absolute))
       else ScalarValue.Null
 
   def unsafeScalarHash(index: Int): Long =
@@ -697,7 +697,7 @@ final private[frame4s] case class Utf8Values(values: Array[String]) extends Colu
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     if index < 0 || index >= length then
       Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
-    else Right(ScalarValue.Utf8(values(index)))
+    else Right(ScalarValue.checkedUtf8(values(index)))
 
   def unsafeScalarHash(index: Int): Long = values(index).hashCode.toLong
 
@@ -710,7 +710,7 @@ final private[frame4s] case class NullableUtf8Values(
   def scalar(index: Int): Either[ExecutionError, ScalarValue] =
     if index < 0 || index >= length then
       Left(ExecutionError.Storage(StorageError.InvalidRange(index, 1, length)))
-    else if valid(index) then Right(ScalarValue.Utf8(values(index)))
+    else if valid(index) then Right(ScalarValue.checkedUtf8(values(index)))
     else Right(ScalarValue.Null)
 
   def unsafeScalarHash(index: Int): Long =
@@ -1353,7 +1353,7 @@ private[frame4s] object ColumnarVector:
       java.lang.Float.floatToRawIntBits(actual).toLong
     case ScalarValue.Float64(actual) =>
       java.lang.Double.doubleToRawLongBits(actual)
-    case ScalarValue.Utf8(actual)            => actual.hashCode.toLong
+    case ScalarValue.Utf8(actual)            => actual.value.hashCode.toLong
     case ScalarValue.Timestamp(actual, unit) => actual ^ unit.ordinal.toLong
 
 private[frame4s] def readInt(bytes: Array[Byte], offset: Int): Int =

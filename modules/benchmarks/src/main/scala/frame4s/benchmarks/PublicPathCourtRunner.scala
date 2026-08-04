@@ -217,10 +217,14 @@ object PublicPathCourtRunner:
     val leftRef = frame(SourceRef.values("public-left", "public-left"))
     val rightRef = frame(SourceRef.values("public-right", "public-right"))
     val leftTable = storage(
-      Table[Left](table(summon[SchemaDescriptor[Left]].schema, shuffled(rows, 41L), 3L))
+      Table.takeOwnership[Left](
+        table(summon[SchemaDescriptor[Left]].schema, shuffled(rows, 41L), 3L)
+      )
     )
     val rightTable = storage(
-      Table[Right](table(summon[SchemaDescriptor[Right]].schema, shuffled(rows, 97L), 5L))
+      Table.takeOwnership[Right](
+        table(summon[SchemaDescriptor[Right]].schema, shuffled(rows, 97L), 5L)
+      )
     )
     val sources =
       ReferenceSources.empty.bind(leftRef, leftTable).bind(rightRef, rightTable)

@@ -138,7 +138,7 @@ class CompileTimeCourtSuite extends munit.FunSuite:
         import frame4s.*
         type Input = (id: Int, label: String)
         val frame = Frame.source[Input]("input").toOption.get
-        frame.sortBy(row => row.col("missing"))
+        frame.sortBy(row => SortKey(row.col("missing")))
       """)
     )
     assert(message.contains("missing"), message)

@@ -84,7 +84,7 @@ class JoinRegimeState:
   private def leftTableFrom(keys: Array[Int]): Table[Left] =
     val schema = summon[SchemaDescriptor[Left]].schema
     storage:
-      Table[Left](
+      Table.takeOwnership[Left](
         Vector(
           storage:
             RecordBatch(
@@ -100,7 +100,7 @@ class JoinRegimeState:
   private def rightTableFrom(keys: Array[Int]): Table[Right] =
     val schema = summon[SchemaDescriptor[Right]].schema
     storage:
-      Table[Right](
+      Table.takeOwnership[Right](
         Vector(
           storage:
             RecordBatch(

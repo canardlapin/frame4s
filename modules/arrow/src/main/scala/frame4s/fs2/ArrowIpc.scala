@@ -34,7 +34,7 @@ import frame4s.*
 final class ArrowIpcFrameSource[F[_]] private (
     delegate: InMemoryFrameSource[F]
 )(using F: Async[F])
-    extends ArrowIpcPlatform[F]:
+    extends FrameSource[F]:
   def inspect: F[Either[SourceError, SourceInspection]] = delegate.inspect
 
   def plan(request: ScanRequest): F[Either[SourceError, PlannedScan[F]]] =
@@ -51,15 +51,19 @@ final class ArrowIpcFrameSource[F[_]] private (
 object ArrowIpcFrameSource:
   /** Decode one Arrow IPC stream from an immutable byte snapshot.
     *
-    * The input array is consumed during acquisition. Malformed or unsupported Arrow data raises
-    * [[SourceFailure]] in `F`; successfully decoded batches are owned by the returned resource.
+    * The input array is copied immediately when this resource value is constructed. Malformed or
+    * unsupported Arrow data raises [[SourceFailure]] in `F`; operational failures retain their
+    * cause without rendering it. Successfully decoded batches are owned by the returned resource.
     */
   def resource[F[_]](
       bytes: Array[Byte]
   )(using F: Async[F]): Resource[F, ArrowIpcFrameSource[F]] =
+    val snapshot =
+      if bytes == null then Left(SourceError.InvalidRequest("Arrow IPC bytes cannot be raw null"))
+      else Right(bytes.clone())
     FrameSource.owningResource:
-      ArrowIpcCodec
-        .decode[F](bytes)
+      F.fromEither(snapshot.leftMap(SourceFailure.apply))
+        .flatMap(ArrowIpcCodec.decode[F])
         .flatMap(result => F.fromEither(result.leftMap(SourceFailure.apply)))
         .map: (schema, batches) =>
           new ArrowIpcFrameSource(InMemoryFrameSource.owned(schema, batches))
@@ -69,9 +73,11 @@ final case class ArrowIpcWriteResult(
     receipt: SinkReceipt
 )
 
-final private case class SinkFailure(error: SinkError) extends RuntimeException(error.message)
-
-/** JVM Arrow IPC encoder that returns a byte snapshot and an exact sink receipt. */
+/** JVM Arrow IPC encoder that returns a byte snapshot and an exact sink receipt.
+  *
+  * Ordinary upstream, write, and close failures are returned as [[SinkError]]; cancellation and
+  * fatal platform failures remain effect-level.
+  */
 final class ArrowIpcFrameSink[F[_]](using F: Async[F]) extends FrameSink[F, ArrowIpcWriteResult]:
   def write(
       schema: Schema,
@@ -79,7 +85,7 @@ final class ArrowIpcFrameSink[F[_]](using F: Async[F]) extends FrameSink[F, Arro
   ): F[Either[SinkError, ArrowIpcWriteResult]] =
     ArrowIpcCodec.encode(schema, batches)
 
-private object ArrowIpcCodec:
+private[fs2] object ArrowIpcCodec:
   final private case class WriterContext(
       output: ByteArrayOutputStream,
       root: VectorSchemaRoot,
@@ -90,32 +96,42 @@ private object ArrowIpcCodec:
       schema: Schema,
       batches: Stream[F, RecordBatch]
   )(using F: Async[F]): F[Either[SinkError, ArrowIpcWriteResult]] =
-    writerResource(schema)
-      .use: context =>
-        val initialize = F.blocking(context.writer.start())
-        val encoded = batches
-          .evalMap: batch =>
-            if batch.schema != schema then
-              F.raiseError[Long](SinkFailure(SinkError.SchemaMismatch(schema, batch.schema)))
-            else
-              F.blocking(writeBatch(schema, context, batch))
-                .flatMap(result => F.fromEither(result.leftMap(SinkFailure.apply)))
-          .compile
-          .fold((0L, 0L)): (state, rows) =>
-            (state._1 + rows, state._2 + 1L)
-        initialize *> encoded.flatMap: (rows, batchCount) =>
-          F.blocking:
-            context.writer.end()
-            val bytes = context.output.toByteArray
-            ArrowIpcWriteResult(
-              bytes,
-              SinkReceipt(rows, batchCount, bytes.length.toLong)
+    arrowSchema(schema) match
+      case Left(error)         => F.pure(Left(error))
+      case Right(nativeSchema) =>
+        val encoded = writerResource(nativeSchema)
+          .use: context =>
+            val initialize = AdapterFailureBoundary.sinkEffect(
+              F.blocking(context.writer.start()),
+              SinkError.Write.apply
             )
-      .attempt
-      .map:
-        case Right(result)            => Right(result)
-        case Left(SinkFailure(error)) => Left(error)
-        case Left(error)              => Left(SinkError.Write(exceptionDetail(error)))
+            val encoded = batches
+              .evalMap: batch =>
+                if batch.schema != schema then
+                  F.raiseError[Long](SinkFailure(SinkError.SchemaMismatch(schema, batch.schema)))
+                else
+                  AdapterFailureBoundary
+                    .sinkEffect(
+                      F.blocking(writeBatch(schema, context, batch)),
+                      SinkError.Write.apply
+                    )
+                    .flatMap(result => F.fromEither(result.leftMap(SinkFailure.apply)))
+              .compile
+              .fold((0L, 0L)): (state, rows) =>
+                (state._1 + rows, state._2 + 1L)
+            initialize *> encoded.flatMap: (rows, batchCount) =>
+              val finish = F.blocking:
+                context.writer.end()
+                val bytes = context.output.toByteArray
+                ArrowIpcWriteResult(
+                  bytes,
+                  SinkReceipt(rows, batchCount, bytes.length.toLong)
+                )
+              AdapterFailureBoundary.sinkEffect(finish, SinkError.Write.apply)
+        AdapterFailureBoundary.sinkEither(
+          encoded.map(result => Right(result): Either[SinkError, ArrowIpcWriteResult]),
+          SinkError.Upstream.apply
+        )
 
   def decode[F[_]](
       bytes: Array[Byte]
@@ -124,7 +140,13 @@ private object ArrowIpcCodec:
       .of[F, Vector[RecordBatch]](Vector.empty)
       .flatMap: retained =>
         def closeRetained: F[Unit] =
-          retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
+          retained.get.flatMap: batches =>
+            batches.traverse_(batch =>
+              AdapterFailureBoundary.sourceEffect(
+                F.delay(batch.close()),
+                SourceError.Close.apply
+              )
+            )
 
         val decoded = readerResource(bytes)
           .use: reader =>
@@ -136,47 +158,40 @@ private object ArrowIpcCodec:
               _ <- readBatches(reader, root, schema, retained)
               batches <- retained.get
             yield (schema, batches)
-        decoded
-          .guaranteeCase:
-            case Outcome.Succeeded(_) => F.unit
-            case _                    => closeRetained
-          .attempt
-          .map:
-            case Right(result)              => Right(result)
-            case Left(SourceFailure(error)) => Left(error)
-            case Left(error)                => Left(SourceError.Open(exceptionDetail(error)))
+        val guarded = decoded.guaranteeCase:
+          case Outcome.Succeeded(_) => F.unit
+          case _                    => closeRetained
+        AdapterFailureBoundary.sourceEither(
+          guarded,
+          SourceError.Open.apply
+        )
 
   private def writerResource[F[_]](
-      schema: Schema
+      schema: ArrowSchema
   )(using F: Async[F]): Resource[F, WriterContext] =
-    Resource
-      .fromAutoCloseable(F.blocking(new RootAllocator()))
+    sinkAutoCloseable(F.blocking(new RootAllocator()))
       .flatMap: allocator =>
-        Resource
-          .fromAutoCloseable(
-            F.blocking(VectorSchemaRoot.create(arrowSchema(schema), allocator))
-          )
+        sinkAutoCloseable(
+          F.blocking(VectorSchemaRoot.create(schema, allocator))
+        )
           .flatMap: root =>
             val output = new ByteArrayOutputStream
-            Resource
-              .fromAutoCloseable(
-                F.blocking(
-                  new ArrowStreamWriter(
-                    root,
-                    null,
-                    Channels.newChannel(output)
-                  )
+            sinkAutoCloseable(
+              F.blocking(
+                new ArrowStreamWriter(
+                  root,
+                  null,
+                  Channels.newChannel(output)
                 )
               )
-              .map(writer => WriterContext(output, root, writer))
+            ).map(writer => WriterContext(output, root, writer))
 
   private def readerResource[F[_]](
       bytes: Array[Byte]
   )(using F: Async[F]): Resource[F, ArrowStreamReader] =
-    Resource
-      .fromAutoCloseable(F.blocking(new RootAllocator()))
+    sourceAutoCloseable(F.blocking(new RootAllocator()))
       .flatMap: allocator =>
-        Resource.fromAutoCloseable:
+        sourceAutoCloseable:
           F.blocking(
             new ArrowStreamReader(
               new ByteArrayInputStream(bytes),
@@ -184,19 +199,49 @@ private object ArrowIpcCodec:
             )
           )
 
+  private def sinkAutoCloseable[F[_], A <: AutoCloseable](
+      acquire: F[A]
+  )(using F: Async[F]): Resource[F, A] =
+    Resource.make(
+      AdapterFailureBoundary.sinkEffect(acquire, SinkError.Write.apply)
+    ): value =>
+      AdapterFailureBoundary.sinkEffect(
+        F.blocking(value.close()),
+        SinkError.Close.apply
+      )
+
+  private def sourceAutoCloseable[F[_], A <: AutoCloseable](
+      acquire: F[A]
+  )(using F: Async[F]): Resource[F, A] =
+    Resource.make(
+      AdapterFailureBoundary.sourceEffect(acquire, SourceError.Open.apply)
+    ): value =>
+      AdapterFailureBoundary.sourceEffect(
+        F.blocking(value.close()),
+        SourceError.Close.apply
+      )
+
   private def readBatches[F[_]](
       reader: ArrowStreamReader,
       root: VectorSchemaRoot,
       schema: Schema,
       retained: Ref[F, Vector[RecordBatch]]
   )(using F: Async[F]): F[Unit] =
-    F.blocking(reader.loadNextBatch())
+    AdapterFailureBoundary
+      .sourceEffect(
+        F.blocking(reader.loadNextBatch()),
+        SourceError.Read.apply
+      )
       .flatMap:
         case false => F.unit
         case true  =>
           (
             F.uncancelable: _ =>
-              F.blocking(decodeBatch(schema, root))
+              AdapterFailureBoundary
+                .sourceEffect(
+                  F.blocking(decodeBatch(schema, root, new BufferTracker)),
+                  SourceError.Read.apply
+                )
                 .flatMap(result => F.fromEither(result.leftMap(SourceFailure.apply)))
                 .flatMap(batch => retained.update(_ :+ batch))
           ) *> readBatches(reader, root, schema, retained)
@@ -230,39 +275,41 @@ private object ArrowIpcCodec:
         case None        =>
           context.writer.writeBatch()
           Right(batch.rowCount.toLong)
-    catch case NonFatal(error) => Left(SinkError.Write(exceptionDetail(error)))
+    catch case NonFatal(error) => Left(SinkError.Write(error))
     finally root.clear()
 
-  private def exceptionDetail(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
-
-  private def arrowSchema(schema: Schema): ArrowSchema =
-    new ArrowSchema(
-      schema.fields
-        .map: field =>
+  private def arrowSchema(schema: Schema): Either[SinkError, ArrowSchema] =
+    if schema == null then Left(SinkError.InvalidRequest("Arrow IPC schema cannot be raw null"))
+    else
+      val fields = schema.fields.map: field =>
+        arrowType(field.dataType).map: dataType =>
           new ArrowField(
             field.name,
-            new ArrowFieldType(field.nullable, arrowType(field.dataType), null, null),
+            new ArrowFieldType(field.nullable, dataType, null, null),
             Collections.emptyList()
           )
-        .asJava
-    )
+      fields
+        .foldLeft[Either[SinkError, Vector[ArrowField]]](Right(Vector.empty)):
+          case (result, value) => result.flatMap(current => value.map(current :+ _))
+        .map(values => new ArrowSchema(values.asJava))
 
-  private def arrowType(dataType: DataType): ArrowType = dataType match
-    case DataType.Bool            => ArrowType.Bool.INSTANCE
-    case DataType.Int32           => new ArrowType.Int(32, true)
-    case DataType.Int64           => new ArrowType.Int(64, true)
-    case DataType.Float32         => new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)
-    case DataType.Float64         => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
-    case DataType.Utf8            => ArrowType.Utf8.INSTANCE
-    case DataType.Timestamp(unit) =>
-      new ArrowType.Timestamp(arrowTimeUnit(unit), null)
-
-  private def arrowTimeUnit(unit: TimeUnit): ArrowTimeUnit = unit match
-    case TimeUnit.Second      => ArrowTimeUnit.SECOND
-    case TimeUnit.Millisecond => ArrowTimeUnit.MILLISECOND
-    case TimeUnit.Microsecond => ArrowTimeUnit.MICROSECOND
-    case TimeUnit.Nanosecond  => ArrowTimeUnit.NANOSECOND
+  private def arrowType(dataType: DataType): Either[SinkError, ArrowType] = dataType match
+    case DataType.Bool    => Right(ArrowType.Bool.INSTANCE)
+    case DataType.Int32   => Right(new ArrowType.Int(32, true))
+    case DataType.Int64   => Right(new ArrowType.Int(64, true))
+    case DataType.Float32 =>
+      Right(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE))
+    case DataType.Float64 =>
+      Right(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE))
+    case DataType.Utf8                            => Right(ArrowType.Utf8.INSTANCE)
+    case DataType.Timestamp(TimeUnit.Microsecond) =>
+      Right(new ArrowType.Timestamp(ArrowTimeUnit.MICROSECOND, null))
+    case DataType.Timestamp(_) =>
+      Left(
+        SinkError.InvalidRequest(
+          "frame4s-arrow 0.1 supports only timezone-free microsecond timestamps"
+        )
+      )
 
   private def frameSchema(schema: ArrowSchema): Either[SourceError, Schema] =
     val fields = schema.getFields.asScala.toVector.map: field =>
@@ -283,13 +330,16 @@ private object ArrowIpcCodec:
       Right(DataType.Float32)
     case value: ArrowType.FloatingPoint if value.getPrecision == FloatingPointPrecision.DOUBLE =>
       Right(DataType.Float64)
-    case _: ArrowType.Utf8                                       => Right(DataType.Utf8)
-    case value: ArrowType.Timestamp if value.getTimezone == null =>
-      value.getUnit match
-        case ArrowTimeUnit.SECOND      => Right(DataType.Timestamp(TimeUnit.Second))
-        case ArrowTimeUnit.MILLISECOND => Right(DataType.Timestamp(TimeUnit.Millisecond))
-        case ArrowTimeUnit.MICROSECOND => Right(DataType.Timestamp(TimeUnit.Microsecond))
-        case ArrowTimeUnit.NANOSECOND  => Right(DataType.Timestamp(TimeUnit.Nanosecond))
+    case _: ArrowType.Utf8 => Right(DataType.Utf8)
+    case value: ArrowType.Timestamp
+        if value.getTimezone == null && value.getUnit == ArrowTimeUnit.MICROSECOND =>
+      Right(DataType.Timestamp(TimeUnit.Microsecond))
+    case _: ArrowType.Timestamp =>
+      Left(
+        SourceError.SchemaMismatch(
+          "frame4s-arrow 0.1 supports only timezone-free microsecond timestamps"
+        )
+      )
     case other =>
       Left(SourceError.SchemaMismatch(s"unsupported Arrow IPC type $other"))
 
@@ -316,18 +366,9 @@ private object ArrowIpcCodec:
         current.setSafe(row, actual)
         Right(())
       case (current: VarCharVector, ScalarValue.Utf8(actual)) =>
-        current.setSafe(row, actual.getBytes(StandardCharsets.UTF_8))
-        Right(())
-      case (current: TimeStampSecVector, ScalarValue.Timestamp(actual, TimeUnit.Second)) =>
-        current.setSafe(row, actual)
-        Right(())
-      case (current: TimeStampMilliVector, ScalarValue.Timestamp(actual, TimeUnit.Millisecond)) =>
-        current.setSafe(row, actual)
+        current.setSafe(row, actual.value.getBytes(StandardCharsets.UTF_8))
         Right(())
       case (current: TimeStampMicroVector, ScalarValue.Timestamp(actual, TimeUnit.Microsecond)) =>
-        current.setSafe(row, actual)
-        Right(())
-      case (current: TimeStampNanoVector, ScalarValue.Timestamp(actual, TimeUnit.Nanosecond)) =>
         current.setSafe(row, actual)
         Right(())
       case (current, ScalarValue.Null) => setNull(current, column, row, value)
@@ -358,35 +399,67 @@ private object ArrowIpcCodec:
       case current: VarCharVector =>
         current.setNull(row)
         Right(())
-      case current: TimeStampSecVector =>
-        current.setNull(row)
-        Right(())
-      case current: TimeStampMilliVector =>
-        current.setNull(row)
-        Right(())
       case current: TimeStampMicroVector =>
-        current.setNull(row)
-        Right(())
-      case current: TimeStampNanoVector =>
         current.setNull(row)
         Right(())
       case _ => Left(SinkError.Encode(row.toLong, column, value))
 
-  private def decodeBatch(
+  private[fs2] def decodeBatch(
       schema: Schema,
-      root: VectorSchemaRoot
+      root: VectorSchemaRoot,
+      tracker: BufferTracker
   ): Either[SourceError, RecordBatch] =
-    val columns = schema.fields.zipWithIndex.map: (field, index) =>
-      decodeColumn(field.dataType, root.getVector(index), root.getRowCount)
-    columns
-      .foldLeft[Either[SourceError, Vector[ColumnArray]]](Right(Vector.empty)):
-        case (result, value) => result.flatMap(current => value.map(current :+ _))
-      .flatMap(values => RecordBatch(schema, values).leftMap(SourceError.Storage.apply))
+    val columns = scala.collection.mutable.ArrayBuffer.empty[ColumnArray]
+    var index = 0
+    var error: Option[SourceError] = None
+    try
+      while index < schema.size && error.isEmpty do
+        decodeColumn(
+          schema.fields(index).dataType,
+          root.getVector(index),
+          root.getRowCount,
+          tracker
+        ) match
+          case Right(column) => columns += column
+          case Left(value)   => error = Some(value)
+        index += 1
+
+      error match
+        case Some(value) =>
+          closeDecoded(columns.toVector) match
+            case Some(cause) => Left(SourceError.Close(cause))
+            case None        => Left(value)
+        case None =>
+          val decoded = columns.toVector
+          RecordBatch(schema, decoded) match
+            case Right(batch) => Right(batch)
+            case Left(value)  =>
+              closeDecoded(decoded) match
+                case Some(cause) => Left(SourceError.Close(cause))
+                case None        => Left(SourceError.Storage(value))
+    catch
+      case NonFatal(cause) =>
+        closeDecoded(columns.toVector).foreach(cause.addSuppressed)
+        throw cause
+
+  private def closeDecoded(columns: Vector[ColumnArray]): Option[Throwable] =
+    var failure: Option[Throwable] = None
+    var index = columns.length - 1
+    while index >= 0 do
+      try columns(index).close()
+      catch
+        case NonFatal(cause) =>
+          failure match
+            case Some(first) => first.addSuppressed(cause)
+            case None        => failure = Some(cause)
+      index -= 1
+    failure
 
   private def decodeColumn(
       dataType: DataType,
       vector: FieldVector,
-      length: Int
+      length: Int,
+      tracker: BufferTracker
   ): Either[SourceError, ColumnArray] =
     val valid = Array.tabulate(length)(index => !vector.isNull(index))
     def invalid: Left[SourceError, Nothing] =
@@ -399,60 +472,53 @@ private object ArrowIpcCodec:
           Right(
             ColumnArray.bool(
               Array.tabulate(length)(index => valid(index) && current.get(index) != 0),
-              valid
+              valid,
+              tracker
             )
           )
         case (DataType.Int32, current: IntVector) =>
           Right(
             ColumnArray.int32(
               Array.tabulate(length)(index => if valid(index) then current.get(index) else 0),
-              valid
+              valid,
+              tracker
             )
           )
         case (DataType.Int64, current: BigIntVector) =>
           Right(
             ColumnArray.int64(
               Array.tabulate(length)(index => if valid(index) then current.get(index) else 0L),
-              valid
+              valid,
+              tracker
             )
           )
         case (DataType.Float32, current: Float4Vector) =>
           Right(
             ColumnArray.float32(
               Array.tabulate(length)(index => if valid(index) then current.get(index) else 0.0f),
-              valid
+              valid,
+              tracker
             )
           )
         case (DataType.Float64, current: Float8Vector) =>
           Right(
             ColumnArray.float64(
               Array.tabulate(length)(index => if valid(index) then current.get(index) else 0.0),
-              valid
+              valid,
+              tracker
             )
           )
         case (DataType.Utf8, current: VarCharVector) =>
           Right(
             ColumnArray.utf8(
               Array.tabulate(length): index =>
-                if valid(index) then new String(current.get(index), StandardCharsets.UTF_8)
+                if valid(index) then
+                  val bytes = current.get(index)
+                  if bytes == null then null
+                  else new String(bytes, StandardCharsets.UTF_8)
                 else "",
-              valid
-            )
-          )
-        case (DataType.Timestamp(TimeUnit.Second), current: TimeStampSecVector) =>
-          Right(
-            ColumnArray.timestamp(
-              Array.tabulate(length)(index => if valid(index) then current.get(index) else 0L),
-              TimeUnit.Second,
-              valid
-            )
-          )
-        case (DataType.Timestamp(TimeUnit.Millisecond), current: TimeStampMilliVector) =>
-          Right(
-            ColumnArray.timestamp(
-              Array.tabulate(length)(index => if valid(index) then current.get(index) else 0L),
-              TimeUnit.Millisecond,
-              valid
+              valid,
+              tracker
             )
           )
         case (DataType.Timestamp(TimeUnit.Microsecond), current: TimeStampMicroVector) =>
@@ -460,15 +526,8 @@ private object ArrowIpcCodec:
             ColumnArray.timestamp(
               Array.tabulate(length)(index => if valid(index) then current.get(index) else 0L),
               TimeUnit.Microsecond,
-              valid
-            )
-          )
-        case (DataType.Timestamp(TimeUnit.Nanosecond), current: TimeStampNanoVector) =>
-          Right(
-            ColumnArray.timestamp(
-              Array.tabulate(length)(index => if valid(index) then current.get(index) else 0L),
-              TimeUnit.Nanosecond,
-              valid
+              valid,
+              tracker
             )
           )
         case _ => invalid

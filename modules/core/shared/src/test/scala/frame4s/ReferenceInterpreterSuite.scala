@@ -70,7 +70,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
             Array("a", "b", "c", "d")
           )
         )
-    storage(Table[Input](batches))
+    storage(Table.takeOwnership[Input](batches))
 
   private def reference: SourceRef =
     SourceRef.values("fixture", "fixture").fold(error => fail(error.message), identity)
@@ -100,7 +100,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
     val peopleRef = SourceRef.values("workflow-people", "workflow-people").toOption.get
     val teamsRef = SourceRef.values("workflow-teams", "workflow-teams").toOption.get
     val peopleInput = storage:
-      Table[People](
+      Table.takeOwnership[People](
         Vector(
           storage:
             RecordBatch(
@@ -114,7 +114,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
         )
       )
     val teamsInput = storage:
-      Table[Teams](
+      Table.takeOwnership[Teams](
         Vector(
           storage:
             RecordBatch(
@@ -152,7 +152,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
 
     assertEquals(
       scalars(output, "region"),
-      Vector(ScalarValue.Utf8("north"), ScalarValue.Utf8("south"))
+      Vector(ScalarValue.checkedUtf8("north"), ScalarValue.checkedUtf8("south"))
     )
     assertEquals(scalars(output, "n"), Vector(ScalarValue.Int64(2L), ScalarValue.Int64(1L)))
     assertEquals(
@@ -177,7 +177,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
       ReferenceInterpreter.prepare(query.plan, ReferenceSources.empty.bind(reference, input))
     val output = execution(physical.collect[(label: String, nextId: Int)])
 
-    assertEquals(scalars(output, "label"), Vector(ScalarValue.Utf8("a")))
+    assertEquals(scalars(output, "label"), Vector(ScalarValue.checkedUtf8("a")))
     assertEquals(scalars(output, "nextId"), Vector(ScalarValue.Int32(2)))
     assertEquals(physical.shape.streaming, true)
     assertEquals(
@@ -275,7 +275,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
       Array(false),
       Array("overflow")
     )
-    val input = storage(Table[Input](Vector(overflowBatch)))
+    val input = storage(Table.takeOwnership[Input](Vector(overflowBatch)))
     val query = source.withColumn("overflow")(row => row.col("id") + Expr.literal(1))
     val result = ReferenceInterpreter
       .prepare(query.plan, ReferenceSources.empty.bind(reference, input))
@@ -337,7 +337,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           storage(ColumnArray.int32(Array(1, 2, 3, 4, 5)))
         )
       )
-    val salesTable = storage(Table[Sales](Vector(salesBatch)))
+    val salesTable = storage(Table.takeOwnership[Sales](Vector(salesBatch)))
     val sales = Frame.values[Sales](salesRef).toOption.get
     val query: Frame[Result] = sales
       .groupBy(row => Tuple1(row.col("group").as("group")))
@@ -356,7 +356,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
         .prepare(query.plan, ReferenceSources.empty.bind(salesRef, salesTable))
         .collect[Result]
 
-    assertEquals(scalars(output, "group"), Vector(ScalarValue.Utf8("a"), ScalarValue.Null))
+    assertEquals(scalars(output, "group"), Vector(ScalarValue.checkedUtf8("a"), ScalarValue.Null))
     assertEquals(scalars(output, "n"), Vector(ScalarValue.Int64(3), ScalarValue.Int64(2)))
     assertEquals(
       scalars(output, "total"),
@@ -385,7 +385,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
     type EmptyInput = (value: Option[Double])
     type Result = (n: Long, total: Option[Double], mean: Option[Double])
     val emptyRef = SourceRef.values("empty", "empty").toOption.get
-    val empty = storage(Table[EmptyInput](Vector.empty))
+    val empty = storage(Table.takeOwnership[EmptyInput](Vector.empty))
     val source = Frame.values[EmptyInput](emptyRef).toOption.get
     val query: Frame[Result] = source
       .groupBy(_ => EmptyTuple)
@@ -428,7 +428,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
         )
 
     val oneBatch = storage:
-      Table[Means](
+      Table.takeOwnership[Means](
         Vector(
           batch(
             Array(
@@ -460,7 +460,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
         )
       )
     val twoBatches = storage:
-      Table[Means](
+      Table.takeOwnership[Means](
         Vector(
           batch(
             Array("positive", "negative", "opposite", "nan", "all-null"),
@@ -525,7 +525,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
 
   test("floating extrema propagate NaN independently of input order"):
     type Floating = (group: String, value: Double)
-    type Result = (group: String, minimum: Double, maximum: Double)
+    type Result = (group: String, minimum: Option[Double], maximum: Option[Double])
     val floatingSchema = summon[SchemaDescriptor[Floating]].schema
     val floatingRef = SourceRef.values("floating-extrema", "floating-extrema").toOption.get
     val floatingBatch = storage:
@@ -536,7 +536,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           storage(ColumnArray.float64(Array(Double.NaN, 1.0, 1.0, Double.NaN)))
         )
       )
-    val floatingTable = storage(Table[Floating](Vector(floatingBatch)))
+    val floatingTable = storage(Table.takeOwnership[Floating](Vector(floatingBatch)))
     val floating = Frame.values[Floating](floatingRef).toOption.get
     val query: Frame[Result] = floating
       .groupBy(row => Tuple1(row.col("group").as("group")))
@@ -583,8 +583,8 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           storage(ColumnArray.utf8(Array("x", "y", "null", "z")))
         )
       )
-    val leftTable = storage(Table[Left](Vector(leftBatch)))
-    val rightTable = storage(Table[Right](Vector(rightBatch)))
+    val leftTable = storage(Table.takeOwnership[Left](Vector(leftBatch)))
+    val rightTable = storage(Table.takeOwnership[Right](Vector(rightBatch)))
     val left = Frame.values[Left](leftRef).toOption.get
     val right = Frame.values[Right](rightRef).toOption.get
     val inner = left.innerJoin(right): (lhs, rhs) =>
@@ -616,11 +616,11 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
     assertEquals(
       scalars(outerOutput, "label"),
       Vector(
-        ScalarValue.Utf8("x"),
-        ScalarValue.Utf8("y"),
+        ScalarValue.checkedUtf8("x"),
+        ScalarValue.checkedUtf8("y"),
         ScalarValue.Null,
-        ScalarValue.Utf8("x"),
-        ScalarValue.Utf8("y"),
+        ScalarValue.checkedUtf8("x"),
+        ScalarValue.checkedUtf8("y"),
         ScalarValue.Null
       )
     )
@@ -653,8 +653,8 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           storage(ColumnArray.utf8(Array("x", "y", "null")))
         )
       )
-    val leftTable = storage(Table[Left](Vector(leftBatch)))
-    val rightTable = storage(Table[Right](Vector(rightBatch)))
+    val leftTable = storage(Table.takeOwnership[Left](Vector(leftBatch)))
+    val rightTable = storage(Table.takeOwnership[Right](Vector(rightBatch)))
     val left = Frame.values[Left](leftRef).toOption.get
     val right = Frame.values[Right](rightRef).toOption.get
     val sources = ReferenceSources.empty.bind(leftRef, leftTable).bind(rightRef, rightTable)
@@ -668,13 +668,66 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
         .prepare(left.leftJoinUsing(right, "key").plan, sources)
         .collect[Outer]
 
-    assertEquals(scalars(inner, "leftLabel"), Vector("a", "a").map(ScalarValue.Utf8.apply))
+    assertEquals(scalars(inner, "leftLabel"), Vector("a", "a").map(ScalarValue.checkedUtf8))
     assertEquals(
       scalars(outer, "rightLabel"),
       Vector(
-        ScalarValue.Utf8("x"),
-        ScalarValue.Utf8("y"),
+        ScalarValue.checkedUtf8("x"),
+        ScalarValue.checkedUtf8("y"),
         ScalarValue.Null,
+        ScalarValue.Null
+      )
+    )
+    inner.close()
+    outer.close()
+    leftTable.close()
+    rightTable.close()
+
+  test("typed multikey using joins resolve names independently of physical field order"):
+    type Left = (group: Int, id: Int, leftLabel: String)
+    type Right = (id: Int, group: Int, rightLabel: String)
+    type Inner = (group: Int, id: Int, leftLabel: String, rightLabel: String)
+    type Outer = (group: Int, id: Int, leftLabel: String, rightLabel: Option[String])
+    val leftRef = SourceRef.values("using-many-left", "using-many-left").toOption.get
+    val rightRef = SourceRef.values("using-many-right", "using-many-right").toOption.get
+    val leftTable = Table
+      .fromRows[Left](
+        Vector(
+          (group = 1, id = 1, leftLabel = "a"),
+          (group = 1, id = 2, leftLabel = "b"),
+          (group = 2, id = 1, leftLabel = "c"),
+          (group = 9, id = 9, leftLabel = "d")
+        )
+      )
+      .fold(error => fail(error.message), identity)
+    val rightTable = Table
+      .fromRows[Right](
+        Vector(
+          (id = 1, group = 1, rightLabel = "x"),
+          (id = 2, group = 1, rightLabel = "y"),
+          (id = 1, group = 2, rightLabel = "z")
+        )
+      )
+      .fold(error => fail(error.message), identity)
+    val left = Frame.values[Left](leftRef).toOption.get
+    val right = Frame.values[Right](rightRef).toOption.get
+    val keys = (UsingKey("group"), UsingKey("id"))
+    val innerQuery: Frame[Inner] = left.innerJoinUsing(right, keys)
+    val outerQuery: Frame[Outer] = left.leftJoinUsing(right, keys)
+    val sources = ReferenceSources.empty.bind(leftRef, leftTable).bind(rightRef, rightTable)
+    val inner = execution(ReferenceInterpreter.prepare(innerQuery.plan, sources).collect[Inner])
+    val outer = execution(ReferenceInterpreter.prepare(outerQuery.plan, sources).collect[Outer])
+
+    assertEquals(
+      scalars(inner, "rightLabel"),
+      Vector("x", "y", "z").map(ScalarValue.checkedUtf8)
+    )
+    assertEquals(
+      scalars(outer, "rightLabel"),
+      Vector(
+        ScalarValue.checkedUtf8("x"),
+        ScalarValue.checkedUtf8("y"),
+        ScalarValue.checkedUtf8("z"),
         ScalarValue.Null
       )
     )
@@ -695,7 +748,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           storage(ColumnArray.utf8(Array("a", "b", "c", "d")))
         )
       )
-    val sortTable = storage(Table[SortInput](Vector(sortBatch)))
+    val sortTable = storage(Table.takeOwnership[SortInput](Vector(sortBatch)))
     val source = Frame.values[SortInput](sortRef).toOption.get
     val cases = Vector(
       (SortDirection.Ascending, NullPlacement.First, Vector("b", "c", "d", "a")),
@@ -713,13 +766,49 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
 
       assertEquals(
         scalars(output, "label"),
-        expected.map(ScalarValue.Utf8.apply)
+        expected.map(ScalarValue.checkedUtf8)
       )
       assertEquals(prepared.shape.streaming, false)
       assertEquals(prepared.shape.blockingNodes, Vector("Sort"))
       assert(query.plan.order.isInstanceOf[OrderGuarantee.Sorted])
       output.close()
 
+    sortTable.close()
+
+  test("typed SortKey values carry heterogeneous policy and preserve equal-key order"):
+    type SortInput = (major: Option[Int], minor: Option[Int], label: String)
+    val sortRef = SourceRef.values("sort-keys", "sort-keys").toOption.get
+    val sortTable = Table
+      .fromRows[SortInput](
+        Vector(
+          (major = Some(1), minor = Some(1), label = "a"),
+          (major = Some(1), minor = None, label = "b"),
+          (major = Some(1), minor = Some(2), label = "c"),
+          (major = Some(2), minor = Some(5), label = "d"),
+          (major = None, minor = Some(0), label = "e"),
+          (major = Some(1), minor = Some(2), label = "f")
+        )
+      )
+      .fold(error => fail(error.message), identity)
+    val source = Frame.values[SortInput](sortRef).toOption.get
+    val query = source.sortBy(
+      row => SortKey(row.col("major")),
+      row => SortKey(row.col("minor")).descending.nullsFirst
+    )
+    val prepared = ReferenceInterpreter.prepare(
+      query.plan,
+      ReferenceSources.empty.bind(sortRef, sortTable)
+    )
+    val output = execution(prepared.collect[SortInput])
+
+    assertEquals(
+      scalars(output, "label"),
+      Vector("b", "c", "f", "a", "d", "e").map(ScalarValue.checkedUtf8)
+    )
+    assert(query.explain.contains("Ascending:Last"))
+    assert(query.explain.contains("Descending:First"))
+    assertEquals(prepared.shape.blockingNodes, Vector("Sort"))
+    output.close()
     sortTable.close()
 
   test("normalization does not eagerly evaluate a fallible later filter"):
@@ -734,7 +823,7 @@ class ReferenceInterpreterSuite extends munit.FunSuite:
           storage(ColumnArray.int32(Array(Int.MaxValue, 1)))
         )
       )
-    val checkedTable = storage(Table[Checked](Vector(checkedBatch)))
+    val checkedTable = storage(Table.takeOwnership[Checked](Vector(checkedBatch)))
     val checked = Frame.values[Checked](checkedRef).toOption.get
     val original = checked
       .filter(row => row.col("id") > Expr.literal(0))

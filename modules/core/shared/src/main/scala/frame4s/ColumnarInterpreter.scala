@@ -779,6 +779,22 @@ final private case class IsNullExpression(input: NullablePrimitiveExpression)
     valid = true
     value = !input.valid
 
+final private case class IsNotNullExpression(input: NullablePrimitiveExpression)
+    extends BooleanPrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input match
+      case value: Int32PrimitiveExpression   => value.evaluate(row, columns, context)
+      case value: Int64PrimitiveExpression   => value.evaluate(row, columns, context)
+      case value: Float32PrimitiveExpression => value.evaluate(row, columns, context)
+      case value: Float64PrimitiveExpression => value.evaluate(row, columns, context)
+      case value: Utf8PrimitiveExpression    => value.evaluate(row, columns, context)
+      case value: BooleanPrimitiveExpression => value.evaluate(row, columns, context)
+    valid = true
+    value = input.valid
+
 final private case class IsTrueExpression(input: BooleanPrimitiveExpression)
     extends BooleanPrimitiveExpression:
   val inputIndices = input.inputIndices
@@ -788,6 +804,16 @@ final private case class IsTrueExpression(input: BooleanPrimitiveExpression)
     input.evaluate(row, columns, context)
     valid = true
     value = input.valid && input.value
+
+final private case class IsFalseExpression(input: BooleanPrimitiveExpression)
+    extends BooleanPrimitiveExpression:
+  val inputIndices = input.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] = input.bind(columns)
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    input.evaluate(row, columns, context)
+    valid = true
+    value = input.valid && !input.value
 
 final private case class BooleanLogicExpression(
     operator: BinaryOperator,
@@ -821,6 +847,29 @@ final private case class BooleanLogicExpression(
             value = false
           else valid = false
         case _ => valid = false
+
+final private case class BooleanComparisonExpression(
+    operator: BinaryOperator,
+    left: BooleanPrimitiveExpression,
+    right: BooleanPrimitiveExpression
+) extends BooleanPrimitiveExpression:
+  val inputIndices = left.inputIndices ++ right.inputIndices
+  def bind(columns: Array[ColumnarVector]): Option[String] =
+    left.bind(columns).orElse(right.bind(columns))
+
+  def evaluate(row: Int, columns: Array[ColumnarVector], context: PrimitiveEvalContext): Unit =
+    left.evaluate(row, columns, context)
+    if !context.failed then right.evaluate(row, columns, context)
+    if operator == BinaryOperator.NullSafeEqual then
+      valid = true
+      value =
+        if !left.valid then !right.valid
+        else right.valid && left.value == right.value
+    else
+      valid = left.valid && right.valid && !context.failed
+      if valid then
+        val compared = left.value.compare(right.value)
+        value = PrimitiveExpression.comparison(operator, compared, equal = compared == 0)
 
 final private case class Int32ComparisonExpression(
     operator: BinaryOperator,
@@ -1002,13 +1051,30 @@ private object PrimitiveExpression:
         Some(BooleanLiteralExpression(None))
       case ExprNode.Unary(UnaryOperator.IsTrue, input) =>
         compileBoolean(input).map(IsTrueExpression.apply)
+      case ExprNode.Unary(UnaryOperator.IsFalse, input) =>
+        compileBoolean(input).map(IsFalseExpression.apply)
       case ExprNode.Unary(UnaryOperator.IsNull, input) =>
         compileNullable(input).map(IsNullExpression.apply)
+      case ExprNode.Unary(UnaryOperator.IsNotNull, input) =>
+        compileNullable(input).map(IsNotNullExpression.apply)
       case ExprNode.Binary(operator @ (BinaryOperator.And | BinaryOperator.Or), left, right) =>
         for
           lhs <- compileBoolean(left)
           rhs <- compileBoolean(right)
         yield BooleanLogicExpression(operator, lhs, rhs)
+      case ExprNode.Binary(
+            operator @ (
+              BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
+              BinaryOperator.LessThan | BinaryOperator.LessThanOrEqual |
+              BinaryOperator.GreaterThan | BinaryOperator.GreaterThanOrEqual
+            ),
+            left,
+            right
+          ) if left.dataType == DataType.Bool && right.dataType == DataType.Bool =>
+        for
+          lhs <- compileBoolean(left)
+          rhs <- compileBoolean(right)
+        yield BooleanComparisonExpression(operator, lhs, rhs)
       case ExprNode.Binary(
             operator @ (
               BinaryOperator.Equal | BinaryOperator.NullSafeEqual | BinaryOperator.NotEqual |
@@ -1190,7 +1256,7 @@ private object PrimitiveExpression:
           if expression.dataType == DataType.Utf8 =>
         Some(Utf8ColumnExpression(index))
       case ExprNode.Literal(LiteralValue.Utf8(value)) =>
-        Some(Utf8LiteralExpression(Some(value)))
+        Some(Utf8LiteralExpression(Some(value.value)))
       case ExprNode.Literal(LiteralValue.Null(DataType.Utf8)) =>
         Some(Utf8LiteralExpression(None))
       case _ => None
@@ -1996,7 +2062,7 @@ private enum StoredGroupKey:
   def scalar: ScalarValue = this match
     case Null         => ScalarValue.Null
     case Int32(value) => ScalarValue.Int32(value)
-    case Utf8(value)  => ScalarValue.Utf8(new String(value, "UTF-8"))
+    case Utf8(value)  => ScalarValue.checkedUtf8(new String(value, "UTF-8"))
 
 /** Allocation-free-per-row composite grouping index.
   *
@@ -3164,7 +3230,7 @@ final private case class HashAggregate(
                             val bytes = utf8Groups.put(key, row, created)
                             appendGroup(
                               groups,
-                              ScalarValue.Utf8(new String(bytes, "UTF-8"))
+                              ScalarValue.checkedUtf8(new String(bytes, "UTF-8"))
                             )
                         add(groups(groupIndex), numeric, row)
                         row += 1
@@ -3209,7 +3275,7 @@ final private case class HashAggregate(
         )
       case DataType.Utf8 =>
         columns += Utf8Values(
-          groups.map(_.key).collect { case ScalarValue.Utf8(value) => value }.toArray
+          groups.map(_.key).collect { case ScalarValue.Utf8(value) => value.value }.toArray
         )
       case _ => ()
     aggregates.foreach:
@@ -4517,7 +4583,7 @@ private object DistinctAtom:
     case ScalarValue.Float64(actual) =>
       val normalized = if actual == 0.0 then 0.0 else actual
       Float64(java.lang.Double.doubleToLongBits(normalized))
-    case ScalarValue.Utf8(actual)            => Utf8(actual)
+    case ScalarValue.Utf8(actual)            => Utf8(actual.value)
     case ScalarValue.Timestamp(actual, unit) => Timestamp(actual, unit)
 
 final private case class HashDistinct(

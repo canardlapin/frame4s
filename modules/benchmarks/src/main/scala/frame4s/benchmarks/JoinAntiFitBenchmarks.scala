@@ -232,11 +232,11 @@ class JoinAntiFitState:
     rightDigest = JoinRegimeFixture.digest(rightKeys.map(_.getOrElse(Int.MinValue)))
     val split = workload == "multibatch-sorted"
     leftTable = storage:
-      Table[Left](
+      Table.takeOwnership[Left](
         batches(summon[SchemaDescriptor[Left]].schema, leftKeys, 3L, split)
       )
     rightTable = storage:
-      Table[Right](
+      Table.takeOwnership[Right](
         batches(summon[SchemaDescriptor[Right]].schema, rightKeys, 5L, split)
       )
 

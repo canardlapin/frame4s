@@ -30,6 +30,179 @@ class ConformanceLawsSuite extends ScalaCheckSuite:
       case BackendAttempt.Residual(capability, reason, _) =>
         fail(s"reference backend reported residual $capability: $reason")
 
+  test("observed equivalence canonicalizes NaN payloads without erasing signed zero"):
+    type Output = (f32: Float, f64: Double)
+    val schema = summon[SchemaDescriptor[Output]].schema
+    val left = ObservedTable(
+      schema,
+      Vector(
+        Vector(
+          ScalarValue.Float32(java.lang.Float.intBitsToFloat(0x7fc00001)),
+          ScalarValue.Float64(java.lang.Double.longBitsToDouble(0x7ff8000000000001L))
+        )
+      ),
+      OrderGuarantee.Stable
+    )
+    val otherNaNs = ObservedTable(
+      schema,
+      Vector(
+        Vector(
+          ScalarValue.Float32(java.lang.Float.intBitsToFloat(0x7fc00011)),
+          ScalarValue.Float64(java.lang.Double.longBitsToDouble(0x7ff8000000000011L))
+        )
+      ),
+      OrderGuarantee.Stable
+    )
+    val oppositeZeros = ObservedTable(
+      schema,
+      Vector(Vector(ScalarValue.Float32(0.0f), ScalarValue.Float64(0.0))),
+      OrderGuarantee.Stable
+    )
+    val negativeZeros = ObservedTable(
+      schema,
+      Vector(Vector(ScalarValue.Float32(-0.0f), ScalarValue.Float64(-0.0))),
+      OrderGuarantee.Stable
+    )
+
+    assert(left.equivalentTo(otherNaNs))
+    assert(!oppositeZeros.equivalentTo(negativeZeros))
+
+  test("empty and all-null reductions have truthful schemas and backend results"):
+    type Required = (i: Int, l: Long, f: Float, d: Double, text: String)
+    type NullableInput = (
+        i: Option[Int],
+        l: Option[Long],
+        f: Option[Float],
+        d: Option[Double],
+        text: Option[String]
+    )
+    type Result = (
+        n: Long,
+        sumI: Option[Int],
+        sumL: Option[Long],
+        sumF: Option[Float],
+        sumD: Option[Double],
+        meanI: Option[Double],
+        meanL: Option[Double],
+        meanF: Option[Double],
+        meanD: Option[Double],
+        varianceI: Option[Double],
+        varianceL: Option[Double],
+        varianceF: Option[Double],
+        varianceD: Option[Double],
+        stddevI: Option[Double],
+        stddevL: Option[Double],
+        stddevF: Option[Double],
+        stddevD: Option[Double],
+        minI: Option[Int],
+        minL: Option[Long],
+        minF: Option[Float],
+        minD: Option[Double],
+        minText: Option[String],
+        maxI: Option[Int],
+        maxL: Option[Long],
+        maxF: Option[Float],
+        maxD: Option[Double],
+        maxText: Option[String]
+    )
+
+    val emptyReference = value(SourceRef.values("empty-reductions", "empty-reductions"))
+    val emptySource = value(Frame.values[Required](emptyReference))
+    val emptyQuery: Frame[Result] = emptySource
+      .groupBy(_ => EmptyTuple)
+      .aggregate: row =>
+        (
+          Aggregate.count.as("n"),
+          Aggregate.sum(row.col("i")).as("sumI"),
+          Aggregate.sum(row.col("l")).as("sumL"),
+          Aggregate.sum(row.col("f")).as("sumF"),
+          Aggregate.sum(row.col("d")).as("sumD"),
+          Aggregate.mean(row.col("i")).as("meanI"),
+          Aggregate.mean(row.col("l")).as("meanL"),
+          Aggregate.mean(row.col("f")).as("meanF"),
+          Aggregate.mean(row.col("d")).as("meanD"),
+          Aggregate.variancePop(row.col("i")).as("varianceI"),
+          Aggregate.variancePop(row.col("l")).as("varianceL"),
+          Aggregate.variancePop(row.col("f")).as("varianceF"),
+          Aggregate.variancePop(row.col("d")).as("varianceD"),
+          Aggregate.stddevPop(row.col("i")).as("stddevI"),
+          Aggregate.stddevPop(row.col("l")).as("stddevL"),
+          Aggregate.stddevPop(row.col("f")).as("stddevF"),
+          Aggregate.stddevPop(row.col("d")).as("stddevD"),
+          Aggregate.min(row.col("i")).as("minI"),
+          Aggregate.min(row.col("l")).as("minL"),
+          Aggregate.min(row.col("f")).as("minF"),
+          Aggregate.min(row.col("d")).as("minD"),
+          Aggregate.min(row.col("text")).as("minText"),
+          Aggregate.max(row.col("i")).as("maxI"),
+          Aggregate.max(row.col("l")).as("maxL"),
+          Aggregate.max(row.col("f")).as("maxF"),
+          Aggregate.max(row.col("d")).as("maxD"),
+          Aggregate.max(row.col("text")).as("maxText")
+        )
+
+    val nullReference = value(SourceRef.values("null-reductions", "null-reductions"))
+    val nullSource = value(Frame.values[NullableInput](nullReference))
+    val nullQuery: Frame[Result] = nullSource
+      .groupBy(_ => EmptyTuple)
+      .aggregate: row =>
+        (
+          Aggregate.count.as("n"),
+          Aggregate.sum(row.col("i")).as("sumI"),
+          Aggregate.sum(row.col("l")).as("sumL"),
+          Aggregate.sum(row.col("f")).as("sumF"),
+          Aggregate.sum(row.col("d")).as("sumD"),
+          Aggregate.mean(row.col("i")).as("meanI"),
+          Aggregate.mean(row.col("l")).as("meanL"),
+          Aggregate.mean(row.col("f")).as("meanF"),
+          Aggregate.mean(row.col("d")).as("meanD"),
+          Aggregate.variancePop(row.col("i")).as("varianceI"),
+          Aggregate.variancePop(row.col("l")).as("varianceL"),
+          Aggregate.variancePop(row.col("f")).as("varianceF"),
+          Aggregate.variancePop(row.col("d")).as("varianceD"),
+          Aggregate.stddevPop(row.col("i")).as("stddevI"),
+          Aggregate.stddevPop(row.col("l")).as("stddevL"),
+          Aggregate.stddevPop(row.col("f")).as("stddevF"),
+          Aggregate.stddevPop(row.col("d")).as("stddevD"),
+          Aggregate.min(row.col("i")).as("minI"),
+          Aggregate.min(row.col("l")).as("minL"),
+          Aggregate.min(row.col("f")).as("minF"),
+          Aggregate.min(row.col("d")).as("minD"),
+          Aggregate.min(row.col("text")).as("minText"),
+          Aggregate.max(row.col("i")).as("maxI"),
+          Aggregate.max(row.col("l")).as("maxL"),
+          Aggregate.max(row.col("f")).as("maxF"),
+          Aggregate.max(row.col("d")).as("maxD"),
+          Aggregate.max(row.col("text")).as("maxText")
+        )
+
+    val empty = value(Table.takeOwnership[Required](Vector.empty))
+    val nullRows: Vector[NullableInput] =
+      Vector((i = None, l = None, f = None, d = None, text = None))
+    val allNull = value(Table.fromRows[NullableInput](nullRows, batchSize = 1))
+
+    def check[S <: scala.NamedTuple.AnyNamedTuple](
+        query: Frame[S],
+        sources: ReferenceSources,
+        count: Long
+    )(using SchemaDescriptor[S]): Unit =
+      BackendConformance.compare(query, sources, ColumnarBackend) match
+        case BackendComparison.Equivalent(_, _) => ()
+        case other                              => fail(s"aggregate backends disagreed: $other")
+      val (observed, _) = completed(ReferenceBackend.execute(query, sources))
+      assertEquals(observed.schema.fields.map(_.nullable), false +: Vector.fill(26)(true))
+      assertEquals(
+        observed.rows,
+        Vector(ScalarValue.Int64(count) +: Vector.fill(26)(ScalarValue.Null))
+      )
+
+    try
+      check(emptyQuery, ReferenceSources.empty.bind(emptyReference, empty), count = 0L)
+      check(nullQuery, ReferenceSources.empty.bind(nullReference, allNull), count = 1L)
+    finally
+      empty.close()
+      allNull.close()
+
   property("unique and deliberately invalid schemas are generated"):
     forAll(Frame4sGenerators.uniqueFields, Frame4sGenerators.invalidSchema): (valid, invalid) =>
       assert(Schema(valid).isRight)
@@ -829,4 +1002,4 @@ class ConformanceLawsSuite extends ScalaCheckSuite:
       case Left(error)   =>
         column.close()
         fail(error.message)
-    value(Table[S](Vector(batch)))
+    value(Table.takeOwnership[S](Vector(batch)))

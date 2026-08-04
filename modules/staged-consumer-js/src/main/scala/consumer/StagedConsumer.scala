@@ -24,16 +24,32 @@ object StagedConsumer extends IOApp.Simple:
           row.col("score").sqrt.as("root")
         )
 
-    for
-      labels <- binding
-        .collect(query)
-        .use(table =>
-          IO.fromEither(
-            table.column("label").left.map(TableReadFailure.apply)
+    FrameRuntime
+      .resource(binding)
+      .flatMap(_.collectWithReceipt(query))
+      .use: execution =>
+        for
+          labels <- IO.fromEither(
+            execution.table.column("label").left.map(TableReadFailure.apply)
           )
-        )
-      _ <- IO.raiseWhen(labels != Vector("alpha", "東京"))(
-        new IllegalStateException(s"unexpected staged Scala.js rows: $labels")
-      )
-      _ <- IO.println("staged-js=ok")
-    yield ()
+          engine <- IO.fromOption(execution.receipt.engine)(
+            new IllegalStateException("staged Scala.js collect produced no engine receipt")
+          )
+          _ <- IO.raiseWhen(
+            engine.engine != EngineId.Columnar || engine.fallback.nonEmpty
+          )(
+            new IllegalStateException(s"unexpected staged Scala.js engine receipt: $engine")
+          )
+          _ <- IO.raiseWhen(
+            execution.receipt.sources.map(_.pushdown.columnsRead) !=
+              Vector(Vector("id", "label", "score"))
+          )(
+            new IllegalStateException(
+              s"unexpected staged Scala.js source receipt: ${execution.receipt.sources}"
+            )
+          )
+          _ <- IO.raiseWhen(labels != Vector("alpha", "東京"))(
+            new IllegalStateException(s"unexpected staged Scala.js rows: $labels")
+          )
+          _ <- IO.println("staged-js=ok")
+        yield ()

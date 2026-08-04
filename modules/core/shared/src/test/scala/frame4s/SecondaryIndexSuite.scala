@@ -25,7 +25,7 @@ class SecondaryIndexSuite extends munit.FunSuite:
     val schema = summon[SchemaDescriptor[Row]].schema
     var ordinal = 0
     val table = storage:
-      Table[Row](
+      Table.takeOwnership[Row](
         idBatches
           .zip(validBatches)
           .map: (ids, valid) =>
@@ -634,7 +634,7 @@ class SecondaryIndexSuite extends munit.FunSuite:
     type FloatRow = (id: Double)
     val floatSchema = summon[SchemaDescriptor[FloatRow]].schema
     val floatTable = storage:
-      Table[FloatRow](
+      Table.takeOwnership[FloatRow](
         Vector(
           storage:
             RecordBatch(

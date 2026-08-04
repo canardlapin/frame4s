@@ -25,6 +25,15 @@ Target: first public `0.1.0` release
 
 Date: 2026-07-26
 
+Implementation status, 2026-08-03: conditional reference-only language below
+records the original admission gate, not the current runtime selection.
+ADR-0005 and ADR-0006 subsequently admitted `EnginePolicy.Auto` for
+materializing collection, with `ReferenceOnly`, `RequireColumnar`, typed
+fallback, and a separate reference streaming route. The
+[public-path replacement court](benchmarks/receipts/2026-08-02-p4-public-path/summary.md)
+is the governing evidence; historical direct-engine receipts remain labeled as
+such.
+
 ## Purpose
 
 This plan turns the frame4s design identity into an executable release

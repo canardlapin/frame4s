@@ -62,7 +62,8 @@ lazy val commonSettings = Seq(
     // Fatal warnings are what make the exhaustivity guarantees in the plan/expression ADTs
     // load-bearing: a future `case _ =>` over a sealed hierarchy fails the build instead of
     // scrolling past. `-Wunused` deliberately omits explicits/implicits/params, since the typed
-    // API uses unused `using` evidence (Ordering, Numeric, Fractional) as type-level constraints.
+    // API uses unused `using` evidence from its closed operator capabilities as type-level
+    // constraints.
     "-Werror",
     "-Wunused:imports,privates,locals",
     "-Wvalue-discard",
@@ -71,6 +72,8 @@ lazy val commonSettings = Seq(
   Test / fork := false,
   libraryDependencies += "org.scalameta" %%% "munit" % "1.3.0" % Test
 )
+
+lazy val arrowJvmOptions = Seq("--add-opens=java.base/java.nio=ALL-UNNAMED")
 
 lazy val core =
   crossProject(JSPlatform, JVMPlatform)
@@ -123,11 +126,7 @@ lazy val fs2 =
       )
     )
     .jvmSettings(
-      libraryDependencies ++= Seq(
-        "co.fs2" %% "fs2-io" % "3.13.0",
-        "org.apache.arrow" % "arrow-vector" % "19.0.0",
-        "org.apache.arrow" % "arrow-memory-unsafe" % "19.0.0"
-      ),
+      libraryDependencies += "co.fs2" %% "fs2-io" % "3.13.0",
       Compile / doc / scalacOptions ++= Seq(
         "-external-mappings:.*modules/core/jvm/target/.*::scaladoc3::https://www.javadoc.io/doc/io.github.canardlapin/frame4s-core_3/latest/",
         "-skip-by-id:frame4s.fs2.examples"
@@ -139,9 +138,7 @@ lazy val fs2 =
         "-Dfile.encoding=UTF-8",
         "-Dstdout.encoding=UTF-8",
         "-Dstderr.encoding=UTF-8"
-      ),
-      Test / fork := true,
-      Test / javaOptions += "--add-opens=java.base/java.nio=ALL-UNNAMED"
+      )
     )
     .jsSettings(
       Compile / doc / scalacOptions +=
@@ -156,6 +153,28 @@ lazy val testkitJVM = testkit.jvm
 lazy val testkitJS = testkit.js
 lazy val fs2JVM = fs2.jvm
 lazy val fs2JS = fs2.js
+
+lazy val arrow =
+  project
+    .in(file("modules/arrow"))
+    .dependsOn(fs2JVM)
+    .settings(commonSettings)
+    .settings(
+      name := "frame4s-arrow",
+      description := "Optional Apache Arrow IPC adapter for frame4s on the JVM.",
+      libraryDependencies ++= Seq(
+        "org.apache.arrow" % "arrow-vector" % "19.0.0",
+        "org.apache.arrow" % "arrow-memory-unsafe" % "19.0.0"
+      ),
+      Compile / doc / scalacOptions ++= Seq(
+        "-external-mappings:.*modules/core/jvm/target/.*::scaladoc3::https://www.javadoc.io/doc/io.github.canardlapin/frame4s-core_3/latest/",
+        "-external-mappings:.*modules/fs2/jvm/target/.*::scaladoc3::https://www.javadoc.io/doc/io.github.canardlapin/frame4s-fs2_3/latest/"
+      ),
+      Compile / run / fork := true,
+      Compile / run / javaOptions ++= arrowJvmOptions,
+      Test / fork := true,
+      Test / javaOptions ++= arrowJvmOptions
+    )
 
 lazy val benchmarks =
   project
@@ -198,7 +217,7 @@ lazy val firstContact =
 lazy val docs =
   project
     .in(file("modules/docs"))
-    .dependsOn(coreJVM, fs2JVM)
+    .dependsOn(coreJVM, fs2JVM, arrow)
     .enablePlugins(TypelevelSitePlugin)
     .disablePlugins(SbtVersionPolicyPlugin)
     .settings(commonSettings)
@@ -258,6 +277,118 @@ lazy val stagedConsumerJS =
       Compile / mainClass := Some("consumer.StagedConsumer")
     )
 
+lazy val stagedConsumerArrow =
+  project
+    .in(file("modules/staged-consumer-arrow"))
+    .disablePlugins(SbtVersionPolicyPlugin)
+    .settings(commonSettings)
+    .settings(
+      name := "frame4s-staged-consumer-arrow",
+      publish / skip := true,
+      resolvers ++=
+        (if (sys.props.get("frame4s.rehearsal.enabled").contains("true"))
+           Seq(rehearsalResolver)
+         else Seq.empty),
+      libraryDependencies +=
+        "io.github.canardlapin" %% "frame4s-arrow" % version.value,
+      Compile / run / fork := true,
+      Compile / run / javaOptions ++= arrowJvmOptions,
+      Compile / mainClass := Some("consumer.StagedArrowConsumer")
+    )
+
+def stagedWideSettings(width: Int) =
+  Seq(
+    name := s"frame4s-staged-wide-$width",
+    publish / skip := true,
+    resolvers ++=
+      (if (sys.props.get("frame4s.rehearsal.enabled").contains("true"))
+         Seq(rehearsalResolver)
+       else Seq.empty),
+    libraryDependencies +=
+      "io.github.canardlapin" %%% "frame4s-core" % version.value,
+    scalacOptions ~= (_.filterNot(_.startsWith("-Xmax-inlines"))),
+    Compile / sourceGenerators += Def.task {
+      WideSchemaGenerator.generate((Compile / sourceManaged).value, width)
+    }.taskValue,
+    Compile / mainClass := Some(s"consumer.WideSchema$width")
+  )
+
+lazy val stagedWide32 =
+  crossProject(JSPlatform, JVMPlatform)
+    .crossType(CrossType.Full)
+    .in(file("modules/staged-consumer-wide/32"))
+    .disablePlugins(SbtVersionPolicyPlugin)
+    .settings(commonSettings)
+    .settings(stagedWideSettings(32))
+    .jvmSettings(Compile / run / fork := true)
+    .jsSettings(
+      scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
+      scalaJSUseMainModuleInitializer := true
+    )
+
+lazy val stagedWide48 =
+  crossProject(JSPlatform, JVMPlatform)
+    .crossType(CrossType.Full)
+    .in(file("modules/staged-consumer-wide/48"))
+    .disablePlugins(SbtVersionPolicyPlugin)
+    .settings(commonSettings)
+    .settings(stagedWideSettings(48))
+    .jvmSettings(Compile / run / fork := true)
+    .jsSettings(
+      scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
+      scalaJSUseMainModuleInitializer := true
+    )
+
+lazy val stagedWide128 =
+  crossProject(JSPlatform, JVMPlatform)
+    .crossType(CrossType.Full)
+    .in(file("modules/staged-consumer-wide/128"))
+    .disablePlugins(SbtVersionPolicyPlugin)
+    .settings(commonSettings)
+    .settings(stagedWideSettings(128))
+    .jvmSettings(Compile / run / fork := true)
+    .jsSettings(
+      scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
+      scalaJSUseMainModuleInitializer := true
+    )
+
+lazy val stagedWide256 =
+  crossProject(JSPlatform, JVMPlatform)
+    .crossType(CrossType.Full)
+    .in(file("modules/staged-consumer-wide/256"))
+    .disablePlugins(SbtVersionPolicyPlugin)
+    .settings(commonSettings)
+    .settings(stagedWideSettings(256))
+    .jvmSettings(Compile / run / fork := true)
+    .jsSettings(
+      scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
+      scalaJSUseMainModuleInitializer := true
+    )
+
+lazy val stagedWide512 =
+  crossProject(JSPlatform, JVMPlatform)
+    .crossType(CrossType.Full)
+    .in(file("modules/staged-consumer-wide/512"))
+    .disablePlugins(SbtVersionPolicyPlugin)
+    .settings(commonSettings)
+    .settings(stagedWideSettings(512))
+    .jvmSettings(Compile / run / fork := true)
+    .jsSettings(
+      scalaJSLinkerConfig ~= (_.withModuleKind(ModuleKind.CommonJSModule)),
+      scalaJSUseMainModuleInitializer := true
+    )
+
+lazy val stagedWide32JVM = stagedWide32.jvm
+lazy val stagedWide32JS = stagedWide32.js
+lazy val stagedWide48JVM = stagedWide48.jvm
+lazy val stagedWide48JS = stagedWide48.js
+lazy val stagedWide128JVM = stagedWide128.jvm
+lazy val stagedWide128JS = stagedWide128.js
+lazy val stagedWide256JVM = stagedWide256.jvm
+lazy val stagedWide256JS = stagedWide256.js
+lazy val stagedWide512JVM = stagedWide512.jvm
+lazy val stagedWide512JS = stagedWide512.js
+
 lazy val root =
   project
     .in(file("."))
@@ -269,6 +400,7 @@ lazy val root =
       testkitJS,
       fs2JVM,
       fs2JS,
+      arrow,
       firstContact,
       docs
     )
@@ -284,6 +416,7 @@ lazy val root =
           (fs2JVM / Compile / doc / target).value,
           (fs2JS / Compile / doc / target).value
         )
+        val arrowDocs = Seq((arrow / Compile / doc / target).value)
         val unresolvedFrame4sLink =
           """data-unresolved-link=""[^>]*>(Frame|DynamicFrame|ExprOf|Table|RecordBatch|Schema|SchemaDescriptor|SourceRef|LogicalPlan|ReferenceInterpreter|FrameError|StorageError|ExecutionError|TableReadError|ColumnArray|DataType|Field|RowCodec|FrameRuntime|FrameSource|FrameSink|CsvFrameSource|TsvFrameSource|CsvPathSource|TsvPathSource|ArrowIpcFrameSource|ArrowIpcFrameSink|SourceError|SinkError|RuntimeBindingError)</span>""".r
         // Scala 3.7.4 Scaladoc emits an unlinked parent-enum span on generated
@@ -293,7 +426,7 @@ lazy val root =
         val corePages = coreDocs
           .flatMap(root => (root ** "*.html").get)
           .filterNot(_.getName.contains("$$"))
-        val fs2Pages = fs2Docs
+        val fs2Pages = (fs2Docs ++ arrowDocs)
           .flatMap(root => (root ** "*.html").get)
           .filterNot(_.getName.contains("$$"))
         val unresolved = (corePages ++ fs2Pages)
@@ -322,19 +455,19 @@ lazy val root =
 
 addCommandAlias(
   "compileAll",
-  ";coreJVM/compile;coreJS/compile;testkitJVM/compile;testkitJS/compile;fs2JVM/compile;fs2JS/compile;firstContact/compile"
+  ";coreJVM/compile;coreJS/compile;testkitJVM/compile;testkitJS/compile;fs2JVM/compile;fs2JS/compile;arrow/compile;firstContact/compile"
 )
 addCommandAlias(
   "testAll",
-  ";coreJVM/test;coreJS/test;testkitJVM/test;testkitJS/test;fs2JVM/test;fs2JS/test"
+  ";coreJVM/test;coreJS/test;testkitJVM/test;testkitJS/test;fs2JVM/test;fs2JS/test;arrow/test"
 )
 addCommandAlias("benchmarkSmoke", ";benchmarks/Jmh/compile")
 addCommandAlias(
   "formatCheck",
-  ";scalafmtCheckAll;benchmarks/scalafmtCheck;stagedConsumerJVM/scalafmtCheck;stagedConsumerJS/scalafmtCheck;scalafmtSbtCheck"
+  ";scalafmtCheckAll;benchmarks/scalafmtCheck;stagedConsumerJVM/scalafmtCheck;stagedConsumerJS/scalafmtCheck;stagedConsumerArrow/scalafmtCheck;scalafmtSbtCheck"
 )
 addCommandAlias("docsCheck", ";docs/tlSite")
 addCommandAlias(
   "apiDocs",
-  ";coreJVM/Compile/doc;coreJS/Compile/doc;fs2JVM/Compile/doc;fs2JS/Compile/doc;apiDocsCheck"
+  ";coreJVM/Compile/doc;coreJS/Compile/doc;fs2JVM/Compile/doc;fs2JS/Compile/doc;arrow/Compile/doc;apiDocsCheck"
 )

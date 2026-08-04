@@ -16,8 +16,11 @@ class FrameIOStreamingSuite extends munit.FunSuite:
   final private case class Probe(
       plans: Ref[IO, Int],
       pulls: Ref[IO, Int],
+      rowsRead: Ref[IO, Long],
       activeBatches: Ref[IO, Int],
       maximumActiveBatches: Ref[IO, Int],
+      activeValueBytes: Ref[IO, Long],
+      maximumActiveValueBytes: Ref[IO, Long],
       closes: Ref[IO, Int]
   )
 
@@ -59,15 +62,25 @@ class FrameIOStreamingSuite extends munit.FunSuite:
       probe.closes.update(_ + 1).as(Right(()))
 
     private def scopedBatch(values: Vector[Int]): Stream[IO, RecordBatch] =
+      val valueBytes = values.size.toLong * 4L
       Stream
         .bracket(
           makeBatch(values) <*
             probe.pulls.update(_ + 1) <*
+            probe.rowsRead.update(_ + values.size.toLong) <*
             probe.activeBatches
               .updateAndGet(_ + 1)
               .flatMap: active =>
-                probe.maximumActiveBatches.update(current => math.max(current, active))
-        )(batch => IO(batch.close()) *> probe.activeBatches.update(_ - 1))
+                probe.maximumActiveBatches.update(current => math.max(current, active)) <*
+                  probe.activeValueBytes
+                    .updateAndGet(_ + valueBytes)
+                    .flatMap: bytes =>
+                      probe.maximumActiveValueBytes.update(current => math.max(current, bytes))
+        )(batch =>
+          IO(batch.close()) *>
+            probe.activeBatches.update(_ - 1) *>
+            probe.activeValueBytes.update(_ - valueBytes)
+        )
         .flatMap(Stream.emit)
 
     private def makeBatch(values: Vector[Int]): IO[RecordBatch] =
@@ -87,10 +100,22 @@ class FrameIOStreamingSuite extends munit.FunSuite:
     for
       plans <- Ref.of[IO, Int](0)
       pulls <- Ref.of[IO, Int](0)
+      rowsRead <- Ref.of[IO, Long](0L)
       active <- Ref.of[IO, Int](0)
       maximum <- Ref.of[IO, Int](0)
+      activeValueBytes <- Ref.of[IO, Long](0L)
+      maximumActiveValueBytes <- Ref.of[IO, Long](0L)
       closes <- Ref.of[IO, Int](0)
-      probe = Probe(plans, pulls, active, maximum, closes)
+      probe = Probe(
+        plans,
+        pulls,
+        rowsRead,
+        active,
+        maximum,
+        activeValueBytes,
+        maximumActiveValueBytes,
+        closes
+      )
       reference <- IO.fromEither(
         SourceRef.scan(id, id).leftMap(error => new IllegalArgumentException(error.message))
       )
@@ -116,22 +141,43 @@ class FrameIOStreamingSuite extends munit.FunSuite:
 
       FrameRuntime
         .resource(source)
-        .use(_.stream(query).compile.toVector)
-        .flatMap: batches =>
+        .flatMap(_.streamWithReceipt(query))
+        .use: execution =>
+          execution.batches.compile.toVector.map(execution.receipt -> _)
+        .flatMap: (receipt, batches) =>
           (
             probe.plans.get,
             probe.pulls.get,
+            probe.rowsRead.get,
             probe.activeBatches.get,
             probe.maximumActiveBatches.get,
+            probe.activeValueBytes.get,
+            probe.maximumActiveValueBytes.get,
             probe.closes.get
-          ).tupled.map: (plans, pulls, active, maximum, closes) =>
-            assertEquals(batches.map(_.rowCount), Vector(1))
-            assertEquals(plans, 1)
-            assertEquals(pulls, 1)
-            assertEquals(active, 0)
-            assertEquals(maximum, 1)
-            assertEquals(closes, 1)
-            assertEquals(tracker.snapshot.activeOwners, 0)
+          ).tupled.map:
+            (
+                plans,
+                pulls,
+                rowsRead,
+                active,
+                maximum,
+                activeValueBytes,
+                maximumActiveValueBytes,
+                closes
+            ) =>
+              assertEquals(batches.map(_.rowCount), Vector(1))
+              assertEquals(plans, 1)
+              assertEquals(pulls, 1)
+              assertEquals(rowsRead, 1L)
+              assertEquals(active, 0)
+              assertEquals(maximum, 1)
+              assertEquals(activeValueBytes, 0L)
+              // The fixture has one required Int32 column, so its source-owned value-buffer peak is
+              // measurable exactly. This is not an allocator-wide heap estimate.
+              assertEquals(maximumActiveValueBytes, 4L)
+              assertEquals(closes, 1)
+              assertEquals(receipt.sources.map(_.pushdown.columnsRead), Vector(Vector("id")))
+              assertEquals(tracker.snapshot.activeOwners, 0)
 
     program.unsafeToFuture()
 
@@ -155,19 +201,36 @@ class FrameIOStreamingSuite extends munit.FunSuite:
             (
               leftProbe.pulls.get,
               rightProbe.pulls.get,
+              leftProbe.rowsRead.get,
+              rightProbe.rowsRead.get,
               leftProbe.activeBatches.get,
               rightProbe.activeBatches.get,
               leftProbe.closes.get,
               rightProbe.closes.get
             ).tupled.map:
-              (leftPulls, rightPulls, leftActive, rightActive, leftCloses, rightCloses) =>
+              (
+                  leftPulls,
+                  rightPulls,
+                  leftRowsRead,
+                  rightRowsRead,
+                  leftActive,
+                  rightActive,
+                  leftCloses,
+                  rightCloses
+              ) =>
                 assertEquals(batches.map(_.rowCount), Vector(1))
                 assertEquals(
                   receipt.sources.map(_.reference.id.value),
                   Vector("union-left", "union-right")
                 )
+                assertEquals(
+                  receipt.sources.map(_.pushdown.columnsRead),
+                  Vector(Vector("id"), Vector("id"))
+                )
                 assertEquals(leftPulls, 1)
                 assertEquals(rightPulls, 0)
+                assertEquals(leftRowsRead, 1L)
+                assertEquals(rightRowsRead, 0L)
                 assertEquals(leftActive, 0)
                 assertEquals(rightActive, 0)
                 assertEquals(leftCloses, 1)
@@ -180,7 +243,7 @@ class FrameIOStreamingSuite extends munit.FunSuite:
       "blocking-sort",
       Vector(Vector(3), Vector(1), Vector(2))
     ).flatMap: (source, probe) =>
-      val query = source.frame.sortBy(_.col("id"))
+      val query = source.frame.sortBy(row => SortKey(row.col("id")))
 
       FrameRuntime
         .resource(source)
@@ -193,12 +256,17 @@ class FrameIOStreamingSuite extends munit.FunSuite:
             )
           ) *> runtime.stream(query).take(1).compile.toVector
         .flatMap: batches =>
-          (probe.pulls.get, probe.activeBatches.get, probe.closes.get).tupled.map:
-            (pulls, active, closes) =>
-              assertEquals(batches.map(_.rowCount), Vector(3))
-              assertEquals(pulls, 3)
-              assertEquals(active, 0)
-              assertEquals(closes, 1)
+          (
+            probe.pulls.get,
+            probe.rowsRead.get,
+            probe.activeBatches.get,
+            probe.closes.get
+          ).tupled.map: (pulls, rowsRead, active, closes) =>
+            assertEquals(batches.map(_.rowCount), Vector(3))
+            assertEquals(pulls, 3)
+            assertEquals(rowsRead, 3L)
+            assertEquals(active, 0)
+            assertEquals(closes, 1)
 
     program.unsafeToFuture()
 

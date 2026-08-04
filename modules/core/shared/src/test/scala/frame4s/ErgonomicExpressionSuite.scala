@@ -44,6 +44,15 @@ class ErgonomicExpressionSuite extends munit.FunSuite:
         .plan,
       frame
         .select(row => Tuple1((row.col("value") / 2.0).as("result")))
+        .plan,
+      frame
+        .select(row => Tuple1((row.col("score") + 1.0).as("result")))
+        .plan,
+      frame
+        .select(row => Tuple1((row.col("id") + Option(1)).as("result")))
+        .plan,
+      frame
+        .select(row => Tuple1((row.col("id") / 2).as("result")))
         .plan
     )
     val expanded = Vector(
@@ -65,6 +74,15 @@ class ErgonomicExpressionSuite extends munit.FunSuite:
         .plan,
       frame
         .select(row => Tuple1((row.col("value") / Expr.literal(2.0)).as("result")))
+        .plan,
+      frame
+        .select(row => Tuple1((row.col("score") + Expr.literal(1.0)).as("result")))
+        .plan,
+      frame
+        .select(row => Tuple1((row.col("id") + Expr.literal(Option(1))).as("result")))
+        .plan,
+      frame
+        .select(row => Tuple1((row.col("id") / Expr.literal(2)).as("result")))
         .plan
     )
 
@@ -141,7 +159,10 @@ class ErgonomicExpressionSuite extends munit.FunSuite:
       def invalid[Origin](expression: ExprOf[String, Origin]) =
         expression + "suffix"
     """))
-    assertUserFacingFirst(message, "Arithmetic requires an Int, Long, Float, Double")
+    assertUserFacingFirst(
+      message,
+      "Operators +, -, and * are not supported for String and scalar String"
+    )
 
   test("concise and expanded forms have oracle result, ordering, and failure parity"):
     val reference = get(SourceRef.values("input", "input"))
@@ -262,7 +283,10 @@ class ErgonomicExpressionSuite extends munit.FunSuite:
       val frame = Frame.source[Input]("input").toOption.get
       frame.filter(row => row.col("id") > "1")
     """))
-    assertUserFacingFirst(wrong, "Scalar operand has type String; expected Int")
+    assertUserFacingFirst(
+      wrong,
+      "Operators <, <=, >, and >= are not supported for Int and scalar String"
+    )
 
     val widened = firstDiagnostic(typeCheckErrors("""
       import frame4s.*
@@ -270,4 +294,7 @@ class ErgonomicExpressionSuite extends munit.FunSuite:
       val frame = Frame.source[Input]("input").toOption.get
       frame.filter(row => row.col("id") > 1L)
     """))
-    assertUserFacingFirst(widened, "Scalar operand has type Long; expected Int")
+    assertUserFacingFirst(
+      widened,
+      "Operators <, <=, >, and >= are not supported for Int and scalar Long"
+    )

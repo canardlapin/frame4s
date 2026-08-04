@@ -7,7 +7,8 @@ frame4s is an immutable, typed local dataframe library:
 - package: `frame4s`
 - core artifact: `frame4s-core`
 - effectful adapter: `frame4s-fs2`
-- source modules: `modules/core` and `modules/fs2`
+- optional JVM Arrow adapter: `frame4s-arrow`
+- source modules: `modules/core`, `modules/fs2`, and `modules/arrow`
 
 The project was extracted from ScalaFIM without changing its logical model,
 execution contracts, or dependency direction. It uses neutral
@@ -75,11 +76,37 @@ handles must expose a `Resource`; a `Table` obtained through `collect` is valid
 only within that resource scope. The reference backend may implement collection
 with `Resource.pure`, but the public API does not weaken the lifetime contract.
 
-Format- and engine-specific integrations remain optional adapters. CSV, TSV,
-Arrow, Parquet, Polars, and SQL engines must not leak their types into the core
-algebra. Polars is a gated candidate backend or collaboration, not the assumed
-execution engine. DuckDB, Parquet, and Gale integrations remain separate
-decisions.
+Adapter failures follow one end-to-end contract. Ordinary source acquisition,
+read/decode, upstream-stream, and close failures are `SourceError` values raised
+as `SourceFailure`; `FrameRuntime` adds the `SourceId` without discarding the
+cause. Ordinary sink upstream, write, and close failures remain in the declared
+`SinkError` result. Cancellation and fatal platform errors are not converted.
+Messages are bounded and do not render causes or rejected values. The decision
+and court are recorded in
+[`adr-0009-structured-adapter-failures.md`](adr-0009-structured-adapter-failures.md).
+
+CSV and TSV are the portable textual adapters in `frame4s-fs2`. Other format-
+and engine-specific integrations remain optional artifacts. Arrow, Parquet,
+Polars, and SQL engines must not leak their types into the core algebra. Polars
+is a gated candidate backend or collaboration, not the assumed execution
+engine. DuckDB, Parquet, and Gale integrations remain separate decisions.
+
+### `frame4s-arrow`
+
+This JVM-only adapter depends on `frame4s-fs2` and Apache Arrow Vector. It owns
+Arrow IPC stream encoding and decoding, Arrow allocators, and the JVM access
+option required by Arrow's unsafe-memory implementation. Neither the JVM nor
+Scala.js `frame4s-fs2` artifact depends on Arrow or inherits that runtime
+requirement.
+
+An `ArrowIpcFrameSource` snapshots the caller's byte array when its `Resource`
+is constructed. Decoding adopts columns incrementally; every failure closes
+the exact prefix already acquired, and failed `RecordBatch` validation closes
+all decoded columns. For `0.1`, the adapter admits only timezone-free Arrow
+microsecond timestamps because `TimestampMicros` is the only public typed
+timestamp. Other units and timezone-bearing values fail with structured schema
+or request errors. These decisions are fixed by
+[`adr-0011-arrow-adapter-boundary.md`](adr-0011-arrow-adapter-boundary.md).
 
 ## Typed schema contract
 
@@ -108,6 +135,25 @@ surface. A nullable boolean cannot be used as a filter predicate until it is
 made total, for example with `isTrue`. A left outer join maps every right-side
 field to `Option`, without nesting an already optional field.
 
+`ColumnType` is sealed, and every operator capability is a frame4s-owned closed
+opaque token. The typed surface therefore admits only physical scalar
+operations implemented by the interpreters; downstream `Numeric`,
+`Fractional`, `Ordering`, or fabricated operator evidence cannot enlarge the
+plan algebra. Binary result types account for both operands: equal-width
+required and nullable scalars may be combined, and the result is nullable
+exactly when either input is nullable. The dynamic surface validates the same
+admitted algebra before constructing a plan.
+
+UTF-8 literals and runtime scalars store `Utf8Value`, an opaque value created
+only after a raw-null check. `Expr.literalChecked`, `LiteralValue.utf8`, and
+`ScalarValue.utf8` return `ValueError` for untrusted input. Direct typed literal
+and scalar syntax performs the same check before it returns an expression, so
+an ascribed null or `Some(null)` cannot enter a logical plan. Row, schema,
+source-order, and column-array constructors translate raw-null input into their
+structured error channels; Arrow UTF-8 decoding preserves the same storage
+check. The full boundary decision is recorded in
+[`adr-0008-null-and-expression-identity.md`](adr-0008-null-and-expression-identity.md).
+
 Each frame value has a path-dependent expression origin. Column expressions
 created by its callback scope carry that origin, literals are origin-free, and
 join expressions may carry only the union of the selected left and right
@@ -120,9 +166,15 @@ fresh field and rejects accidental replacement; `replace` is the explicit
 type-computing replacement operation. Joins require
 disjoint output names in 0.1 so ownership is never resolved by implicit suffixes.
 
-The compile contract is tested with both narrow and 32-column schemas. This is
-not a claim of unbounded compile-time performance; compile-cost regression gates
-should be added before a standalone release.
+Schema descriptors, field lookup, and row codecs use flat compile-time
+derivation rather than one inline or implicit expansion per preceding field.
+The staged external court exercises 32, 48, 128, 256, and 512 columns on JVM
+and Scala.js without inheriting the library's `-Xmax-inlines` setting. The
+practical 0.1 envelope is 256 columns. A 512-column query and row round-trip is
+verified as a stress tier, but its measured compile time is minutes rather than
+seconds and is not presented as an ordinary-cost workflow. The API decision,
+lowerings, and evidence boundary are recorded in
+[`adr-0012-pre-freeze-api-and-wide-schema.md`](adr-0012-pre-freeze-api-and-wide-schema.md).
 
 The initial physical-layout and allocation smoke receipt is recorded in
 [`../benchmarks/storage.md`](../benchmarks/storage.md). It is scoped
@@ -139,8 +191,11 @@ operation algebra.
 Each node carries its validated output schema, making an invalid internal plan
 unconstructable through the public typed API.
 
-Resolved fields and expressions carry distinct stable `ColumnId` and `ExprId`
-values; display names and left/right/current qualifiers remain separate. Scan
+Resolved fields and expressions carry distinct `ColumnId` and `ExprId` values.
+An `ExprId` contains a fixed-size structural fingerprint plus an internal
+collision witness; neither is public diagnostic text. Logical explain assigns
+deterministic plan-local ordinals and a linear, value-redacted expression
+legend. Display names and left/right/current qualifiers remain separate. Scan
 and literal-values nodes refer to immutable `SourceRef` identities rather than
 capturing a table, cursor, backend, or closure. Public consumers can inspect a
 plan through its output, node name, children, and deterministic explanation,
@@ -151,6 +206,7 @@ objects without copying data or executing the plan.
 Failures are structured:
 
 - `SchemaError` covers malformed runtime schemas;
+- `ValueError` rejects raw null before UTF-8 literal or scalar construction;
 - `BindingIssue` records ordered field count/name/type/nullability mismatches;
 - `FrameError` covers binding and planning-boundary failures;
 - `ExecutionError` records interpreter and storage failures without throwing
@@ -176,8 +232,9 @@ The reference interpreter defines semantics independently of optional engines:
   must be declared in its receipt.
 - `Int32` and `Int64` arithmetic is checked. Overflow and integral division by
   zero are structured `ExecutionError` values, never wrapping arithmetic.
-- There are no implicit casts. The current closed expression algebra accepts
-  only same-typed operators; future explicit cast nodes must define overflow,
+- There are no implicit casts or numeric widening. The current closed
+  expression algebra accepts equal physical scalar types and lifts required and
+  nullable operands explicitly; future cast nodes must define overflow,
   precision, and null propagation per source/target pair.
 - Timestamps are signed counts since the Unix epoch in their declared unit.
   Units do not compare or convert implicitly, and timestamps carry no hidden
@@ -238,8 +295,7 @@ it when its input is total.
 Population variance is named `variancePop`; no ambiguous `variance` alias is
 part of the first compatibility baseline. `stddevPop` returns the square root
 of the population variance result. Both ignore null observations, return null
-for empty/all-null input under the existing aggregate policy, use denominator
-`N`, and return `Double` or `Option[Double]` according to input nullability.
+for empty/all-null input, use denominator `N`, and return `Option[Double]`.
 Sample variance and sample standard deviation are different future operations
 and are never implied by these names.
 
@@ -302,15 +358,29 @@ under `Auto`; `RequireColumnar` rejects it.
 CSV and TSV byte/character sources parse incrementally into bounded batches;
 UTF-8 decoding and quoted records may cross arbitrary input chunks. JVM path
 adapters use FS2 file resources, while Scala.js exposes only the portable
-stream/string surface. Owning CSV, TSV, and Arrow IPC sources are acquired
-through `Resource`; decoded or native buffers cannot escape an unbracketed
-source lifetime.
+stream/string surface. Owning CSV and TSV sources are acquired through
+`Resource`; the optional JVM `frame4s-arrow` adapter applies the same scoped
+lifetime to Arrow IPC and its decoded buffers. Delimited cells retain
+quotedness until decoding: configured
+null tokens apply only to unquoted cells, while the writer quotes every real
+value that could collide with that policy. Finite record, field, parser-chunk,
+batch, and diagnostic limits make retained state independent of source chunk
+size. One transport-leading BOM is ignored, blank records remain records, and
+sink byte receipts count encoded UTF-8. These rules are fixed by
+[ADR-0010](adr-0010-lossless-bounded-delimited-io.md).
 
 `Table[S]` is a materialized read view, not another dataframe algebra. It can
 decode detached named-tuple rows, exact typed cells/columns, and matching
 `NamedTuple.From` products; construct an owned table from rows; and render
 bounded rows/schema. It has no filter, project, sort, join, or arithmetic
-transformation methods.
+transformation methods. Existing batches enter through one of two explicit
+contracts: `takeOwnership` consumes them and closes all inputs on validation
+failure, while `retainFrom` creates independent full-batch views and leaves the
+caller's batches untouched. Row construction classifies iterator acquisition,
+`hasNext`, `next`, encoding, and batch-building exceptions as structured input
+failures and releases every batch or column allocated before the failure.
+Ranges are validated with subtraction so signed integer wraparound cannot admit
+an invalid buffer, column, or batch slice.
 
 Normalization is observationally error-preserving as well as value-preserving.
 Rewrites that reorder expression evaluation, including filter fusion and
@@ -336,7 +406,8 @@ The accepted release plan is authoritative. The first usable release includes:
   scoped JVM path entry point;
 - typed materialized reading, row/case-class codecs, construction from rows,
   and bounded rendering without a second eager transformation algebra;
-- Apache Arrow IPC stream ingestion/writing through the JVM adapter;
+- Apache Arrow IPC stream ingestion/writing through the optional JVM
+  `frame4s-arrow` adapter;
 - pure plan display and normalization;
 - reusable semantic/backend laws and honest JVM/Scala.js performance receipts.
 

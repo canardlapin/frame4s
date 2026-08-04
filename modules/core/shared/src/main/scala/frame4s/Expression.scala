@@ -2,6 +2,7 @@ package frame4s
 
 import scala.NamedTuple
 import scala.annotation.implicitNotFound
+import scala.collection.mutable
 import scala.compiletime.error
 
 private[frame4s] enum InputRef:
@@ -21,9 +22,19 @@ private[frame4s] enum InputRef:
   */
 enum UnaryOperator:
   case IsNull
+  case IsNotNull
   case IsTrue
+  case IsFalse
   case Negate
   case Sqrt
+
+  def symbol: String = this match
+    case IsNull    => "isNull"
+    case IsNotNull => "isNotNull"
+    case IsTrue    => "isTrue"
+    case IsFalse   => "isFalse"
+    case Negate    => "unary -"
+    case Sqrt      => "sqrt"
 
 /** Binary operations represented in a logical expression tree.
   *
@@ -45,6 +56,21 @@ enum BinaryOperator:
   case And
   case Or
 
+  def symbol: String = this match
+    case Equal              => "==="
+    case NullSafeEqual      => "nullSafeEq"
+    case NotEqual           => "=!="
+    case LessThan           => "<"
+    case LessThanOrEqual    => "<="
+    case GreaterThan        => ">"
+    case GreaterThanOrEqual => ">="
+    case Add                => "+"
+    case Subtract           => "-"
+    case Multiply           => "*"
+    case Divide             => "/"
+    case And                => "&&"
+    case Or                 => "||"
+
 /** Backend-neutral literal values stored in logical plans.
   *
   * Typed user code usually constructs literals with [[Expr.literal]]. `Null` always records the
@@ -57,8 +83,272 @@ enum LiteralValue:
   case Int64(value: Long)
   case Float32(value: Float)
   case Float64(value: Double)
-  case Utf8(value: String)
+  case Utf8(value: Utf8Value)
   case Timestamp(value: Long, unit: TimeUnit)
+
+  override def toString: String = this match
+    case Null(dataType)     => s"Null($dataType)"
+    case Bool(_)            => "Bool(<redacted>)"
+    case Int32(_)           => "Int32(<redacted>)"
+    case Int64(_)           => "Int64(<redacted>)"
+    case Float32(_)         => "Float32(<redacted>)"
+    case Float64(_)         => "Float64(<redacted>)"
+    case Utf8(_)            => "Utf8(<redacted>)"
+    case Timestamp(_, unit) => s"Timestamp(<redacted>,$unit)"
+
+object LiteralValue:
+  /** Construct a UTF-8 literal without admitting raw null. */
+  def utf8(value: String): Either[ValueError, LiteralValue] =
+    Utf8Value.from(value).map(Utf8.apply)
+
+  private[frame4s] def checkedUtf8(value: String): LiteralValue =
+    Utf8(Utf8Value.checked(value))
+
+  private[frame4s] def validate(value: LiteralValue): Either[ValueError, LiteralValue] =
+    if value == null then Left(ValueError.NullLiteral)
+    else
+      value match
+        case Null(dataType) if dataType == null => Left(ValueError.NullDataType)
+        case Timestamp(_, unit) if unit == null => Left(ValueError.NullTimeUnit)
+        case _                                  => Right(value)
+
+final private[frame4s] case class ExprFingerprint(first: Long, second: Long)
+
+private[frame4s] enum ExprIdentityNode:
+  case Derived(description: String)
+  case Column(
+      input: InputRef,
+      column: ColumnId,
+      dataType: DataType,
+      nullable: Boolean
+  )
+  case Literal(value: LiteralValue)
+  case Unary(
+      operator: UnaryOperator,
+      input: ExprId,
+      dataType: DataType,
+      nullable: Boolean
+  )
+  case Binary(
+      operator: BinaryOperator,
+      left: ExprId,
+      right: ExprId,
+      dataType: DataType,
+      nullable: Boolean
+  )
+
+/** Internal structural identity for a resolved expression.
+  *
+  * Its fingerprint has fixed size. A compact structural witness disambiguates the deliberately rare
+  * case in which two structures have the same fingerprint. Public diagnostics never render either
+  * representation.
+  */
+final class ExprId private[frame4s] (
+    private[frame4s] val fingerprint: ExprFingerprint,
+    private[frame4s] val witness: ExprIdentityNode
+):
+  override def equals(other: Any): Boolean = other match
+    case that: ExprId =>
+      (this eq that) ||
+      (fingerprint == that.fingerprint && ExprId.structurallyEqual(this, that))
+    case _ => false
+
+  override def hashCode(): Int =
+    val foldedFirst = fingerprint.first ^ (fingerprint.first >>> 32)
+    val foldedSecond = fingerprint.second ^ (fingerprint.second >>> 32)
+    31 * foldedFirst.toInt + foldedSecond.toInt
+
+  override def toString: String = "ExprId(<redacted>)"
+
+object ExprId:
+  private val FirstOffset = -3750763034362895579L
+  private val FirstPrime = 1099511628211L
+  private val SecondOffset = 7640891576956012809L
+  private val SecondPrime = -4417276706812531889L
+
+  final private class IdentityPair(val left: ExprId, val right: ExprId):
+    override def equals(other: Any): Boolean = other match
+      case that: IdentityPair => (left eq that.left) && (right eq that.right)
+      case _                  => false
+
+    override def hashCode(): Int =
+      31 * System.identityHashCode(left) + System.identityHashCode(right)
+
+  private def mixFirst(state: Long, value: Long): Long =
+    (state ^ value) * FirstPrime
+
+  private def mixSecond(state: Long, value: Long): Long =
+    (state ^ java.lang.Long.rotateLeft(value, 23)) * SecondPrime
+
+  private def combine(tag: Int, values: Long*): ExprFingerprint =
+    var first = mixFirst(FirstOffset, tag.toLong)
+    var second = mixSecond(SecondOffset, tag.toLong)
+    var index = 0
+    while index < values.length do
+      first = mixFirst(first, values(index))
+      second = mixSecond(second, values(index))
+      index += 1
+    ExprFingerprint(first ^ (first >>> 32), second ^ (second >>> 29))
+
+  private def stringFingerprint(tag: Int, value: String): ExprFingerprint =
+    if value == null then combine(tag, -1L)
+    else
+      var first = mixFirst(FirstOffset, tag.toLong)
+      var second = mixSecond(SecondOffset, tag.toLong)
+      var index = 0
+      while index < value.length do
+        val character = value.charAt(index).toLong
+        first = mixFirst(first, character)
+        second = mixSecond(second, character)
+        index += 1
+      combine(tag, first, second, value.length.toLong)
+
+  private def dataTypeCode(dataType: DataType): Long = dataType match
+    case DataType.Bool            => 1L
+    case DataType.Int32           => 2L
+    case DataType.Int64           => 3L
+    case DataType.Float32         => 4L
+    case DataType.Float64         => 5L
+    case DataType.Utf8            => 6L
+    case DataType.Timestamp(unit) => 16L + unit.ordinal.toLong
+
+  private def literalFingerprint(value: LiteralValue): ExprFingerprint = value match
+    case LiteralValue.Null(dataType)  => combine(20, dataTypeCode(dataType))
+    case LiteralValue.Bool(actual)    => combine(21, if actual then 1L else 0L)
+    case LiteralValue.Int32(actual)   => combine(22, actual.toLong)
+    case LiteralValue.Int64(actual)   => combine(23, actual)
+    case LiteralValue.Float32(actual) =>
+      combine(24, java.lang.Float.floatToRawIntBits(actual).toLong)
+    case LiteralValue.Float64(actual) =>
+      combine(25, java.lang.Double.doubleToRawLongBits(actual))
+    case LiteralValue.Utf8(actual)            => stringFingerprint(26, actual.value)
+    case LiteralValue.Timestamp(actual, unit) => combine(27, actual, unit.ordinal.toLong)
+
+  private def sameLiteral(left: LiteralValue, right: LiteralValue): Boolean =
+    (left, right) match
+      case (LiteralValue.Null(a), LiteralValue.Null(b))       => a == b
+      case (LiteralValue.Bool(a), LiteralValue.Bool(b))       => a == b
+      case (LiteralValue.Int32(a), LiteralValue.Int32(b))     => a == b
+      case (LiteralValue.Int64(a), LiteralValue.Int64(b))     => a == b
+      case (LiteralValue.Float32(a), LiteralValue.Float32(b)) =>
+        java.lang.Float.floatToRawIntBits(a) == java.lang.Float.floatToRawIntBits(b)
+      case (LiteralValue.Float64(a), LiteralValue.Float64(b)) =>
+        java.lang.Double.doubleToRawLongBits(a) == java.lang.Double.doubleToRawLongBits(b)
+      case (LiteralValue.Utf8(a), LiteralValue.Utf8(b))                   => a.value == b.value
+      case (LiteralValue.Timestamp(a, au), LiteralValue.Timestamp(b, bu)) =>
+        a == b && au == bu
+      case _ => false
+
+  private def structurallyEqual(left: ExprId, right: ExprId): Boolean =
+    val pending = mutable.ArrayDeque((left, right))
+    val visited = mutable.HashSet.empty[IdentityPair]
+    var equal = true
+    while pending.nonEmpty && equal do
+      val (currentLeft, currentRight) = pending.removeLast()
+      if !(currentLeft eq currentRight) then
+        if currentLeft.fingerprint != currentRight.fingerprint then equal = false
+        else
+          val pair = new IdentityPair(currentLeft, currentRight)
+          if visited.add(pair) then
+            (currentLeft.witness, currentRight.witness) match
+              case (ExprIdentityNode.Derived(a), ExprIdentityNode.Derived(b)) =>
+                equal = a == b
+              case (
+                    ExprIdentityNode.Column(ai, ac, at, an),
+                    ExprIdentityNode.Column(bi, bc, bt, bn)
+                  ) =>
+                equal = ai == bi && ac == bc && at == bt && an == bn
+              case (ExprIdentityNode.Literal(a), ExprIdentityNode.Literal(b)) =>
+                equal = sameLiteral(a, b)
+              case (
+                    ExprIdentityNode.Unary(ao, ai, at, an),
+                    ExprIdentityNode.Unary(bo, bi, bt, bn)
+                  ) =>
+                equal = ao == bo && at == bt && an == bn
+                if equal then pending.append((ai, bi))
+              case (
+                    ExprIdentityNode.Binary(ao, al, ar, at, an),
+                    ExprIdentityNode.Binary(bo, bl, br, bt, bn)
+                  ) =>
+                equal = ao == bo && at == bt && an == bn
+                if equal then
+                  pending.append((al, bl))
+                  pending.append((ar, br))
+              case _ => equal = false
+    equal
+
+  private[frame4s] def derived(description: String): ExprId =
+    new ExprId(stringFingerprint(1, description), ExprIdentityNode.Derived(description))
+
+  private[frame4s] def column(
+      input: InputRef,
+      column: ColumnId,
+      dataType: DataType,
+      nullable: Boolean
+  ): ExprId =
+    val name = stringFingerprint(2, column.value)
+    val fingerprint = combine(
+      3,
+      input.ordinal.toLong,
+      dataTypeCode(dataType),
+      if nullable then 1L else 0L,
+      name.first,
+      name.second
+    )
+    new ExprId(
+      fingerprint,
+      ExprIdentityNode.Column(input, column, dataType, nullable)
+    )
+
+  private[frame4s] def literal(value: LiteralValue): ExprId =
+    new ExprId(literalFingerprint(value), ExprIdentityNode.Literal(value))
+
+  private[frame4s] def unary(
+      operator: UnaryOperator,
+      input: ExprId,
+      dataType: DataType,
+      nullable: Boolean
+  ): ExprId =
+    val fingerprint = combine(
+      4,
+      operator.ordinal.toLong,
+      dataTypeCode(dataType),
+      if nullable then 1L else 0L,
+      input.fingerprint.first,
+      input.fingerprint.second
+    )
+    new ExprId(
+      fingerprint,
+      ExprIdentityNode.Unary(operator, input, dataType, nullable)
+    )
+
+  private[frame4s] def binary(
+      operator: BinaryOperator,
+      left: ExprId,
+      right: ExprId,
+      dataType: DataType,
+      nullable: Boolean
+  ): ExprId =
+    val fingerprint = combine(
+      5,
+      operator.ordinal.toLong,
+      dataTypeCode(dataType),
+      if nullable then 1L else 0L,
+      left.fingerprint.first,
+      left.fingerprint.second,
+      right.fingerprint.first,
+      right.fingerprint.second
+    )
+    new ExprId(
+      fingerprint,
+      ExprIdentityNode.Binary(operator, left, right, dataType, nullable)
+    )
+
+  private[frame4s] def diagnostic(id: ExprId): String = "<redacted>"
+
+  /** Test-only collision injection: retain a fingerprint while changing its structural witness. */
+  private[frame4s] def collisionProbe(id: ExprId, description: String): ExprId =
+    new ExprId(id.fingerprint, ExprIdentityNode.Derived(description))
 
 final private[frame4s] class FrameScopeToken private ()
 
@@ -93,10 +383,6 @@ final private[frame4s] case class ResolvedExpr(
     node: ExprNode
 )
 
-type ComparisonResult[A] = A match
-  case Option[value] => Option[Boolean]
-  case _             => Boolean
-
 @implicitNotFound(
   "This expression was created for a different frame scope. Build it from the callback's scope or use a literal."
 )
@@ -106,15 +392,171 @@ private[frame4s] object OriginInScope:
   given [Origin, Allowed](using Origin <:< Allowed): OriginInScope[Origin, Allowed] with {}
 
 @implicitNotFound(
-  "Scalar operand has type ${Found}; expected ${Expected}. Convert the value explicitly before using it in this expression"
+  "Scalar operand has type ${Found}; expected ${Left} or its corresponding required/nullable form. Convert the value explicitly before using it in this expression"
 )
-sealed private[frame4s] trait ExactScalarOperand[Expected, Found]:
-  def widen(value: Found): Expected
+sealed private[frame4s] trait ExactLiteralOperand[Left, Found, Right]:
+  def widen(value: Found): Right
 
-private[frame4s] object ExactScalarOperand:
-  given [Expected, Found](using subtype: Found <:< Expected): ExactScalarOperand[Expected, Found]
+private[frame4s] object ExactLiteralOperand:
+  given exact[Left, Found](using subtype: Found <:< Left): ExactLiteralOperand[Left, Found, Left]
   with
-    def widen(value: Found): Expected = subtype(value)
+    def widen(value: Found): Left = subtype(value)
+
+  given requiredForOptional[A, Found](using
+      subtype: Found <:< A
+  ): ExactLiteralOperand[Option[A], Found, A] with
+    def widen(value: Found): A = subtype(value)
+
+  given optionalForRequired[A, Found](using
+      subtype: Found <:< Option[A]
+  ): ExactLiteralOperand[A, Found, Option[A]] with
+    def widen(value: Found): Option[A] = subtype(value)
+
+/** Closed evidence for equality against an exact-width scalar literal. */
+@implicitNotFound(
+  "Operators ===, =!=, and nullSafeEq are not supported for ${Left} and scalar ${Found}. The scalar must have the same supported physical type; either side may be Option."
+)
+opaque type LiteralEqualityType[Left, Found, Result] = LiteralEqualityBuilder[Left, Found, Result]
+
+private[frame4s] trait LiteralEqualityBuilder[Left, Found, Result]:
+  def comparison[Origin](
+      operator: BinaryOperator,
+      left: ExprOf[Left, Origin],
+      value: Found
+  ): ExprOf[Result, Origin]
+  def nullSafe[Origin](left: ExprOf[Left, Origin], value: Found): ExprOf[Boolean, Origin]
+
+private[frame4s] object LiteralEqualityType:
+  extension [Left, Found, Result](capability: LiteralEqualityType[Left, Found, Result])
+    private[frame4s] def comparison[Origin](
+        operator: BinaryOperator,
+        left: ExprOf[Left, Origin],
+        value: Found
+    ): ExprOf[Result, Origin] = capability.comparison(operator, left, value)
+
+    private[frame4s] def nullSafe[Origin](
+        left: ExprOf[Left, Origin],
+        value: Found
+    ): ExprOf[Boolean, Origin] = capability.nullSafe(left, value)
+
+  given [Left, Found, Right, Result](using
+      exact: ExactLiteralOperand[Left, Found, Right],
+      columnType: ColumnType[Right],
+      equality: EqualityType[Left, Right, Result]
+  ): LiteralEqualityType[Left, Found, Result] =
+    new LiteralEqualityBuilder[Left, Found, Result]:
+      def comparison[Origin](
+          operator: BinaryOperator,
+          left: ExprOf[Left, Origin],
+          value: Found
+      ): ExprOf[Result, Origin] =
+        Expr.comparison(operator, left, Expr.literal(exact.widen(value)))
+
+      def nullSafe[Origin](
+          left: ExprOf[Left, Origin],
+          value: Found
+      ): ExprOf[Boolean, Origin] =
+        Expr.nullSafeComparison(left, Expr.literal(exact.widen(value)))
+
+/** Closed evidence for ordered comparison against an exact-width scalar literal. */
+@implicitNotFound(
+  "Operators <, <=, >, and >= are not supported for ${Left} and scalar ${Found}. The scalar must have the same supported physical type; either side may be Option."
+)
+opaque type LiteralOrderedType[Left, Found, Result] = LiteralOrderedBuilder[Left, Found, Result]
+
+private[frame4s] trait LiteralOrderedBuilder[Left, Found, Result]:
+  def apply[Origin](
+      operator: BinaryOperator,
+      left: ExprOf[Left, Origin],
+      value: Found
+  ): ExprOf[Result, Origin]
+
+private[frame4s] object LiteralOrderedType:
+  extension [Left, Found, Result](capability: LiteralOrderedType[Left, Found, Result])
+    private[frame4s] def build[Origin](
+        operator: BinaryOperator,
+        left: ExprOf[Left, Origin],
+        value: Found
+    ): ExprOf[Result, Origin] = capability.apply(operator, left, value)
+
+  given [Left, Found, Right, Result](using
+      exact: ExactLiteralOperand[Left, Found, Right],
+      columnType: ColumnType[Right],
+      ordered: OrderedType[Left, Right, Result]
+  ): LiteralOrderedType[Left, Found, Result] =
+    new LiteralOrderedBuilder[Left, Found, Result]:
+      def apply[Origin](
+          operator: BinaryOperator,
+          left: ExprOf[Left, Origin],
+          value: Found
+      ): ExprOf[Result, Origin] =
+        Expr.comparison(operator, left, Expr.literal(exact.widen(value)))
+
+/** Closed evidence for width-preserving arithmetic against a scalar literal. */
+@implicitNotFound(
+  "Operators +, -, and * are not supported for ${Left} and scalar ${Found}. Both operands must have the same numeric width; either may be Option."
+)
+opaque type LiteralArithmeticType[Left, Found, Result] =
+  LiteralArithmeticBuilder[Left, Found, Result]
+
+private[frame4s] trait LiteralArithmeticBuilder[Left, Found, Result]:
+  def apply[Origin](
+      operator: BinaryOperator,
+      left: ExprOf[Left, Origin],
+      value: Found
+  ): ExprOf[Result, Origin]
+
+private[frame4s] object LiteralArithmeticType:
+  extension [Left, Found, Result](capability: LiteralArithmeticType[Left, Found, Result])
+    private[frame4s] def build[Origin](
+        operator: BinaryOperator,
+        left: ExprOf[Left, Origin],
+        value: Found
+    ): ExprOf[Result, Origin] = capability.apply(operator, left, value)
+
+  given [Left, Found, Right, Result](using
+      exact: ExactLiteralOperand[Left, Found, Right],
+      columnType: ColumnType[Right],
+      arithmetic: ArithmeticType[Left, Right, Result]
+  ): LiteralArithmeticType[Left, Found, Result] =
+    new LiteralArithmeticBuilder[Left, Found, Result]:
+      def apply[Origin](
+          operator: BinaryOperator,
+          left: ExprOf[Left, Origin],
+          value: Found
+      ): ExprOf[Result, Origin] =
+        Expr.samePhysical(operator, left, Expr.literal(exact.widen(value)))
+
+/** Closed evidence for width-preserving division by a scalar literal. */
+@implicitNotFound(
+  "Operator / is not supported for ${Left} and scalar ${Found}. Both operands must have the same numeric width; either may be Option."
+)
+opaque type LiteralDivisibleType[Left, Found, Result] = LiteralDivisibleBuilder[Left, Found, Result]
+
+private[frame4s] trait LiteralDivisibleBuilder[Left, Found, Result]:
+  def apply[Origin](
+      left: ExprOf[Left, Origin],
+      value: Found
+  ): ExprOf[Result, Origin]
+
+private[frame4s] object LiteralDivisibleType:
+  extension [Left, Found, Result](capability: LiteralDivisibleType[Left, Found, Result])
+    private[frame4s] def build[Origin](
+        left: ExprOf[Left, Origin],
+        value: Found
+    ): ExprOf[Result, Origin] = capability.apply(left, value)
+
+  given [Left, Found, Right, Result](using
+      exact: ExactLiteralOperand[Left, Found, Right],
+      columnType: ColumnType[Right],
+      divisible: DivisibleType[Left, Right, Result]
+  ): LiteralDivisibleType[Left, Found, Result] =
+    new LiteralDivisibleBuilder[Left, Found, Result]:
+      def apply[Origin](
+          left: ExprOf[Left, Origin],
+          value: Found
+      ): ExprOf[Result, Origin] =
+        Expr.samePhysical(BinaryOperator.Divide, left, Expr.literal(exact.widen(value)))
 
 /** A typed logical expression whose originating frame scope is intentionally hidden. */
 type Expr[A] = ExprOf[A, ?]
@@ -146,205 +588,200 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   def as[Name <: String & Singleton](name: Name): NamedExprOf[Name, A, Origin] =
     NamedExpr(name, this)
 
-  def ===[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  ): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
+  def ===[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using EqualityType[A, B, Result]): ExprOf[Result, Origin | OtherOrigin] =
     Expr.comparison(BinaryOperator.Equal, this, other)
 
-  def ===(other: LiteralExpr[A]): ExprOf[ComparisonResult[A], Origin] =
+  def ===[B, Result](other: LiteralExpr[B])(using
+      EqualityType[A, B, Result]
+  ): ExprOf[Result, Origin] =
     Expr.comparison(BinaryOperator.Equal, this, other)
 
-  def ===[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
-    this === Expr.literal(exact.widen(value))
+  def ===[Value, Result](value: Value)(using
+      equality: LiteralEqualityType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    equality.comparison(BinaryOperator.Equal, this, value)
 
   transparent inline def ===(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def =!=[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  ): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
+  def =!=[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using EqualityType[A, B, Result]): ExprOf[Result, Origin | OtherOrigin] =
     Expr.comparison(BinaryOperator.NotEqual, this, other)
 
-  def =!=(other: LiteralExpr[A]): ExprOf[ComparisonResult[A], Origin] =
+  def =!=[B, Result](other: LiteralExpr[B])(using
+      EqualityType[A, B, Result]
+  ): ExprOf[Result, Origin] =
     Expr.comparison(BinaryOperator.NotEqual, this, other)
 
-  def =!=[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
-    this =!= Expr.literal(exact.widen(value))
+  def =!=[Value, Result](value: Value)(using
+      equality: LiteralEqualityType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    equality.comparison(BinaryOperator.NotEqual, this, value)
 
   transparent inline def =!=(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def nullSafeEq[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  ): ExprOf[Boolean, Origin | OtherOrigin] =
+  def nullSafeEq[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using EqualityType[A, B, Result]): ExprOf[Boolean, Origin | OtherOrigin] =
     Expr.nullSafeComparison(this, other)
 
-  def nullSafeEq(other: LiteralExpr[A]): ExprOf[Boolean, Origin] =
-    Expr.nullSafeComparison(this, other)
-
-  def nullSafeEq[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A]
+  def nullSafeEq[B, Result](other: LiteralExpr[B])(using
+      EqualityType[A, B, Result]
   ): ExprOf[Boolean, Origin] =
-    nullSafeEq(Expr.literal(exact.widen(value)))
+    Expr.nullSafeComparison(this, other)
+
+  def nullSafeEq[Value, Result](value: Value)(using
+      equality: LiteralEqualityType[A, Value, Result]
+  ): ExprOf[Boolean, Origin] =
+    equality.nullSafe(this, value)
 
   transparent inline def nullSafeEq(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def <[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  )(using Ordering[A]): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
+  def <[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using OrderedType[A, B, Result]): ExprOf[Result, Origin | OtherOrigin] =
     Expr.comparison(BinaryOperator.LessThan, this, other)
 
-  def <(other: LiteralExpr[A])(using
-      Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
+  def <[B, Result](other: LiteralExpr[B])(using
+      OrderedType[A, B, Result]
+  ): ExprOf[Result, Origin] =
     Expr.comparison(BinaryOperator.LessThan, this, other)
 
-  def <[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      ordering: Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
-    this < Expr.literal(exact.widen(value))
+  def <[Value, Result](value: Value)(using
+      ordered: LiteralOrderedType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    ordered.build(BinaryOperator.LessThan, this, value)
 
   transparent inline def <(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def <=[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  )(using Ordering[A]): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
+  def <=[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using OrderedType[A, B, Result]): ExprOf[Result, Origin | OtherOrigin] =
     Expr.comparison(BinaryOperator.LessThanOrEqual, this, other)
 
-  def <=(other: LiteralExpr[A])(using
-      Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
+  def <=[B, Result](other: LiteralExpr[B])(using
+      OrderedType[A, B, Result]
+  ): ExprOf[Result, Origin] =
     Expr.comparison(BinaryOperator.LessThanOrEqual, this, other)
 
-  def <=[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      ordering: Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
-    this <= Expr.literal(exact.widen(value))
+  def <=[Value, Result](value: Value)(using
+      ordered: LiteralOrderedType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    ordered.build(BinaryOperator.LessThanOrEqual, this, value)
 
   transparent inline def <=(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def >[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  )(using Ordering[A]): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
+  def >[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using OrderedType[A, B, Result]): ExprOf[Result, Origin | OtherOrigin] =
     Expr.comparison(BinaryOperator.GreaterThan, this, other)
 
-  def >(other: LiteralExpr[A])(using
-      Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
+  def >[B, Result](other: LiteralExpr[B])(using
+      OrderedType[A, B, Result]
+  ): ExprOf[Result, Origin] =
     Expr.comparison(BinaryOperator.GreaterThan, this, other)
 
-  def >[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      ordering: Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
-    this > Expr.literal(exact.widen(value))
+  def >[Value, Result](value: Value)(using
+      ordered: LiteralOrderedType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    ordered.build(BinaryOperator.GreaterThan, this, value)
 
   transparent inline def >(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def >=[OtherOrigin](
-      other: ExprOf[A, OtherOrigin]
-  )(using Ordering[A]): ExprOf[ComparisonResult[A], Origin | OtherOrigin] =
+  def >=[B, OtherOrigin, Result](
+      other: ExprOf[B, OtherOrigin]
+  )(using OrderedType[A, B, Result]): ExprOf[Result, Origin | OtherOrigin] =
     Expr.comparison(BinaryOperator.GreaterThanOrEqual, this, other)
 
-  def >=(other: LiteralExpr[A])(using
-      Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
+  def >=[B, Result](other: LiteralExpr[B])(using
+      OrderedType[A, B, Result]
+  ): ExprOf[Result, Origin] =
     Expr.comparison(BinaryOperator.GreaterThanOrEqual, this, other)
 
-  def >=[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      ordering: Ordering[A]
-  ): ExprOf[ComparisonResult[A], Origin] =
-    this >= Expr.literal(exact.widen(value))
+  def >=[Value, Result](value: Value)(using
+      ordered: LiteralOrderedType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    ordered.build(BinaryOperator.GreaterThanOrEqual, this, value)
 
   transparent inline def >=(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def +[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      NumericColumn[A]
-  ): ExprOf[A, Origin | OtherOrigin] =
-    Expr.sameType(BinaryOperator.Add, this, other)
+  def +[B, OtherOrigin, Result](other: ExprOf[B, OtherOrigin])(using
+      ArithmeticType[A, B, Result]
+  ): ExprOf[Result, Origin | OtherOrigin] =
+    Expr.samePhysical(BinaryOperator.Add, this, other)
 
-  def +(other: LiteralExpr[A])(using NumericColumn[A]): ExprOf[A, Origin] =
-    Expr.sameType(BinaryOperator.Add, this, other)
+  def +[B, Result](other: LiteralExpr[B])(using
+      ArithmeticType[A, B, Result]
+  ): ExprOf[Result, Origin] =
+    Expr.samePhysical(BinaryOperator.Add, this, other)
 
-  def +[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      numeric: NumericColumn[A]
-  ): ExprOf[A, Origin] =
-    this + Expr.literal(exact.widen(value))
+  def +[Value, Result](value: Value)(using
+      arithmetic: LiteralArithmeticType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    arithmetic.build(BinaryOperator.Add, this, value)
 
   transparent inline def +(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def -[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      NumericColumn[A]
-  ): ExprOf[A, Origin | OtherOrigin] =
-    Expr.sameType(BinaryOperator.Subtract, this, other)
+  def -[B, OtherOrigin, Result](other: ExprOf[B, OtherOrigin])(using
+      ArithmeticType[A, B, Result]
+  ): ExprOf[Result, Origin | OtherOrigin] =
+    Expr.samePhysical(BinaryOperator.Subtract, this, other)
 
-  def -(other: LiteralExpr[A])(using NumericColumn[A]): ExprOf[A, Origin] =
-    Expr.sameType(BinaryOperator.Subtract, this, other)
+  def -[B, Result](other: LiteralExpr[B])(using
+      ArithmeticType[A, B, Result]
+  ): ExprOf[Result, Origin] =
+    Expr.samePhysical(BinaryOperator.Subtract, this, other)
 
-  def -[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      numeric: NumericColumn[A]
-  ): ExprOf[A, Origin] =
-    this - Expr.literal(exact.widen(value))
+  def -[Value, Result](value: Value)(using
+      arithmetic: LiteralArithmeticType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    arithmetic.build(BinaryOperator.Subtract, this, value)
 
   transparent inline def -(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def *[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      NumericColumn[A]
-  ): ExprOf[A, Origin | OtherOrigin] =
-    Expr.sameType(BinaryOperator.Multiply, this, other)
+  def *[B, OtherOrigin, Result](other: ExprOf[B, OtherOrigin])(using
+      ArithmeticType[A, B, Result]
+  ): ExprOf[Result, Origin | OtherOrigin] =
+    Expr.samePhysical(BinaryOperator.Multiply, this, other)
 
-  def *(other: LiteralExpr[A])(using NumericColumn[A]): ExprOf[A, Origin] =
-    Expr.sameType(BinaryOperator.Multiply, this, other)
+  def *[B, Result](other: LiteralExpr[B])(using
+      ArithmeticType[A, B, Result]
+  ): ExprOf[Result, Origin] =
+    Expr.samePhysical(BinaryOperator.Multiply, this, other)
 
-  def *[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      numeric: NumericColumn[A]
-  ): ExprOf[A, Origin] =
-    this * Expr.literal(exact.widen(value))
+  def *[Value, Result](value: Value)(using
+      arithmetic: LiteralArithmeticType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    arithmetic.build(BinaryOperator.Multiply, this, value)
 
   transparent inline def *(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
 
-  def /[OtherOrigin](other: ExprOf[A, OtherOrigin])(using
-      FractionalColumn[A]
-  ): ExprOf[A, Origin | OtherOrigin] =
-    Expr.sameType(BinaryOperator.Divide, this, other)
+  def /[B, OtherOrigin, Result](other: ExprOf[B, OtherOrigin])(using
+      DivisibleType[A, B, Result]
+  ): ExprOf[Result, Origin | OtherOrigin] =
+    Expr.samePhysical(BinaryOperator.Divide, this, other)
 
-  def /(other: LiteralExpr[A])(using FractionalColumn[A]): ExprOf[A, Origin] =
-    Expr.sameType(BinaryOperator.Divide, this, other)
+  def /[B, Result](other: LiteralExpr[B])(using
+      DivisibleType[A, B, Result]
+  ): ExprOf[Result, Origin] =
+    Expr.samePhysical(BinaryOperator.Divide, this, other)
 
-  def /[Value](value: Value)(using
-      exact: ExactScalarOperand[A, Value],
-      columnType: ColumnType[A],
-      fractional: FractionalColumn[A]
-  ): ExprOf[A, Origin] =
-    this / Expr.literal(exact.widen(value))
+  def /[Value, Result](value: Value)(using
+      divisible: LiteralDivisibleType[A, Value, Result]
+  ): ExprOf[Result, Origin] =
+    divisible.build(this, value)
 
   transparent inline def /(inline value: Null): Nothing =
     error("Raw null is not a typed column value. Use None for a nullable column.")
@@ -352,7 +789,29 @@ sealed class ExprOf[A, Origin] private[frame4s] (
   def isNull: ExprOf[Boolean, Origin] =
     Expr.unary(UnaryOperator.IsNull, this, DataType.Bool, nullable = false)
 
-  def sqrt(using FloatingColumn[A]): ExprOf[A, Origin] =
+  def isNotNull: ExprOf[Boolean, Origin] =
+    Expr.unary(UnaryOperator.IsNotNull, this, DataType.Bool, nullable = false)
+
+  def &&[B, OtherOrigin, Result](other: ExprOf[B, OtherOrigin])(using
+      BooleanType[A, B, Result]
+  ): ExprOf[Result, Origin | OtherOrigin] =
+    Expr.booleanBinary(BinaryOperator.And, this, other)
+
+  def ||[B, OtherOrigin, Result](other: ExprOf[B, OtherOrigin])(using
+      BooleanType[A, B, Result]
+  ): ExprOf[Result, Origin | OtherOrigin] =
+    Expr.booleanBinary(BinaryOperator.Or, this, other)
+
+  def isTrue(using BooleanValue[A]): ExprOf[Boolean, Origin] =
+    Expr.unary(UnaryOperator.IsTrue, this, DataType.Bool, nullable = false)
+
+  def isFalse(using BooleanValue[A]): ExprOf[Boolean, Origin] =
+    Expr.unary(UnaryOperator.IsFalse, this, DataType.Bool, nullable = false)
+
+  def unary_-(using NumericType[A]): ExprOf[A, Origin] =
+    Expr.unary(UnaryOperator.Negate, this, dataType, nullable)
+
+  def sqrt(using FloatingType[A]): ExprOf[A, Origin] =
     Expr.unary(UnaryOperator.Sqrt, this, dataType, nullable)
 
 /** A scope-independent literal expression that may be combined with any compatible column. */
@@ -371,14 +830,54 @@ object Expr:
     * `None` is represented as a typed null. A raw `null` is not accepted as a typed column value.
     */
   def literal[A](value: A)(using columnType: ColumnType[A]): LiteralExpr[A] =
-    val literal = columnType.literal(value)
-    val id = ExprId.derived(s"literal:$literal")
-    new LiteralExpr(
-      ResolvedExpr(id, columnType.dataType, columnType.nullable, ExprNode.Literal(literal))
+    literalChecked(value).fold(error => throw InvalidValueFailure(error), identity)
+
+  /** Construct a literal through a total boundary.
+    *
+    * Use this form when a string-bearing value came from Java or code compiled without explicit
+    * nulls. `None` remains the only typed representation of absence.
+    */
+  def literalChecked[A](
+      value: A
+  )(using columnType: ColumnType[A]): Either[ValueError, LiteralExpr[A]] =
+    columnType
+      .literal(value)
+      .map: literal =>
+        new LiteralExpr(
+          ResolvedExpr(
+            ExprId.literal(literal),
+            columnType.dataType,
+            columnType.nullable,
+            ExprNode.Literal(literal)
+          )
+        )
+
+  private[frame4s] def resolvedUnary(
+      operator: UnaryOperator,
+      input: ResolvedExpr,
+      dataType: DataType,
+      nullable: Boolean
+  ): ResolvedExpr =
+    ResolvedExpr(
+      ExprId.unary(operator, input.id, dataType, nullable),
+      dataType,
+      nullable,
+      ExprNode.Unary(operator, input)
     )
 
-  private def binaryId(operator: BinaryOperator, left: ResolvedExpr, right: ResolvedExpr): ExprId =
-    ExprId.derived(s"$operator(${left.id.value},${right.id.value})")
+  private[frame4s] def resolvedBinary(
+      operator: BinaryOperator,
+      left: ResolvedExpr,
+      right: ResolvedExpr,
+      dataType: DataType,
+      nullable: Boolean
+  ): ResolvedExpr =
+    ResolvedExpr(
+      ExprId.binary(operator, left.id, right.id, dataType, nullable),
+      dataType,
+      nullable,
+      ExprNode.Binary(operator, left, right)
+    )
 
   private[frame4s] def unary[A, B, Origin](
       operator: UnaryOperator,
@@ -386,85 +885,66 @@ object Expr:
       dataType: DataType,
       nullable: Boolean
   ): ExprOf[B, Origin] =
-    val resolved = input.resolved
-    new ExprOf(
-      ResolvedExpr(
-        ExprId.derived(s"$operator(${resolved.id.value})"),
-        dataType,
-        nullable,
-        ExprNode.Unary(operator, resolved)
-      )
-    )
+    new ExprOf(resolvedUnary(operator, input.resolved, dataType, nullable))
 
-  private[frame4s] def comparison[A, LeftOrigin, RightOrigin](
+  private[frame4s] def comparison[Left, Right, Result, LeftOrigin, RightOrigin](
       operator: BinaryOperator,
-      left: ExprOf[A, LeftOrigin],
-      right: ExprOf[A, RightOrigin]
-  ): ExprOf[ComparisonResult[A], LeftOrigin | RightOrigin] =
+      left: ExprOf[Left, LeftOrigin],
+      right: ExprOf[Right, RightOrigin]
+  ): ExprOf[Result, LeftOrigin | RightOrigin] =
     new ExprOf(
-      ResolvedExpr(
-        binaryId(operator, left.resolved, right.resolved),
+      resolvedBinary(
+        operator,
+        left.resolved,
+        right.resolved,
         DataType.Bool,
-        left.nullable || right.nullable,
-        ExprNode.Binary(operator, left.resolved, right.resolved)
+        left.nullable || right.nullable
       )
     )
 
-  private[frame4s] def sameType[A, LeftOrigin, RightOrigin](
+  private[frame4s] def samePhysical[Left, Right, Result, LeftOrigin, RightOrigin](
       operator: BinaryOperator,
-      left: ExprOf[A, LeftOrigin],
-      right: ExprOf[A, RightOrigin]
-  ): ExprOf[A, LeftOrigin | RightOrigin] =
+      left: ExprOf[Left, LeftOrigin],
+      right: ExprOf[Right, RightOrigin]
+  ): ExprOf[Result, LeftOrigin | RightOrigin] =
     new ExprOf(
-      ResolvedExpr(
-        binaryId(operator, left.resolved, right.resolved),
+      resolvedBinary(
+        operator,
+        left.resolved,
+        right.resolved,
         left.dataType,
-        left.nullable || right.nullable,
-        ExprNode.Binary(operator, left.resolved, right.resolved)
+        left.nullable || right.nullable
       )
     )
 
-  private[frame4s] def nullSafeComparison[A, LeftOrigin, RightOrigin](
-      left: ExprOf[A, LeftOrigin],
-      right: ExprOf[A, RightOrigin]
+  private[frame4s] def nullSafeComparison[Left, Right, LeftOrigin, RightOrigin](
+      left: ExprOf[Left, LeftOrigin],
+      right: ExprOf[Right, RightOrigin]
   ): ExprOf[Boolean, LeftOrigin | RightOrigin] =
     new ExprOf(
-      ResolvedExpr(
-        binaryId(BinaryOperator.NullSafeEqual, left.resolved, right.resolved),
+      resolvedBinary(
+        BinaryOperator.NullSafeEqual,
+        left.resolved,
+        right.resolved,
         DataType.Bool,
-        nullable = false,
-        ExprNode.Binary(BinaryOperator.NullSafeEqual, left.resolved, right.resolved)
+        nullable = false
       )
     )
 
-  private[frame4s] def booleanBinary[LeftOrigin, RightOrigin](
+  private[frame4s] def booleanBinary[Left, Right, Result, LeftOrigin, RightOrigin](
       operator: BinaryOperator,
-      left: ExprOf[Boolean, LeftOrigin],
-      right: ExprOf[Boolean, RightOrigin]
-  ): ExprOf[Boolean, LeftOrigin | RightOrigin] =
+      left: ExprOf[Left, LeftOrigin],
+      right: ExprOf[Right, RightOrigin]
+  ): ExprOf[Result, LeftOrigin | RightOrigin] =
     new ExprOf(
-      ResolvedExpr(
-        binaryId(operator, left.resolved, right.resolved),
+      resolvedBinary(
+        operator,
+        left.resolved,
+        right.resolved,
         DataType.Bool,
-        nullable = false,
-        ExprNode.Binary(operator, left.resolved, right.resolved)
+        left.nullable || right.nullable
       )
     )
-
-extension [LeftOrigin](expression: ExprOf[Boolean, LeftOrigin])
-  def &&[RightOrigin](
-      other: ExprOf[Boolean, RightOrigin]
-  ): ExprOf[Boolean, LeftOrigin | RightOrigin] =
-    Expr.booleanBinary(BinaryOperator.And, expression, other)
-
-  def ||[RightOrigin](
-      other: ExprOf[Boolean, RightOrigin]
-  ): ExprOf[Boolean, LeftOrigin | RightOrigin] =
-    Expr.booleanBinary(BinaryOperator.Or, expression, other)
-
-extension [Origin](expression: ExprOf[Option[Boolean], Origin])
-  def isTrue: ExprOf[Boolean, Origin] =
-    Expr.unary(UnaryOperator.IsTrue, expression, DataType.Bool, nullable = false)
 
 /** A typed expression paired with its singleton output column name. */
 sealed trait NamedExpr[Name <: String & Singleton, A]:
@@ -606,7 +1086,7 @@ final class Scope[S <: NamedTuple.AnyNamedTuple, Origin] private[frame4s] (
   ): ColumnExprOf[Name, SchemaFieldType[S, Name], Origin] =
     val field = schema.fields(at.index)
     val resolved = ResolvedExpr(
-      ExprId.derived(s"column:${input.qualifier}:${field.id.value}"),
+      ExprId.column(input, field.id, field.dataType, field.nullable),
       field.dataType,
       field.nullable,
       ExprNode.Column(input, scopeId, field.id, field.name, at.index)
@@ -685,111 +1165,185 @@ object Aggregate:
 
   def sum[A, Origin](
       expression: ExprOf[A, Origin]
-  )(using NumericColumn[A]): AggregateExprOf[A, Origin] =
+  )(using NumericType[A]): AggregateExprOf[ReductionResult[A], Origin] =
     new AggregateExprOf(
       ResolvedAggregate(
         expression.dataType,
-        expression.nullable,
+        nullable = true,
         AggregateNode.Sum(expression.resolved)
       )
     )
 
   def mean[A, Origin](
       expression: ExprOf[A, Origin]
-  )(using NumericColumn[A]): AggregateExprOf[MeanResult[A], Origin] =
+  )(using NumericType[A]): AggregateExprOf[Option[Double], Origin] =
     new AggregateExprOf(
       ResolvedAggregate(
         DataType.Float64,
-        expression.nullable,
+        nullable = true,
         AggregateNode.Mean(expression.resolved)
       )
     )
 
   def variancePop[A, Origin](
       expression: ExprOf[A, Origin]
-  )(using NumericColumn[A]): AggregateExprOf[MeanResult[A], Origin] =
+  )(using NumericType[A]): AggregateExprOf[Option[Double], Origin] =
     new AggregateExprOf(
       ResolvedAggregate(
         DataType.Float64,
-        expression.nullable,
+        nullable = true,
         AggregateNode.VariancePop(expression.resolved)
       )
     )
 
   def stddevPop[A, Origin](
       expression: ExprOf[A, Origin]
-  )(using NumericColumn[A]): AggregateExprOf[MeanResult[A], Origin] =
+  )(using NumericType[A]): AggregateExprOf[Option[Double], Origin] =
     new AggregateExprOf(
       ResolvedAggregate(
         DataType.Float64,
-        expression.nullable,
+        nullable = true,
         AggregateNode.StddevPop(expression.resolved)
       )
     )
 
   def min[A, Origin](
       expression: ExprOf[A, Origin]
-  )(using Ordering[A]): AggregateExprOf[A, Origin] =
+  )(using OrderedValue[A]): AggregateExprOf[ReductionResult[A], Origin] =
     new AggregateExprOf(
       ResolvedAggregate(
         expression.dataType,
-        expression.nullable,
+        nullable = true,
         AggregateNode.Min(expression.resolved)
       )
     )
 
   def max[A, Origin](
       expression: ExprOf[A, Origin]
-  )(using Ordering[A]): AggregateExprOf[A, Origin] =
+  )(using OrderedValue[A]): AggregateExprOf[ReductionResult[A], Origin] =
     new AggregateExprOf(
       ResolvedAggregate(
         expression.dataType,
-        expression.nullable,
+        nullable = true,
         AggregateNode.Max(expression.resolved)
       )
     )
 
-/** Evidence that a typed column supports addition, subtraction, and multiplication.
-  *
-  * The closed instances preserve the physical width and lift explicitly nullable `Option` columns
-  * without defining arithmetic for ordinary Scala `Option` values.
-  */
+/** Closed evidence for width-preserving `+`, `-`, and `*` expressions. */
 @implicitNotFound(
-  "Arithmetic requires an Int, Long, Float, Double, or nullable Option of one of those types."
+  "Operators +, -, and * are not supported for ${Left} and ${Right}. Both operands must have the same numeric width; either may be Option."
 )
-sealed trait NumericColumn[A]
+opaque type ArithmeticType[Left, Right, Result] = Unit
 
-object NumericColumn:
-  given NumericColumn[Int] with {}
-  given NumericColumn[Long] with {}
-  given NumericColumn[Float] with {}
-  given NumericColumn[Double] with {}
-  given [A](using NumericColumn[A]): NumericColumn[Option[A]] with {}
+private[frame4s] object ArithmeticType:
+  given required[A <: (Int | Long | Float | Double)]: ArithmeticType[A, A, A] = ()
+  given optionalLeft[A <: (Int | Long | Float | Double)]: ArithmeticType[Option[A], A, Option[A]] =
+    ()
+  given optionalRight[A <: (Int | Long | Float | Double)]: ArithmeticType[A, Option[A], Option[A]] =
+    ()
+  given optionalBoth[A <: (Int | Long | Float | Double)]
+      : ArithmeticType[Option[A], Option[A], Option[A]] = ()
 
-/** Evidence that a typed column supports IEEE floating-point division. */
+/** Closed evidence for width-preserving checked integral or IEEE floating-point division. */
 @implicitNotFound(
-  "Division requires Float, Double, or a nullable Option of one of those types."
+  "Operator / is not supported for ${Left} and ${Right}. Both operands must have the same numeric width; either may be Option."
 )
-sealed trait FractionalColumn[A]
+opaque type DivisibleType[Left, Right, Result] = Unit
 
-object FractionalColumn:
-  given FractionalColumn[Float] with {}
-  given FractionalColumn[Double] with {}
-  given [A](using FractionalColumn[A]): FractionalColumn[Option[A]] with {}
+private[frame4s] object DivisibleType:
+  given required[A <: (Int | Long | Float | Double)]: DivisibleType[A, A, A] = ()
+  given optionalLeft[A <: (Int | Long | Float | Double)]: DivisibleType[Option[A], A, Option[A]] =
+    ()
+  given optionalRight[A <: (Int | Long | Float | Double)]: DivisibleType[A, Option[A], Option[A]] =
+    ()
+  given optionalBoth[A <: (Int | Long | Float | Double)]
+      : DivisibleType[Option[A], Option[A], Option[A]] = ()
 
+/** Closed evidence for equality over one physical scalar type, with nullable lifting. */
 @implicitNotFound(
-  "sqrt requires a Float, Double, Option[Float], or Option[Double] expression."
+  "Operators ===, =!=, and nullSafeEq are not supported for ${Left} and ${Right}. Operands must have the same supported physical type; either may be Option."
 )
-sealed trait FloatingColumn[A]
+opaque type EqualityType[Left, Right, Result] = Unit
 
-object FloatingColumn:
-  given FloatingColumn[Float] with {}
-  given FloatingColumn[Double] with {}
-  given [A](using FloatingColumn[A]): FloatingColumn[Option[A]] with {}
+private[frame4s] object EqualityType:
+  given required[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : EqualityType[A, A, Boolean] = ()
+  given optionalLeft[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : EqualityType[Option[A], A, Option[Boolean]] = ()
+  given optionalRight[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : EqualityType[A, Option[A], Option[Boolean]] = ()
+  given optionalBoth[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : EqualityType[Option[A], Option[A], Option[Boolean]] = ()
 
-type MeanResult[A] = A match
-  case Option[value] => Option[Double]
-  case _             => Double
+/** Closed evidence for ordered comparisons over one physical scalar type. */
+@implicitNotFound(
+  "Operators <, <=, >, and >= are not supported for ${Left} and ${Right}. Operands must have the same supported physical type; either may be Option."
+)
+opaque type OrderedType[Left, Right, Result] = Unit
+
+private[frame4s] object OrderedType:
+  given required[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : OrderedType[A, A, Boolean] = ()
+  given optionalLeft[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : OrderedType[Option[A], A, Option[Boolean]] = ()
+  given optionalRight[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : OrderedType[A, Option[A], Option[Boolean]] = ()
+  given optionalBoth[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : OrderedType[Option[A], Option[A], Option[Boolean]] = ()
+
+/** Closed evidence for SQL three-valued `&&` and `||`. */
+@implicitNotFound(
+  "Operators && and || are not supported for ${Left} and ${Right}. Both operands must be Boolean or Option[Boolean]."
+)
+opaque type BooleanType[Left, Right, Result] = Unit
+
+private[frame4s] object BooleanType:
+  given BooleanType[Boolean, Boolean, Boolean] = ()
+  given BooleanType[Option[Boolean], Boolean, Option[Boolean]] = ()
+  given BooleanType[Boolean, Option[Boolean], Option[Boolean]] = ()
+  given BooleanType[Option[Boolean], Option[Boolean], Option[Boolean]] = ()
+
+/** Closed evidence for unary numeric negation. */
+@implicitNotFound(
+  "Unary - requires Int, Long, Float, Double, or Option of one of those types; found ${A}."
+)
+opaque type NumericType[A] = Unit
+
+private[frame4s] object NumericType:
+  given required[A <: (Int | Long | Float | Double)]: NumericType[A] = ()
+  given optional[A <: (Int | Long | Float | Double)]: NumericType[Option[A]] = ()
+
+/** Closed evidence for Boolean truth predicates. */
+@implicitNotFound("isTrue and isFalse require Boolean or Option[Boolean]; found ${A}.")
+opaque type BooleanValue[A] = Unit
+
+private[frame4s] object BooleanValue:
+  given BooleanValue[Boolean] = ()
+  given BooleanValue[Option[Boolean]] = ()
+
+/** Closed evidence for ordered reductions. */
+@implicitNotFound(
+  "min and max require Boolean, Int, Long, Float, Double, String, TimestampMicros, or Option of one of those types; found ${A}."
+)
+opaque type OrderedValue[A] = Unit
+
+private[frame4s] object OrderedValue:
+  given required[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : OrderedValue[A] = ()
+  given optional[A <: (Boolean | Int | Long | Float | Double | String | TimestampMicros)]
+      : OrderedValue[Option[A]] = ()
+
+/** Closed evidence for square-root expressions. */
+@implicitNotFound(
+  "sqrt requires Float, Double, Option[Float], or Option[Double]; found ${A}."
+)
+opaque type FloatingType[A] = Unit
+
+private[frame4s] object FloatingType:
+  given required[A <: (Float | Double)]: FloatingType[A] = ()
+  given optional[A <: (Float | Double)]: FloatingType[Option[A]] = ()
+
+type ReductionResult[A] = Nullable[A]
 
 final private[frame4s] case class NamedAggregateExpression(
     name: String,

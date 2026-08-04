@@ -117,7 +117,7 @@ class TypeDisciplineRegressionSuite extends munit.FunSuite:
     val batch = get(
       RecordBatch(schema, Vector(get(ColumnArray.float64(Array(Double.PositiveInfinity, 1.0)))))
     )
-    val table = get(Table[Values](Vector(batch)))
+    val table = get(Table.takeOwnership[Values](Vector(batch)))
     val source = get(Frame.values[Values](reference))
     val query = source
       .groupBy(_ => EmptyTuple)
@@ -125,7 +125,7 @@ class TypeDisciplineRegressionSuite extends munit.FunSuite:
     try
       val collected = ReferenceInterpreter
         .prepare(query.plan, ReferenceSources.empty.bind(reference, table))
-        .collect[(avg: Double)]
+        .collect[(avg: Option[Double])]
       collected.foreach: output =>
         // IEEE sum/count over [+Inf, 1.0] is +Infinity, not NaN.
         assertEquals(

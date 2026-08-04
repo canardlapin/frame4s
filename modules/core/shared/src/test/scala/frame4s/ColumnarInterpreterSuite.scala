@@ -146,12 +146,12 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         Right(
           Vector(
             Vector(
-              ScalarValue.Utf8("keep"),
+              ScalarValue.checkedUtf8("keep"),
               ScalarValue.Float64(1.8),
               ScalarValue.Float64(81.0 / (1.8 * 1.8))
             ),
             Vector(
-              ScalarValue.Utf8("edge"),
+              ScalarValue.checkedUtf8("edge"),
               ScalarValue.Float64(1.7),
               ScalarValue.Float64(68.0 / (1.7 * 1.7))
             )
@@ -221,8 +221,8 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         result.rows,
         Right(
           Vector(
-            Vector(ScalarValue.Utf8("one")),
-            Vector(ScalarValue.Utf8("四"))
+            Vector(ScalarValue.checkedUtf8("one")),
+            Vector(ScalarValue.checkedUtf8("四"))
           )
         )
       )
@@ -244,7 +244,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         ids.close()
         words.close()
         fail(error.message)
-    val input = value(Table[Input](Vector(batch)))
+    val input = value(Table.takeOwnership[Input](Vector(batch)))
     val ref = reference("columnar-expression-pipeline-dictionary")
     val query: Frame[Output] = value(Frame.values[Input](ref))
       .filter(row => row.col("id") >= 2)
@@ -261,8 +261,8 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         result.rows,
         Right(
           Vector(
-            Vector(ScalarValue.Utf8("beta")),
-            Vector(ScalarValue.Utf8("alpha"))
+            Vector(ScalarValue.checkedUtf8("beta")),
+            Vector(ScalarValue.checkedUtf8("alpha"))
           )
         )
       )
@@ -290,9 +290,9 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         result.rows,
         Right(
           Vector(
-            Vector(ScalarValue.Int32(1), ScalarValue.Utf8("row-1"), ScalarValue.Int32(2)),
-            Vector(ScalarValue.Int32(2), ScalarValue.Utf8("row-2"), ScalarValue.Int32(5)),
-            Vector(ScalarValue.Int32(3), ScalarValue.Utf8("row-3"), ScalarValue.Int32(8))
+            Vector(ScalarValue.Int32(1), ScalarValue.checkedUtf8("row-1"), ScalarValue.Int32(2)),
+            Vector(ScalarValue.Int32(2), ScalarValue.checkedUtf8("row-2"), ScalarValue.Int32(5)),
+            Vector(ScalarValue.Int32(3), ScalarValue.checkedUtf8("row-3"), ScalarValue.Int32(8))
           )
         )
       )
@@ -357,7 +357,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       assert(run.receipt.physicalPlan.contains("oracle=ReferenceExecution"))
       assertEquals(
         result.rows,
-        Right(Vector(Vector(ScalarValue.Int32(2), ScalarValue.Utf8("b"))))
+        Right(Vector(Vector(ScalarValue.Int32(2), ScalarValue.checkedUtf8("b"))))
       )
     finally
       result.close()
@@ -404,14 +404,14 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         Right(
           Vector(
             Vector(
-              ScalarValue.Utf8("a"),
+              ScalarValue.checkedUtf8("a"),
               ScalarValue.Int64(2L),
               ScalarValue.Float64(4.0),
               ScalarValue.Float64(2.0),
               ScalarValue.Float64(1.0)
             ),
             Vector(
-              ScalarValue.Utf8("b"),
+              ScalarValue.checkedUtf8("b"),
               ScalarValue.Int64(1L),
               ScalarValue.Null,
               ScalarValue.Null,
@@ -453,9 +453,9 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         result.rows,
         Right(
           Vector(
-            Vector(ScalarValue.Utf8("a"), ScalarValue.Float64(4.0)),
-            Vector(ScalarValue.Utf8("b"), ScalarValue.Null),
-            Vector(ScalarValue.Utf8("long-key-abcdefgh"), ScalarValue.Float64(7.0))
+            Vector(ScalarValue.checkedUtf8("a"), ScalarValue.Float64(4.0)),
+            Vector(ScalarValue.checkedUtf8("b"), ScalarValue.Null),
+            Vector(ScalarValue.checkedUtf8("long-key-abcdefgh"), ScalarValue.Float64(7.0))
           )
         )
       )
@@ -545,22 +545,22 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         Right(
           Vector(
             Vector(
-              ScalarValue.Utf8("human"),
-              ScalarValue.Utf8("female"),
+              ScalarValue.checkedUtf8("human"),
+              ScalarValue.checkedUtf8("female"),
               ScalarValue.Int64(2L),
               ScalarValue.Float64(170.0),
               ScalarValue.Float64(55.0)
             ),
             Vector(
               ScalarValue.Null,
-              ScalarValue.Utf8("unknown"),
+              ScalarValue.checkedUtf8("unknown"),
               ScalarValue.Int64(1L),
               ScalarValue.Null,
               ScalarValue.Float64(20.0)
             ),
             Vector(
-              ScalarValue.Utf8("human"),
-              ScalarValue.Utf8("male"),
+              ScalarValue.checkedUtf8("human"),
+              ScalarValue.checkedUtf8("male"),
               ScalarValue.Int64(1L),
               ScalarValue.Float64(190.0),
               ScalarValue.Float64(90.0)
@@ -1011,7 +1011,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           var row = 0
           while row < batch.rowCount do
             val expectedLabel =
-              if index % 7 == 0 then ScalarValue.Null else ScalarValue.Utf8(s"v$index")
+              if index % 7 == 0 then ScalarValue.Null else ScalarValue.checkedUtf8(s"v$index")
             val (expectedRightKey, expectedScore) =
               if index % 2 == 0 then
                 val j = index / 2
@@ -1387,7 +1387,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
             ScalarValue.Int64(101L),
             ScalarValue.Bool(true),
             ScalarValue.Float32(1.5f),
-            ScalarValue.Utf8("one"),
+            ScalarValue.checkedUtf8("one"),
             ScalarValue.Timestamp(7L, TimeUnit.Microsecond),
             ScalarValue.Int32(1),
             ScalarValue.Float64(Double.NaN)
@@ -1498,7 +1498,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     val nanA = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
     val nanB = java.lang.Double.longBitsToDouble(0x7ff8000000000011L)
     val input = value(
-      Table[Input](
+      Table.takeOwnership[Input](
         Vector(
           dictionaryBatch(Array(0, 1), Array("a", "b"), Array(nanA, 0.0)),
           dictionaryBatch(Array(1, 0), Array("b", "a"), Array(nanB, -0.0))
@@ -1603,5 +1603,5 @@ object ColumnarInterpreterSuite:
         if value.isNaN then "nan"
         else if value == 0.0 then "zero"
         else java.lang.Double.doubleToLongBits(value).toString
-      s"$word|$floating"
+      s"${word.value}|$floating"
     case other => other.toString

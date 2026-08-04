@@ -7,6 +7,7 @@ import cats.effect.Resource
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import frame4s.*
+import _root_.fs2.Stream
 
 class FrameRuntimeSuite extends munit.FunSuite:
   type Input = (id: Int)
@@ -29,7 +30,7 @@ class FrameRuntimeSuite extends munit.FunSuite:
           schema,
           Vector(storage(ColumnArray.int32(input, tracker = tracker)))
         )
-    storage(Table[Input](batches))
+    storage(Table.takeOwnership[Input](batches))
 
   test("stream scopes each batch and preserves source ownership"):
     val tracker = new BufferTracker
@@ -127,6 +128,81 @@ class FrameRuntimeSuite extends munit.FunSuite:
           input.close()
           assertEquals(tracker.snapshot.activeOwners, 0)
       .unsafeToFuture()
+
+  test("canceling table acquisition releases every retained batch created so far"):
+    val tracker = new BufferTracker
+    val sourceBatch = storage(
+      RecordBatch(
+        schema,
+        Vector(storage(ColumnArray.int32(Array(1, 2), tracker = tracker)))
+      )
+    )
+    val baseline = tracker.snapshot
+
+    val program = for
+      started <- Deferred[IO, Unit]
+      source = new FrameSource[IO]:
+        def inspect: IO[Either[SourceError, SourceInspection]] =
+          IO.pure(
+            Right(
+              SourceInspection(
+                schema,
+                SourceCapabilities(
+                  projection = false,
+                  predicate = false,
+                  limit = false,
+                  batchSize = false,
+                  streaming = true
+                )
+              )
+            )
+          )
+
+        def plan(request: ScanRequest): IO[Either[SourceError, PlannedScan[IO]]] =
+          val emitted = Stream
+            .bracket(
+              IO.fromEither(
+                sourceBatch
+                  .slice(0, sourceBatch.rowCount)
+                  .leftMap(error => TableReadFailure(TableReadError.Storage(error)))
+              )
+            )(batch => IO(batch.close()))
+            .flatMap(Stream.emit)
+          val blocked = Stream.eval(started.complete(())).drain ++ Stream.never[IO]
+          IO.pure(
+            Right(
+              PlannedScan(
+                schema,
+                PushdownReceipt(
+                  request.requestedFeatures,
+                  Vector.empty,
+                  request.requestedFeatures,
+                  schema.fields.map(_.name)
+                ),
+                emitted ++ blocked
+              )
+            )
+          )
+
+        private[fs2] def close: IO[Either[SourceError, Unit]] = IO.pure(Right(()))
+      binding = SourceBinding[IO, Input, FrameSource[IO]](
+        reference,
+        Resource.pure[IO, FrameSource[IO]](source)
+      )
+      fiber <- FrameRuntime
+        .resource(binding)
+        .flatMap(_.collect(binding.frame))
+        .use(_ => IO.unit)
+        .start
+      _ <- started.get
+      _ <- fiber.cancel
+      _ <- IO:
+        assertEquals(tracker.snapshot, baseline)
+        sourceBatch.close()
+        assertEquals(tracker.snapshot.activeOwners, 0)
+    yield ()
+
+    program.unsafeToFuture()
 
   test("failed collection closes acquired output and source leases"):
     val tracker = new BufferTracker

@@ -8,9 +8,23 @@ class ErrorMessageSuite extends munit.FunSuite:
   private val expressionId = ExprId.derived("coverage")
   private val sourceId = SourceId.unsafe("coverage")
 
+  test("value diagnostics cover every public branch without carrying input data"):
+    val errors = Vector(
+      ValueError.NullUtf8,
+      ValueError.NullLiteral,
+      ValueError.NullDataType,
+      ValueError.NullTimeUnit
+    )
+    assert(errors.forall(_.message.nonEmpty))
+    assert(errors.forall(error => !error.message.contains("coverage")))
+
   test("schema and binding diagnostics cover every public branch"):
     val schemaErrors = Vector(
+      SchemaError.NullFields,
+      SchemaError.NullField(0),
       SchemaError.NullFieldName(1),
+      SchemaError.NullFieldType(1),
+      SchemaError.NullTimestampUnit(1),
       SchemaError.EmptyFieldName(2),
       SchemaError.DuplicateFieldName("id")
     )
@@ -37,6 +51,8 @@ class ErrorMessageSuite extends munit.FunSuite:
     val errors = Vector(
       FrameError.NullSourceId,
       FrameError.NullSourceName,
+      FrameError.NullSourceOrder,
+      FrameError.InvalidSourceOrder,
       FrameError.InvalidSourceId(""),
       FrameError.InvalidSourceName(""),
       FrameError.InvalidSchema(SchemaError.EmptyFieldName(0)),
@@ -47,6 +63,12 @@ class ErrorMessageSuite extends munit.FunSuite:
       FrameError.DuplicateColumnRequests(Vector("id", "score")),
       FrameError.InvalidColumnReference("id", 2),
       FrameError.ExpressionType(DataType.Int32, DataType.Utf8),
+      FrameError.UnsupportedUnaryExpression(UnaryOperator.Negate, DataType.Utf8),
+      FrameError.UnsupportedBinaryExpression(
+        BinaryOperator.Add,
+        DataType.Utf8,
+        DataType.Utf8
+      ),
       FrameError.NullablePredicate(expressionId),
       FrameError.InvalidExpressionScope(expressionId),
       FrameError.InvalidLimit(-1),
@@ -66,12 +88,13 @@ class ErrorMessageSuite extends munit.FunSuite:
     )
     assertEquals(
       FrameError.InvalidExpressionScope(expressionId).message,
-      "expression expr:coverage references a different input scope"
+      "expression <redacted> references a different input scope"
     )
 
   test("storage diagnostics cover every public branch"):
     val errors = Vector(
       StorageError.BufferClosed,
+      StorageError.NullInput("column values"),
       StorageError.InvalidRange(2, 4, 5),
       StorageError.InvalidValidityLength(2, 1),
       StorageError.ColumnLengthMismatch(2, 1, 0),
@@ -101,11 +124,11 @@ class ErrorMessageSuite extends munit.FunSuite:
       ExecutionError.MissingSource(sourceId),
       ExecutionError.SourceSchema(expectedSchema, actualSchema),
       ExecutionError.InvalidColumnIndex(expressionId, "left", 2, 1),
-      ExecutionError.ExpressionType(expressionId, DataType.Int32, ScalarValue.Utf8("x")),
+      ExecutionError.ExpressionType(expressionId, DataType.Int32, ScalarValue.checkedUtf8("x")),
       ExecutionError.IncompatibleValues(
         expressionId,
         ScalarValue.Int32(1),
-        ScalarValue.Utf8("x")
+        ScalarValue.checkedUtf8("x")
       ),
       ExecutionError.PredicateType(expressionId, ScalarValue.Int32(1)),
       ExecutionError.IntegerOverflow(expressionId, BinaryOperator.Add),
@@ -117,7 +140,7 @@ class ErrorMessageSuite extends munit.FunSuite:
     assert(errors.forall(_.message.nonEmpty))
     assertEquals(
       ExecutionError.IntegerOverflow(expressionId, BinaryOperator.Add).message,
-      "integer overflow in Add for expression expr:coverage"
+      "integer overflow in Add for expression <redacted>"
     )
 
   test("table-read diagnostics cover every public branch"):
@@ -126,6 +149,8 @@ class ErrorMessageSuite extends munit.FunSuite:
       TableReadError.RowOutOfBounds(2, 1),
       TableReadError.SchemaMismatch(expectedSchema, actualSchema),
       TableReadError.InvalidBatchSize(0),
+      TableReadError.InputFailure(TableInputStage.Next, 3L, "injected failure"),
+      TableReadError.InvalidValue(1, 0, "id", ValueError.NullUtf8),
       TableReadError.ScalarDecode(
         1,
         0,
@@ -138,7 +163,7 @@ class ErrorMessageSuite extends munit.FunSuite:
         1,
         0,
         "id",
-        ScalarValue.Utf8("x"),
+        ScalarValue.checkedUtf8("x"),
         DataType.Int32,
         nullable = true
       ),
@@ -148,10 +173,10 @@ class ErrorMessageSuite extends munit.FunSuite:
 
     assert(errors.forall(_.message.nonEmpty))
     assertEquals(
-      errors(4).message,
+      errors(6).message,
       "row 1 column 0 ('id') value Null cannot be decoded as Int32"
     )
     assertEquals(
-      errors(5).message,
-      "row 1 column 0 ('id') value Utf8(x) cannot be decoded as Int32 or null"
+      errors(7).message,
+      "row 1 column 0 ('id') value Utf8(<redacted>) cannot be decoded as Int32 or null"
     )

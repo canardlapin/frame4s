@@ -149,7 +149,7 @@ class ReferenceState:
   ): Table[Facts] =
     val schema = summon[SchemaDescriptor[Facts]].schema
     storage:
-      Table[Facts](
+      Table.takeOwnership[Facts](
         Vector(
           storage:
             RecordBatch(
@@ -169,7 +169,7 @@ class ReferenceState:
   ): Table[JoinLeft] =
     val schema = summon[SchemaDescriptor[JoinLeft]].schema
     storage:
-      Table[JoinLeft](
+      Table.takeOwnership[JoinLeft](
         Vector(
           storage:
             RecordBatch(
@@ -188,7 +188,7 @@ class ReferenceState:
   ): Table[JoinRight] =
     val schema = summon[SchemaDescriptor[JoinRight]].schema
     storage:
-      Table[JoinRight](
+      Table.takeOwnership[JoinRight](
         Vector(
           storage:
             RecordBatch(
@@ -438,7 +438,7 @@ class ReferenceBenchmarks:
     val values = Array.tabulate(state.rows)(_.toDouble)
     val valid = Array.tabulate(state.rows)(_ % 5 != 0)
     val table = storage:
-      Table[Constructed](
+      Table.takeOwnership[Constructed](
         Vector(
           storage:
             RecordBatch(

@@ -63,9 +63,16 @@ mutable dataframe API:
 - `replace` derives a new value for an existing column; and
 - `groupBy(...).aggregate(...)` computes typed summaries.
 
-Nullable columns use `Option[A]`. Nullable arithmetic requires an explicit
-nullable operand, so `row.col("height") / Some(100.0)` returns
-`Option[Double]` and propagates missing values. See the
+Operations already present in the algebra are complete rather than
+arity-specific: typed rename/drop take non-empty request tuples, using joins
+accept multiple named keys, and each typed sort key chooses its own direction
+and null placement. Every convenience still lowers to the ordinary immutable
+`Frame` plan.
+
+Nullable columns use `Option[A]`. Required and nullable operands of the same
+physical width combine directly, so `row.col("height") / 100.0` returns
+`Option[Double]` when `height` is optional and propagates missing values.
+Integral arithmetic and division are checked, with no implicit widening. See the
 [practical-pipelines guide](docs/guide/practical-pipelines.md) for a complete
 filter, derived-column, projection, and grouped-summary example.
 
@@ -75,7 +82,11 @@ filter, derived-column, projection, and grouped-summary example.
   Arrow-compatible local storage, normalization, and the cross-platform
   semantic reference interpreter. It has no external runtime dependency.
 - `frame4s-fs2`: Cats Effect and FS2 execution, scoped streaming and collection,
-  CSV and TSV sources and sinks on JVM and Scala.js, and JVM Apache Arrow IPC.
+  plus CSV and TSV sources and sinks on JVM and Scala.js. It has no Apache
+  Arrow dependency or Arrow-specific JVM requirement.
+- `frame4s-arrow`: optional JVM-only Apache Arrow IPC source and sink support.
+  It depends on `frame4s-fs2` and admits only timezone-free microsecond
+  timestamps in `0.1`.
 - `frame4s-testkit`: a non-published, cross-built repository court containing
   deterministic generators, shrinkers, backend-conformance laws, and
   compile-time specimens.
@@ -84,12 +95,17 @@ filter, derived-column, projection, and grouped-summary example.
 - `frame4s-first-contact`: a non-published downstream-package specimen that
   continuously proves the public typed-source-to-query-to-bounded-output path.
 
-The reference interpreter defines semantics and provides a small useful local
-backend. It remains the backend used by the public `FrameRuntime`. A separate
-internal columnar candidate now covers general typed expression pipelines and
-projected nullable grouping, but it is benchmark and conformance evidence for
-future backend work, not a public runtime selection. Production integrations
-such as Polars, DuckDB, or Parquet still belong in optional adapters.
+The reference interpreter is the semantic oracle and remains publicly
+selectable. For materializing collection, `FrameRuntime` uses
+`EnginePolicy.Auto`: admitted plans run on the in-process columnar engine, and
+declined plans return a typed fallback reason before running on the reference
+backend. `ReferenceOnly` and `RequireColumnar` make either boundary explicit.
+Streaming takes a different route: source, project, filter, limit, and
+`unionAll` pull reference batches incrementally, while aggregate, join, and
+sort report their materialization boundary. This is a useful local engine, not
+a claim of spill, distributed execution, or production analytical-database
+performance. External engines and additional formats still belong in optional
+adapters.
 
 ## Status
 
@@ -105,7 +121,15 @@ The intended artifacts are:
 ```scala
 libraryDependencies += "io.github.canardlapin" %%% "frame4s-core" % version
 libraryDependencies += "io.github.canardlapin" %%% "frame4s-fs2" % version
+
+// Optional and JVM-only. Use %% rather than %%%.
+libraryDependencies += "io.github.canardlapin" %% "frame4s-arrow" % version
 ```
+
+Programs that use `frame4s-arrow` must start the JVM with
+`--add-opens=java.base/java.nio=ALL-UNNAMED`. CSV- and TSV-only programs do not
+need that option. The [Arrow IPC guide](docs/guide/arrow-ipc.md) gives the full
+resource and timestamp contract.
 
 No released version is implied by the snapshot version in the build.
 
@@ -123,6 +147,12 @@ Other JDK, Node.js, Scala, sbt, and Scala.js versions may work, but are not part
 of the `0.1` support claim until they have an explicit CI and staged-consumer
 receipt.
 
+External JVM and Scala.js consumers are compiled at 32, 48, 128, 256, and 512
+columns without inheriting repository-only inline limits. The practical 0.1
+schema-width envelope is 256 columns. The 512-column court passes, but is a
+compile-cost stress tier measured in minutes rather than seconds; see the
+[operation map](docs/operations.md#schema-width-envelope) for the exact scope.
+
 Run every supported platform:
 
 ```sh
@@ -135,13 +165,18 @@ Performance claims are governed by the
 [ratified budgets](docs/benchmarks/budgets.md); the published receipt includes
 the workloads frame4s currently loses.
 
-The current 10,000-row
+The historical 10,000-row
 [practical-pipeline receipt](docs/benchmarks/receipts/2026-07-29-dplyr-practical/dplyr/summary.md)
-records the internal columnar candidate at `0.487 ms/op` for
+records the package-internal columnar endpoint at `0.487 ms/op` for
 filter/derived-column/projection and `0.722 ms/op` for projected nullable
 grouping. The corresponding dplyr medians were `1.340 ms` and `1.594 ms` in a
-separate R process. These descriptive ratios do not imply that public
-`FrameRuntime` calls use the candidate.
+separate R process. Those descriptive ratios are not public-runtime timings.
+The later
+[public-path replacement court](docs/benchmarks/receipts/2026-08-02-p4-public-path/summary.md)
+checks actual `FrameRuntime.collectWithReceipt` engine selection and narrowly
+measures admitted filter, join, and grouping plans against direct engine
+collection. Neither receipt establishes cross-machine or production-scale
+performance.
 
 The semantic contract, resource ownership rules, and deliberate scope boundary
 are described in [the architecture](docs/design/architecture.md).

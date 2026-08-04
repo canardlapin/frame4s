@@ -1,5 +1,6 @@
 package example
 
+import frame4s.*
 import scala.compiletime.testing.typeCheckErrors
 
 class ApiContractCourtSuite extends munit.FunSuite:
@@ -23,7 +24,7 @@ class ApiContractCourtSuite extends munit.FunSuite:
       def invalid(frame: Frame[People]) =
         frame.filter(row => row.col("id") > "1")
     """)
-    assertUserFacing(errors, "Scalar operand has type String; expected Int")
+    assertUserFacing(errors, "not supported for Int and scalar String")
 
   test("the public literal factory rejects an un-ascribed raw null"):
     assertUserFacing(
@@ -45,6 +46,30 @@ class ApiContractCourtSuite extends munit.FunSuite:
       "Raw null is not a typed column value"
     )
 
+  test("checked public constructors reject ascribed null and Some(null)"):
+    assertEquals(Expr.literalChecked(null: String), Left(ValueError.NullUtf8))
+    assertEquals(
+      Expr.literalChecked(Some(null): Option[String]),
+      Left(ValueError.NullUtf8)
+    )
+    assertEquals(LiteralValue.utf8(null), Left(ValueError.NullUtf8))
+    assertEquals(ScalarValue.utf8(null), Left(ValueError.NullUtf8))
+
+    val raw = intercept[InvalidValueFailure](Expr.literal(null: String))
+    val nested = intercept[InvalidValueFailure]:
+      Expr.literal(Some(null): Option[String])
+    assertEquals(raw.error, ValueError.NullUtf8)
+    assertEquals(nested.error, ValueError.NullUtf8)
+
+  test("raw strings cannot call the UTF-8 enum cases"):
+    val errors = typeCheckErrors("""
+      import frame4s.*
+      val literal = LiteralValue.Utf8("value")
+      val scalar = ScalarValue.Utf8("value")
+    """)
+    assert(errors.nonEmpty)
+    assert(errors.exists(_.message.contains("Utf8Value")), clues(errors.map(_.message)))
+
   test("exact scalar operands reject numeric widening"):
     val errors = typeCheckErrors("""
       import frame4s.*
@@ -52,16 +77,16 @@ class ApiContractCourtSuite extends munit.FunSuite:
       def invalid(frame: Frame[People]) =
         frame.filter(row => row.col("id") > 0L)
     """)
-    assertUserFacing(errors, "Scalar operand has type Long; expected Int")
+    assertUserFacing(errors, "not supported for Int and scalar Long")
 
-  test("nullable columns reject a non-optional scalar operand"):
+  test("nullable columns accept a required scalar and lift the result"):
     val errors = typeCheckErrors("""
       import frame4s.*
       type People = (score: Option[Double])
-      def invalid(frame: Frame[People]) =
+      def valid(frame: Frame[People]) =
         frame.filter(row => (row.col("score") > 0.0).isTrue)
     """)
-    assertUserFacing(errors, "Scalar operand has type Double; expected Option[Double]")
+    assertEquals(errors, Nil)
 
   test("raw projected columns retain duplicate-name checking"):
     assertUserFacing(

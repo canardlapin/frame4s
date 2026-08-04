@@ -36,14 +36,32 @@ def rawNull(frame: Frame[Person]) =
   frame.filter(row => row.col("name") === null)
 ```
 
-Under Scala's default nullability mode, a caller can first lie to the compiler
-with `val value: String = null`. Once that happens, a library sees only
-`String`; frame4s cannot recover the discarded fact. The public guarantee is
-therefore precise: un-ascribed `null` is rejected at literal and operand entry
-points, and `Option[A]` is the only supported nullable schema type.
+Projects compiled without explicit nulls can still place raw null inside a
+value declared as `String`, or inside `Some(null)`. frame4s checks those values
+when it constructs a literal. The direct typed syntax stops immediately with
+`InvalidValueFailure`; it does not return an expression or plan. Use the total
+constructor when the value came from Java or another untrusted boundary:
 
-The repository's compile-time court separately protects the concise diagnostic
-wording used by the public API.
+```scala mdoc
+val checked = Expr.literalChecked(null: String)
+checked.left.map(_.message)
+```
+
+Dynamic literals and storage scalars use the same boundary through
+`LiteralValue.utf8` and `ScalarValue.utf8`. Their UTF-8 cases store an opaque
+`Utf8Value`, so a successfully constructed case cannot contain raw null.
+`None` remains the only supported representation of a missing typed value.
+
+The repository court protects both the compile-time `null` diagnostic and the
+runtime boundary for an ascribed null or `Some(null)`.
+
+Planning, storage, execution, and adapter failures use separate structured
+ADTs. In particular, source acquisition and streams raise `SourceFailure`, a
+runtime binding adds its `SourceId` in `RuntimeBindingError.Source`, and sinks
+return `Left(SinkError)` for ordinary failures. Their public messages are
+bounded and redact rejected values and exception text. Inspect `cause` only in
+an explicit debugging path. The complete repository decision is recorded in
+`docs/design/adr-0009-structured-adapter-failures.md`.
 
 Next, compose these expressions into
 [relational operations](relational-operations.md).

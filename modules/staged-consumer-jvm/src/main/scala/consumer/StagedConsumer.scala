@@ -23,10 +23,35 @@ object StagedConsumer extends IOApp.Simple:
           row.col("score").sqrt.as("root")
         )
 
-    for
-      rendered <- binding.render(query, TableRenderOptions(maxRows = 4, maxWidth = 60))
-      _ <- IO.raiseWhen(!rendered.contains("東京"))(
-        new IllegalStateException("staged JVM consumer lost its typed UTF-8 row")
-      )
-      _ <- IO.println("staged-jvm=ok")
-    yield ()
+    FrameRuntime
+      .resource(binding)
+      .flatMap(_.collectWithReceipt(query))
+      .use: execution =>
+        for
+          rendered <- IO.fromEither(
+            execution.table
+              .show(TableRenderOptions(maxRows = 4, maxWidth = 60))
+              .left
+              .map(TableReadFailure.apply)
+          )
+          engine <- IO.fromOption(execution.receipt.engine)(
+            new IllegalStateException("staged JVM collect produced no engine receipt")
+          )
+          _ <- IO.raiseWhen(
+            engine.engine != EngineId.Columnar || engine.fallback.nonEmpty
+          )(
+            new IllegalStateException(s"unexpected staged JVM engine receipt: $engine")
+          )
+          _ <- IO.raiseWhen(
+            execution.receipt.sources.map(_.pushdown.columnsRead) !=
+              Vector(Vector("id", "label", "score"))
+          )(
+            new IllegalStateException(
+              s"unexpected staged JVM source receipt: ${execution.receipt.sources}"
+            )
+          )
+          _ <- IO.raiseWhen(!rendered.contains("東京"))(
+            new IllegalStateException("staged JVM consumer lost its typed UTF-8 row")
+          )
+          _ <- IO.println("staged-jvm=ok")
+        yield ()

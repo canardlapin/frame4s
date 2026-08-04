@@ -19,40 +19,97 @@ class SmallAlgebraSuite extends munit.FunSuite:
       .collect[S](using frame.descriptor)
       .fold(error => fail(error.message), identity)
 
+  test("tuple-recursive edit, using-join, and per-key sort APIs typecheck"):
+    val errors = compileErrors("""
+      import frame4s.*
+
+      type Left = (group: Int, id: Int, label: String, score: Option[Double])
+      type Right = (id: Int, group: Int, note: String)
+      val left: Frame[Left] = ???
+      val right: Frame[Right] = ???
+
+      val renamed: Frame[(cohort: Int, key: Int, name: String, score: Option[Double])] =
+        left.renameAll((
+          RenameRequest("group", "cohort"),
+          RenameRequest("id", "key"),
+          RenameRequest("label", "name")
+        ))
+      val dropped: Frame[(group: Int)] = left.dropAll((
+        DropRequest("id"),
+        DropRequest("label"),
+        DropRequest("score")
+      ))
+      val joined: Frame[(group: Int, id: Int, label: String, score: Option[Double], note: String)] =
+        left.innerJoinUsing(right, (UsingKey("group"), UsingKey("id")))
+      val sorted: Frame[Left] = left.sortBy(
+        row => SortKey(row.col("group")),
+        row => SortKey(row.col("score")).descending.nullsFirst
+      )
+      (renamed, dropped, joined, sorted)
+    """)
+
+    assertEquals(errors, "")
+
   test("rename, drop, and replace lower to exact Project schemas"):
-    type Input = (id: Int, label: String, score: Option[Double])
-    type Renamed = (id: Int, name: String, score: Option[Double])
-    type Dropped = (id: Int, label: String)
-    type Replaced = (id: String, label: String, score: Option[Double])
-    type RenamedMany = (key: Int, name: String, score: Option[Double])
+    type Input = (id: Int, label: String, score: Option[Double], active: Boolean)
+    type Renamed = (id: Int, name: String, score: Option[Double], active: Boolean)
+    type Dropped = (id: Int, label: String, active: Boolean)
+    type Replaced = (id: String, label: String, score: Option[Double], active: Boolean)
+    type RenamedMany = (key: Int, name: String, value: Option[Double], active: Boolean)
+    type Swapped = (label: Int, id: String, score: Option[Double], active: Boolean)
     type DroppedMany = (label: String)
 
     val ref = reference("projection-conveniences")
-    val input = table[Input](Vector((id = 1, label = "a", score = Some(2.0))))
+    val input = table[Input](
+      Vector((id = 1, label = "a", score = Some(2.0), active = true))
+    )
     val frame = Frame.values[Input](ref).fold(error => fail(error.message), identity)
     val renamed: Frame[Renamed] = frame.rename("label", "name")
     val dropped: Frame[Dropped] = frame.drop("score")
     val replaced: Frame[Replaced] = frame.replace("id")(_.col("label"))
     val renamedMany: Frame[RenamedMany] =
-      frame.renameAll("id" -> "key", "label" -> "name")
-    val droppedMany: Frame[DroppedMany] = frame.dropAll("id", "score")
+      frame.renameAll(
+        (
+          RenameRequest("id", "key"),
+          RenameRequest("label", "name"),
+          RenameRequest("score", "value")
+        )
+      )
+    val swapped: Frame[Swapped] = frame.renameAll(
+      (RenameRequest("id", "label"), RenameRequest("label", "id"))
+    )
+    val droppedMany: Frame[DroppedMany] =
+      frame.dropAll(
+        (DropRequest("id"), DropRequest("score"), DropRequest("active"))
+      )
     val sources = ReferenceSources.empty.bind(ref, input)
     val renamedOut = collect(renamed, sources)
     val droppedOut = collect(dropped, sources)
     val replacedOut = collect(replaced, sources)
     val renamedManyOut = collect(renamedMany, sources)
+    val swappedOut = collect(swapped, sources)
     val droppedManyOut = collect(droppedMany, sources)
     try
-      assertEquals(renamed.schema.fields.map(_.name), Vector("id", "name", "score"))
-      assertEquals(renamedOut.row(0), Right((id = 1, name = "a", score = Some(2.0))))
-      assertEquals(droppedOut.row(0), Right((id = 1, label = "a")))
+      assertEquals(
+        renamed.schema.fields.map(_.name),
+        Vector("id", "name", "score", "active")
+      )
+      assertEquals(
+        renamedOut.row(0),
+        Right((id = 1, name = "a", score = Some(2.0), active = true))
+      )
+      assertEquals(droppedOut.row(0), Right((id = 1, label = "a", active = true)))
       assertEquals(
         replacedOut.row(0),
-        Right((id = "a", label = "a", score = Some(2.0)))
+        Right((id = "a", label = "a", score = Some(2.0), active = true))
       )
       assertEquals(
         renamedManyOut.row(0),
-        Right((key = 1, name = "a", score = Some(2.0)))
+        Right((key = 1, name = "a", value = Some(2.0), active = true))
+      )
+      assertEquals(
+        swappedOut.row(0),
+        Right((label = 1, id = "a", score = Some(2.0), active = true))
       )
       assertEquals(droppedManyOut.row(0), Right(Tuple1("a")))
       Vector(
@@ -60,6 +117,7 @@ class SmallAlgebraSuite extends munit.FunSuite:
         dropped,
         replaced,
         renamedMany,
+        swapped,
         droppedMany
       ).foreach: projected =>
         assert(projected.explain.startsWith("Project["))
@@ -69,6 +127,7 @@ class SmallAlgebraSuite extends munit.FunSuite:
       droppedOut.close()
       replacedOut.close()
       renamedManyOut.close()
+      swappedOut.close()
       droppedManyOut.close()
       input.close()
 
@@ -117,9 +176,66 @@ class SmallAlgebraSuite extends munit.FunSuite:
       import frame4s.*
       type S = (id: Int, label: String)
       val frame: Frame[S] = ???
-      frame.dropAll("id", "id")
+      frame.dropAll((DropRequest("id"), DropRequest("id")))
     """)
     assert(clue(duplicateRequests).contains("duplicated"))
+
+    val missingRequest = compileErrors("""
+      import frame4s.*
+      type S = (id: Int, label: String)
+      val frame: Frame[S] = ???
+      frame.renameAll(Tuple1(RenameRequest("missing", "other")))
+    """)
+    val atomicCollision = compileErrors("""
+      import frame4s.*
+      type S = (id: Int, label: String)
+      val frame: Frame[S] = ???
+      frame.renameAll(Tuple1(RenameRequest("id", "label")))
+    """)
+    val emptyRequests = compileErrors("""
+      import frame4s.*
+      type S = (id: Int, label: String)
+      val frame: Frame[S] = ???
+      frame.dropAll(EmptyTuple)
+    """)
+    assert(clue(missingRequest).contains("missing"))
+    assert(clue(missingRequest).contains("does not exist"))
+    assert(clue(atomicCollision).contains("label"))
+    assert(clue(atomicCollision).contains("overlap"))
+    assert(clue(emptyRequests).contains("At least one"))
+
+  test("typed multikey using joins reject missing, duplicate, and mismatched keys"):
+    val missing = compileErrors("""
+      import frame4s.*
+      type Left = (id: Int, group: Int, leftValue: String)
+      type Right = (group: Int, id: Int, rightValue: String)
+      val left: Frame[Left] = ???
+      val right: Frame[Right] = ???
+      left.innerJoinUsing(right, (UsingKey("id"), UsingKey("missing")))
+    """)
+    val duplicate = compileErrors("""
+      import frame4s.*
+      type Left = (id: Int, group: Int, leftValue: String)
+      type Right = (group: Int, id: Int, rightValue: String)
+      val left: Frame[Left] = ???
+      val right: Frame[Right] = ???
+      left.innerJoinUsing(right, (UsingKey("id"), UsingKey("id")))
+    """)
+    val mistyped = compileErrors("""
+      import frame4s.*
+      type Left = (id: Int, group: Int, leftValue: String)
+      type Right = (group: String, id: Int, rightValue: String)
+      val left: Frame[Left] = ???
+      val right: Frame[Right] = ???
+      left.innerJoinUsing(right, (UsingKey("id"), UsingKey("group")))
+    """)
+    assert(clue(missing).contains("missing"))
+    assert(clue(missing).contains("does not exist"))
+    assert(clue(duplicate).contains("id"))
+    assert(clue(duplicate).contains("duplicated"))
+    assert(clue(mistyped).contains("group"))
+    assert(clue(mistyped).contains("Int"))
+    assert(clue(mistyped).contains("String"))
 
   test("key-only grouping is public in typed and dynamic paths"):
     type Input = (id: Int, label: String)
@@ -213,12 +329,14 @@ class SmallAlgebraSuite extends munit.FunSuite:
       RecordBatch(descriptor.schema, Vector(encoded))
         .fold(error => fail(error.message), identity)
 
-    val input = Table[Input](
-      Vector(
-        dictionaryBatch(Array(0, 1), Array("a", "b")),
-        dictionaryBatch(Array(1, 0), Array("b", "a"))
+    val input = Table
+      .takeOwnership[Input](
+        Vector(
+          dictionaryBatch(Array(0, 1), Array("a", "b")),
+          dictionaryBatch(Array(1, 0), Array("b", "a"))
+        )
       )
-    ).fold(error => fail(error.message), identity)
+      .fold(error => fail(error.message), identity)
     val ref = reference("dictionary-distinct")
     val frame = Frame.values[Input](ref).fold(error => fail(error.message), identity)
     val output = collect(frame.distinct, ReferenceSources.empty.bind(ref, input))
@@ -537,7 +655,10 @@ class SmallAlgebraSuite extends munit.FunSuite:
 
   test("sqrt dynamic and compile-time diagnostics reject non-floating expressions"):
     val dynamic = DynamicExpr.literal(LiteralValue.Int32(4)).sqrt
-    assertEquals(dynamic, Left(FrameError.ExpressionType(DataType.Float64, DataType.Int32)))
+    assertEquals(
+      dynamic,
+      Left(FrameError.UnsupportedUnaryExpression(UnaryOperator.Sqrt, DataType.Int32))
+    )
     val typed = compileErrors("""
       import frame4s.*
       type S = (id: Int)

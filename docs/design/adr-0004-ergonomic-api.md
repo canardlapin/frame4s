@@ -55,7 +55,8 @@ normalized, explained, reused, and executed more than once.
 
 ### Accept exact Scala values as expression operands
 
-`ExprOf[A, Origin]` will add overloads for exact operands of type `A`:
+`ExprOf[A, Origin]` accepts exact scalar operands whose required/nullable form
+has the same physical scalar type:
 
 ```scala
 row.col("id") > 0
@@ -63,14 +64,15 @@ row.col("score") === Option(1.5)
 row.col("id") + 1
 ```
 
-Each overload constructs `Expr.literal(value)` and calls the existing
-expression-to-expression operation. It uses `ColumnType[A]`, `Ordering[A]`, or
-the closed frame4s `NumericColumn[A]` and `FractionalColumn[A]` witnesses.
-Those witnesses admit the primitive numeric columns and their explicit
-`Option` forms without installing a global `Numeric[Option[A]]` instance.
-There is no implicit conversion, numeric widening, cast, or new expression
-node. Existing `LiteralExpr[A]` overloads remain available for a reusable
-literal.
+Each overload constructs `Expr.literal(value)` and calls the same resolved
+expression builder as the expression-to-expression operation. Closed opaque
+frame4s capabilities describe equality, ordering, arithmetic, division,
+Boolean logic, numeric unary operations, and floating operations. Their result
+type depends on both operands: a required scalar may combine with its `Option`
+form and produces an optional result. No capability admits a different numeric
+width. There is no implicit conversion, numeric widening, cast, open downstream
+witness, or new expression node. Existing `LiteralExpr[A]` overloads remain
+available for a reusable literal.
 
 The experiment exposed a current hole: with Scala explicit-nulls mode disabled,
 `column === null` compiles because `null` conforms to the reference type
@@ -85,15 +87,14 @@ Raw null is not a typed column value. Use None for a nullable column.
 This overload is a compile-time rejection. It does not throw or manufacture a
 typed null.
 
-This is the strongest honest guarantee under Scala's default nullability mode.
-Scala permits a caller to manufacture an invalid value such as
-`val value: String = null` or to ascribe `null` to `String`. After that
-ascription, the compiler exposes only `String`; no library overload can recover
-the discarded fact that the value was null. frame4s rejects an un-ascribed
-`null` at every public literal and operand boundary and represents nullable
-columns only as `Option[A]`. It does not claim to diagnose a caller that has
-already lied to Scala's type system. The E1 and E5 courts keep these two cases
-separate so the public guarantee remains attainable.
+Scala also permits a project compiled without explicit nulls to manufacture an
+invalid value such as `val value: String = null` or `Some(null)`. ADR-0008
+supersedes this ADR's original handling of those cases. UTF-8 literals and
+scalars now store a validated non-null wrapper. Checked constructors return
+`ValueError.NullUtf8`; direct typed expression syntax performs the same check
+and raises `InvalidValueFailure` before returning an expression or plan. The E1
+and E5 courts retain the compile-time `Null` diagnostic and also exercise the
+runtime boundary for an ascribed null.
 
 ### Preserve names on raw column expressions
 
@@ -291,8 +292,9 @@ Implementation and release certification must prove:
   error lifting without losing the typed query.
 - `ColumnExprOf` becomes a public implementation type, but it requires no
   annotation or import at call sites.
-- Direct operands add overloads, so E2 must retain narrow, 32-column, and
-  48-column compile-time and diagnostic receipts.
+- Direct operands add overloads, so the downstream compile and diagnostic court
+  remains mandatory. ADR 0012 extends that court through 128, 256, and 512
+  columns and removes its dependence on repository inline settings.
 - Single-source constructors cannot be combined in a multi-source runtime.
   Callers opt into the existing explicit-reference constructors when source
   identity matters.

@@ -21,20 +21,59 @@ enum RuntimeBindingError:
   case SourceSchema(id: SourceId, expected: Schema, actual: Schema)
   case Source(id: SourceId, error: SourceError)
 
-  def message: String = this match
-    case DuplicateSource(id)                     => s"source '${id.value}' is bound more than once"
-    case SingleSourceIdentityInMultiBinding(ids) =>
-      val rendered = ids.map(id => s"'${id.value}'").mkString(", ")
-      s"single-source bindings $rendered cannot be combined; construct each source with an explicit SourceRef"
-    case MissingSource(id)                        => s"no source is bound for '${id.value}'"
-    case ConflictingPlanSchema(id, first, second) =>
-      s"source '${id.value}' is used with conflicting schemas $first and $second"
-    case SourceSchema(id, expected, actual) =>
-      s"source '${id.value}' schema $actual does not match typed schema $expected"
-    case Source(id, error) => s"source '${id.value}': ${error.message}"
+  def cause: Option[Throwable] = this match
+    case Source(_, error) => error.cause
+    case _                => None
 
-final case class RuntimeBindingFailure(error: RuntimeBindingError)
-    extends RuntimeException(error.message)
+  def message: String =
+    AdapterMessage.bounded:
+      this match
+        case DuplicateSource(id) => s"source '${id.value}' is bound more than once"
+        case SingleSourceIdentityInMultiBinding(ids) =>
+          val rendered = ids.map(id => s"'${id.value}'").mkString(", ")
+          s"single-source bindings $rendered cannot be combined; construct each source with an explicit SourceRef"
+        case MissingSource(id)                        => s"no source is bound for '${id.value}'"
+        case ConflictingPlanSchema(id, first, second) =>
+          s"source '${id.value}' is used with conflicting schemas $first and $second"
+        case SourceSchema(id, expected, actual) =>
+          s"source '${id.value}' schema $actual does not match typed schema $expected"
+        case Source(id, error) => s"source '${id.value}': ${error.message}"
+
+  override def toString: String = message
+
+final class RuntimeBindingFailure private (val error: RuntimeBindingError)
+    extends RuntimeException(error.message, error.cause.orNull)
+
+object RuntimeBindingFailure:
+  def apply(error: RuntimeBindingError): RuntimeBindingFailure =
+    new RuntimeBindingFailure(error)
+
+  def unapply(failure: RuntimeBindingFailure): Some[RuntimeBindingError] = Some(failure.error)
+
+private def runtimeSourceFailure(reference: SourceRef, error: SourceError): RuntimeBindingFailure =
+  RuntimeBindingFailure(RuntimeBindingError.Source(reference.id, error))
+
+private def runtimeSourceEffect[F[_], A](
+    reference: SourceRef,
+    effect: F[A],
+    classify: Throwable => SourceError
+)(using F: Async[F]): F[A] =
+  AdapterFailureBoundary
+    .sourceEffect(effect, classify)
+    .handleErrorWith:
+      case SourceFailure(error) => F.raiseError(runtimeSourceFailure(reference, error))
+      case fatal                => F.raiseError(fatal)
+
+private def runtimeSourceStream[F[_], A](
+    reference: SourceRef,
+    stream: Stream[F, A],
+    classify: Throwable => SourceError
+)(using F: Async[F]): Stream[F, A] =
+  AdapterFailureBoundary
+    .sourceStream(stream, classify)
+    .handleErrorWith:
+      case SourceFailure(error) => Stream.raiseError[F](runtimeSourceFailure(reference, error))
+      case fatal                => Stream.raiseError[F](fatal)
 
 private[fs2] enum BindingIdentity:
   case Explicit
@@ -201,8 +240,11 @@ final private class TypedAcquiredBinding[
   val expected: Schema = binding.descriptor.schema
 
   private def plannedScan(request: ScanRequest)(using F: Async[F]): F[PlannedScan[F]] =
-    source
-      .plan(request)
+    runtimeSourceEffect(
+      reference,
+      source.plan(request),
+      SourceError.Upstream.apply
+    )
       .flatMap:
         case Left(error) =>
           F.raiseError(RuntimeBindingFailure(RuntimeBindingError.Source(reference.id, error)))
@@ -216,12 +258,11 @@ final private class TypedAcquiredBinding[
 
   def plan(request: ScanRequest)(using F: Async[F]): F[PlannedBinding[F]] =
     plannedScan(request).map: scan =>
-      val batches = scan.batches.handleErrorWith:
-        case SourceFailure(error) =>
-          Stream.raiseError[F](
-            RuntimeBindingFailure(RuntimeBindingError.Source(reference.id, error))
-          )
-        case other => Stream.raiseError[F](other)
+      val batches = runtimeSourceStream(
+        reference,
+        scan.batches,
+        SourceError.Upstream.apply
+      )
       PlannedBinding(
         reference,
         batches,
@@ -240,7 +281,12 @@ final private class TypedAcquiredBinding[
               def closeRetained: F[Unit] =
                 retained.get.flatMap(_.traverse_(batch => F.delay(batch.close())))
 
-              val copy = scan.batches.evalMap: batch =>
+              val sourceBatches = runtimeSourceStream(
+                reference,
+                scan.batches,
+                SourceError.Upstream.apply
+              )
+              val copy = sourceBatches.evalMap: batch =>
                 F.uncancelable: _ =>
                   F.delay(batch.slice(0, batch.rowCount))
                     .flatMap:
@@ -256,33 +302,23 @@ final private class TypedAcquiredBinding[
                         )
                     .flatTap(value => retained.update(_ :+ value))
 
-              poll(
-                copy.compile.drain.handleErrorWith:
-                  case SourceFailure(error) =>
-                    F.raiseError(
-                      RuntimeBindingFailure(
-                        RuntimeBindingError.Source(reference.id, error)
-                      )
-                    )
-                  case other => F.raiseError(other)
-              )
+              poll(copy.compile.drain)
                 .guaranteeCase:
                   case Outcome.Succeeded(_) => F.unit
                   case _                    => closeRetained
                 .flatMap: _ =>
                   retained.get.flatMap: batches =>
-                    Table[S](batches)(using binding.descriptor) match
+                    Table.takeOwnership[S](batches)(using binding.descriptor) match
                       case Right(table) => F.pure((table, scan.receipt))
                       case Left(error)  =>
-                        closeRetained *>
-                          F.raiseError[(Table[S], PushdownReceipt)](
-                            RuntimeBindingFailure(
-                              RuntimeBindingError.Source(
-                                reference.id,
-                                SourceError.Storage(error)
-                              )
+                        F.raiseError[(Table[S], PushdownReceipt)](
+                          RuntimeBindingFailure(
+                            RuntimeBindingError.Source(
+                              reference.id,
+                              SourceError.Storage(error)
                             )
                           )
+                        )
       )((table, _) => F.delay(table.close()))
       .map: (table, receipt) =>
         MaterializedBinding(
@@ -617,13 +653,12 @@ final class FrameRuntime[F[_]] private (
 
           collectBatches(frame, sources).flatMap:
             case OwnedCollectedBatches(engine, batches) =>
-              Table[S](batches)(using frame.descriptor) match
+              Table.takeOwnership[S](batches)(using frame.descriptor) match
                 case Right(table) => F.pure((engine, table))
                 case Left(error)  =>
-                  batches.traverse_(batch => F.delay(batch.close())) *>
-                    F.raiseError[(EngineReceipt, Table[S])](
-                      ExecutionFailure(ExecutionError.Storage(error))
-                    )
+                  F.raiseError[(EngineReceipt, Table[S])](
+                    ExecutionFailure(ExecutionError.Storage(error))
+                  )
             case ScopedCollectedBatches(engine, engineBatches) =>
               val copyBatches = engineBatches.evalMap: batch =>
                 F.uncancelable: _ =>
@@ -638,10 +673,10 @@ final class FrameRuntime[F[_]] private (
                   case _                    => closeRetained
                 .flatMap: _ =>
                   retained.get.flatMap: batches =>
-                    Table[S](batches)(using frame.descriptor) match
+                    Table.takeOwnership[S](batches)(using frame.descriptor) match
                       case Right(table) => F.pure((engine, table))
                       case Left(error)  =>
-                        closeRetained *> F.raiseError[(EngineReceipt, Table[S])](
+                        F.raiseError[(EngineReceipt, Table[S])](
                           ExecutionFailure(ExecutionError.Storage(error))
                         )
     )(acquired => F.delay(acquired(1).close()))
@@ -845,9 +880,29 @@ object FrameRuntime:
           ):
             case (acquired, binding) =>
               acquired.flatMap: current =>
-                binding.acquire.flatMap: source =>
+                val acquiredSource = Resource
+                  .makeCase(
+                    runtimeSourceEffect(
+                      binding.reference,
+                      binding.acquire.allocatedCase,
+                      SourceError.Open.apply
+                    )
+                  ): (allocated, exitCase) =>
+                    runtimeSourceEffect(
+                      binding.reference,
+                      allocated(1)(exitCase),
+                      SourceError.Close.apply
+                    )
+                  .map(_(0))
+                acquiredSource.flatMap: source =>
                   Resource
-                    .eval(source.inspect)
+                    .eval(
+                      runtimeSourceEffect(
+                        binding.reference,
+                        source.inspect,
+                        SourceError.Open.apply
+                      )
+                    )
                     .flatMap:
                       case Left(error) =>
                         Resource.eval(

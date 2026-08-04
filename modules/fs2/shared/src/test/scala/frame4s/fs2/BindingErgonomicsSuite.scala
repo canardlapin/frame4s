@@ -73,7 +73,7 @@ class BindingErgonomicsSuite extends munit.FunSuite:
                   .leftMap(error => TableReadFailure(TableReadError.Storage(error)))
                   .flatMap: values =>
                     values.traverse:
-                      case ScalarValue.Utf8(value) => Right(value)
+                      case ScalarValue.Utf8(value) => Right(value.value)
                       case other                   =>
                         Left(
                           TableReadFailure(
@@ -197,9 +197,9 @@ class BindingErgonomicsSuite extends munit.FunSuite:
 
     final class InspectFailure extends FrameSource[IO]:
       def inspect: IO[Either[SourceError, SourceInspection]] =
-        IO.pure(Left(SourceError.Open("unavailable")))
+        IO.pure(Left(SourceError.Open(new IllegalStateException("unavailable"))))
       def plan(request: ScanRequest): IO[Either[SourceError, PlannedScan[IO]]] =
-        IO.pure(Left(SourceError.Open("unavailable")))
+        IO.pure(Left(SourceError.Open(new IllegalStateException("unavailable"))))
       private[fs2] def close: IO[Either[SourceError, Unit]] = IO.pure(Right(()))
 
     Ref
@@ -226,7 +226,7 @@ class BindingErgonomicsSuite extends munit.FunSuite:
                 Left(RuntimeBindingFailure(RuntimeBindingError.Source(_, SourceError.Open(_)))),
                 Left(
                   RuntimeBindingFailure(
-                    RuntimeBindingError.Source(_, SourceError.Decode(_, _, _, _))
+                    RuntimeBindingError.Source(_, SourceError.Decode(_, _, _))
                   )
                 ),
                 Left(RuntimeBindingFailure(RuntimeBindingError.MissingSource(id))),

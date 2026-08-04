@@ -47,7 +47,7 @@ The script refuses a dirty checkout. It verifies JDK 21, Node.js 24, the
 repository-pinned sbt 1.10.5 court, the sbt 1.12.11 Central Portal release
 runner, repository administration, Actions secret names, private-reporting
 status, and a detached signature made by the recovered production key. It then
-runs the full court and isolated JVM/Scala.js artifact rehearsal.
+runs the full court and isolated JVM, Scala.js, and Arrow artifact rehearsal.
 
 Git transport and GitHub API authentication are deliberately separate. Commits
 and pushes use the repo-local `github-canardlapin` SSH route. GitHub

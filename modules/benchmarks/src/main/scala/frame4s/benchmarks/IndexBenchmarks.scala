@@ -140,7 +140,7 @@ class IndexLookupState extends IndexScanState:
     super.setup()
     val schema = summon[SchemaDescriptor[Row]].schema
     val sourceTable = storage:
-      Table[Row](
+      Table.takeOwnership[Row](
         Vector(
           storage:
             RecordBatch(

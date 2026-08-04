@@ -82,6 +82,18 @@ jobs:
       - uses: sbt/setup-sbt@1f718a9acba84199353b2835642645f66393cae7 # v1
       - run: sbt fs2JS/test
 
+  arrow-jvm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: sbt
+      - uses: sbt/setup-sbt@1f718a9acba84199353b2835642645f66393cae7 # v1
+      - run: sbt arrow/test
+
   format-and-docs:
     runs-on: ubuntu-latest
     steps:

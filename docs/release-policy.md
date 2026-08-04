@@ -20,6 +20,7 @@ release-continuity contract.
 | Normal sbt court | sbt 1.10.5 | `project/build.properties` and CI |
 | Central Portal publication runner | sbt 1.12.11 | tag-triggered release workflow and owner preflight |
 | JDK and JVM | Eclipse Temurin 21.x | CI and the R6 staged JVM consumer |
+| Optional Arrow JVM access | `--add-opens=java.base/java.nio=ALL-UNNAMED` | Arrow CI and the R6 staged Arrow consumer |
 | Scala.js toolchain | sbt-scalajs 1.22.0, CommonJS output | `project/plugins.sbt` and CI |
 | JavaScript runtime | Node.js 24.x | CI and the R6 staged Scala.js consumer |
 | Published platforms | JVM and Scala.js | R6 staged consumers and R7 artifact verification |
@@ -34,8 +35,11 @@ support claim. sbt 1.11 and newer supply the Central Portal staging and release
 commands used by `sbt-ci-release` 1.11.x; ordinary development and the
 cross-platform court remain on the repository-pinned sbt 1.10.5.
 
-The core remains dependency-free and cross-platform. Cats Effect, FS2,
-filesystem access, Apache Arrow, and engine integrations remain in adapters.
+The core remains dependency-free and cross-platform. Cats Effect, FS2, and
+filesystem access remain in the cross-platform adapter. Apache Arrow remains
+in the separate JVM-only `frame4s-arrow` adapter; base FS2 consumers neither
+resolve Arrow nor need its JVM opening. Other engine integrations remain
+optional adapters.
 
 ## Capability scope and admission
 

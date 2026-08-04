@@ -3,9 +3,11 @@ package frame4s
 import scala.NamedTuple
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Using
+import scala.util.control.NonFatal
 
 enum StorageError:
   case BufferClosed
+  case NullInput(argument: String)
   case InvalidRange(offset: Int, length: Int, available: Int)
   case InvalidValidityLength(expected: Int, actual: Int)
   case ColumnLengthMismatch(expected: Int, actual: Int, column: Int)
@@ -24,6 +26,7 @@ enum StorageError:
 
   def message: String = this match
     case BufferClosed                            => "buffer is closed"
+    case NullInput(argument)                     => s"$argument is null"
     case InvalidRange(offset, length, available) =>
       s"range offset=$offset length=$length exceeds available length $available"
     case InvalidValidityLength(expected, actual) =>
@@ -49,6 +52,35 @@ enum StorageError:
     case SourceAlreadyOpened => "owned batch source has already been opened"
     case SourceClosed        => "batch source is closed"
     case Unexpected(error)   => error
+
+private object RangeValidation:
+  def apply(offset: Int, length: Int, available: Int): Either[StorageError, Unit] =
+    if offset < 0 || length < 0 || available < 0 || offset > available ||
+      length > available - offset
+    then Left(StorageError.InvalidRange(offset, length, available))
+    else Right(())
+
+private object ResourceRelease:
+  def all[A](values: IterableOnce[A])(release: A => Unit): Unit =
+    val iterator = values.iterator
+    var failure: Option[Throwable] = None
+    while iterator.hasNext do
+      try release(iterator.next())
+      catch
+        case NonFatal(error) if failure.isEmpty => failure = Some(error)
+        case NonFatal(_)                        => ()
+    failure match
+      case Some(error) => throw error
+      case None        => ()
+
+  def quietly[A](values: IterableOnce[A])(release: A => Unit): Unit =
+    try all(values)(release)
+    catch case NonFatal(_) => ()
+
+private def boundedFailureDetail(error: Throwable): String =
+  val kind = error.getClass.getName
+  val message = Option(error.getMessage).filter(_.nonEmpty)
+  message.fold(kind)(value => s"$kind: ${value.take(160)}")
 
 enum BufferOwnership:
   case Owned
@@ -99,8 +131,8 @@ final private class BufferState(
       references -= 1
       if references == 0 then
         released = true
-        releaseExternal()
-        tracker.ownerReleased()
+        try releaseExternal()
+        finally tracker.ownerReleased()
 
   def isReleased: Boolean = synchronized(released)
 
@@ -118,13 +150,12 @@ final class Buffer private (
 
   def slice(relativeOffset: Int, sliceLength: Int): Either[StorageError, Buffer] = synchronized:
     if isClosed then Left(StorageError.BufferClosed)
-    else if relativeOffset < 0 || sliceLength < 0 || relativeOffset + sliceLength > length then
-      Left(StorageError.InvalidRange(relativeOffset, sliceLength, length))
     else
-      state
-        .retain()
-        .map: _ =>
-          new Buffer(state, offset + relativeOffset, sliceLength, ownership, tracker)
+      RangeValidation(relativeOffset, sliceLength, length).flatMap: _ =>
+        state
+          .retain()
+          .map: _ =>
+            new Buffer(state, offset + relativeOffset, sliceLength, ownership, tracker)
 
   private[frame4s] def read[A](operation: (Array[Byte], Int) => A): Either[StorageError, A] =
     synchronized:
@@ -141,8 +172,8 @@ final class Buffer private (
   def close(): Unit = synchronized:
     if !closed then
       closed = true
-      state.release()
-      tracker.viewClosed()
+      try state.release()
+      finally tracker.viewClosed()
 
 object Buffer:
   def owned(bytes: Array[Byte], tracker: BufferTracker = new BufferTracker): Buffer =
@@ -198,8 +229,26 @@ enum ScalarValue:
   case Int64(value: Long)
   case Float32(value: Float)
   case Float64(value: Double)
-  case Utf8(value: String)
+  case Utf8(value: Utf8Value)
   case Timestamp(value: Long, unit: TimeUnit)
+
+  override def toString: String = this match
+    case Null               => "Null"
+    case Bool(_)            => "Bool(<redacted>)"
+    case Int32(_)           => "Int32(<redacted>)"
+    case Int64(_)           => "Int64(<redacted>)"
+    case Float32(_)         => "Float32(<redacted>)"
+    case Float64(_)         => "Float64(<redacted>)"
+    case Utf8(_)            => "Utf8(<redacted>)"
+    case Timestamp(_, unit) => s"Timestamp(<redacted>,$unit)"
+
+object ScalarValue:
+  /** Construct a UTF-8 scalar without admitting raw null. */
+  def utf8(value: String): Either[ValueError, ScalarValue] =
+    Utf8Value.from(value).map(Utf8.apply)
+
+  private[frame4s] def checkedUtf8(value: String): ScalarValue =
+    Utf8(Utf8Value.checked(value))
 
 private object LittleEndian:
   def int(bytes: Array[Byte], offset: Int): Int =
@@ -252,9 +301,7 @@ object Validity:
       else Right(true)
 
     private[frame4s] def slice(offset: Int, sliceLength: Int): Either[StorageError, Validity] =
-      if offset < 0 || sliceLength < 0 || offset + sliceLength > length then
-        Left(StorageError.InvalidRange(offset, sliceLength, length))
-      else Right(new Required(sliceLength))
+      RangeValidation(offset, sliceLength, length).map(_ => new Required(sliceLength))
 
     private[frame4s] val layouts = Vector.empty
     private[frame4s] val copyBuffers = Right(Vector.empty)
@@ -277,9 +324,7 @@ object Validity:
             ((value.toInt >>> (absolute & 7)) & 1) == 1
 
     private[frame4s] def slice(offset: Int, sliceLength: Int): Either[StorageError, Validity] =
-      if offset < 0 || sliceLength < 0 || offset + sliceLength > length then
-        Left(StorageError.InvalidRange(offset, sliceLength, length))
-      else
+      RangeValidation(offset, sliceLength, length).flatMap: _ =>
         var nulls = 0
         var index = 0
         var error: Option[StorageError] = None
@@ -418,9 +463,7 @@ abstract private class FixedWidthArray[Self <: ColumnArray](
   ): Self
 
   override def slice(offset: Int, sliceLength: Int): Either[StorageError, Self] =
-    if offset < 0 || sliceLength < 0 || offset + sliceLength > length then
-      Left(StorageError.InvalidRange(offset, sliceLength, length))
-    else
+    RangeValidation(offset, sliceLength, length).flatMap: _ =>
       values
         .slice(0, values.length)
         .flatMap: retainedValues =>
@@ -428,12 +471,13 @@ abstract private class FixedWidthArray[Self <: ColumnArray](
             case Right(retainedValidity) =>
               Right(sliced(offset, sliceLength, retainedValues, retainedValidity))
             case Left(error) =>
-              retainedValues.close()
+              ResourceRelease.quietly(Vector(retainedValues))(_.close())
               Left(error)
 
   def close(): Unit =
-    validity.close()
-    values.close()
+    ResourceRelease.all(Vector[() => Unit](() => validity.close(), () => values.close()))(
+      operation => operation()
+    )
 
 final class Int32Array private[frame4s] (
     length: Int,
@@ -640,9 +684,7 @@ final class BooleanArray private[frame4s] (
         if valid then value(index).map(ScalarValue.Bool.apply) else Right(ScalarValue.Null)
 
   override def slice(offset: Int, sliceLength: Int): Either[StorageError, BooleanArray] =
-    if offset < 0 || sliceLength < 0 || offset + sliceLength > length then
-      Left(StorageError.InvalidRange(offset, sliceLength, length))
-    else
+    RangeValidation(offset, sliceLength, length).flatMap: _ =>
       values
         .slice(0, values.length)
         .flatMap: retainedValues =>
@@ -657,12 +699,13 @@ final class BooleanArray private[frame4s] (
                 )
               )
             case Left(error) =>
-              retainedValues.close()
+              ResourceRelease.quietly(Vector(retainedValues))(_.close())
               Left(error)
 
   def close(): Unit =
-    validity.close()
-    values.close()
+    ResourceRelease.all(Vector[() => Unit](() => validity.close(), () => values.close()))(
+      operation => operation()
+    )
 
 final class Utf8Array private[frame4s] (
     val length: Int,
@@ -771,18 +814,18 @@ final class Utf8Array private[frame4s] (
     validity
       .isValid(index)
       .flatMap: valid =>
-        if valid then value(index).map(ScalarValue.Utf8.apply) else Right(ScalarValue.Null)
+        if valid then value(index).map(ScalarValue.checkedUtf8) else Right(ScalarValue.Null)
 
   override def slice(offset: Int, sliceLength: Int): Either[StorageError, Utf8Array] =
-    if offset < 0 || sliceLength < 0 || offset + sliceLength > length then
-      Left(StorageError.InvalidRange(offset, sliceLength, length))
-    else
+    RangeValidation(offset, sliceLength, length).flatMap: _ =>
       offsets
         .slice(0, offsets.length)
         .flatMap: retainedOffsets =>
-          values
-            .slice(0, values.length)
-            .flatMap: retainedValues =>
+          values.slice(0, values.length) match
+            case Left(error) =>
+              ResourceRelease.quietly(Vector(retainedOffsets))(_.close())
+              Left(error)
+            case Right(retainedValues) =>
               validity.slice(offset, sliceLength) match
                 case Right(retainedValidity) =>
                   Right(
@@ -795,14 +838,13 @@ final class Utf8Array private[frame4s] (
                     )
                   )
                 case Left(error) =>
-                  retainedOffsets.close()
-                  retainedValues.close()
+                  ResourceRelease.quietly(Vector(retainedOffsets, retainedValues))(_.close())
                   Left(error)
 
   def close(): Unit =
-    validity.close()
-    offsets.close()
-    values.close()
+    ResourceRelease.all(
+      Vector[() => Unit](() => validity.close(), () => offsets.close(), () => values.close())
+    )(operation => operation())
 
 final class DictionaryArray private[frame4s] (
     private val indices: Int32Array,
@@ -845,14 +887,25 @@ final class DictionaryArray private[frame4s] (
           case Right(retainedDictionary) =>
             Right(new DictionaryArray(retainedIndices, retainedDictionary))
           case Left(error) =>
-            retainedIndices.close()
+            ResourceRelease.quietly(Vector(retainedIndices))(_.close())
             Left(error)
 
   def close(): Unit =
-    indices.close()
-    dictionary.close()
+    ResourceRelease.all(Vector[() => Unit](() => indices.close(), () => dictionary.close()))(
+      operation => operation()
+    )
 
 object ColumnArray:
+  private def publicInputs(
+      input: AnyRef,
+      valid: Array[Boolean],
+      tracker: BufferTracker
+  ): Either[StorageError, Unit] =
+    if input == null then Left(StorageError.NullInput("column values"))
+    else if valid == null then Left(StorageError.NullInput("column validity"))
+    else if tracker == null then Left(StorageError.NullInput("buffer tracker"))
+    else Right(())
+
   private def validity(
       length: Int,
       valid: Array[Boolean],
@@ -989,122 +1042,128 @@ object ColumnArray:
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, Int32Array] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).map: validity =>
-      val bytes = new Array[Byte](input.length * 4)
-      var index = 0
-      while index < input.length do
-        LittleEndian.putInt(bytes, index * 4, input(index))
-        index += 1
-      new Int32Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      val flags = if valid.isEmpty then allValid(input.length) else valid
+      validity(input.length, flags, tracker).map: validity =>
+        val bytes = new Array[Byte](input.length * 4)
+        var index = 0
+        while index < input.length do
+          LittleEndian.putInt(bytes, index * 4, input(index))
+          index += 1
+        new Int32Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
 
   def int64(
       input: Array[Long],
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, Int64Array] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).map: validity =>
-      val bytes = new Array[Byte](input.length * 8)
-      var index = 0
-      while index < input.length do
-        LittleEndian.putLong(bytes, index * 8, input(index))
-        index += 1
-      new Int64Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      val flags = if valid.isEmpty then allValid(input.length) else valid
+      validity(input.length, flags, tracker).map: validity =>
+        val bytes = new Array[Byte](input.length * 8)
+        var index = 0
+        while index < input.length do
+          LittleEndian.putLong(bytes, index * 8, input(index))
+          index += 1
+        new Int64Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
 
   def float32(
       input: Array[Float],
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, Float32Array] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).map: validity =>
-      val bytes = new Array[Byte](input.length * 4)
-      var index = 0
-      while index < input.length do
-        LittleEndian.putInt(bytes, index * 4, java.lang.Float.floatToRawIntBits(input(index)))
-        index += 1
-      new Float32Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      val flags = if valid.isEmpty then allValid(input.length) else valid
+      validity(input.length, flags, tracker).map: validity =>
+        val bytes = new Array[Byte](input.length * 4)
+        var index = 0
+        while index < input.length do
+          LittleEndian.putInt(bytes, index * 4, java.lang.Float.floatToRawIntBits(input(index)))
+          index += 1
+        new Float32Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
 
   def float64(
       input: Array[Double],
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, Float64Array] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).map: validity =>
-      val bytes = new Array[Byte](input.length * 8)
-      var index = 0
-      while index < input.length do
-        LittleEndian.putLong(bytes, index * 8, java.lang.Double.doubleToRawLongBits(input(index)))
-        index += 1
-      new Float64Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      val flags = if valid.isEmpty then allValid(input.length) else valid
+      validity(input.length, flags, tracker).map: validity =>
+        val bytes = new Array[Byte](input.length * 8)
+        var index = 0
+        while index < input.length do
+          LittleEndian.putLong(bytes, index * 8, java.lang.Double.doubleToRawLongBits(input(index)))
+          index += 1
+        new Float64Array(input.length, 0, Buffer.owned(bytes, tracker), validity)
 
   def bool(
       input: Array[Boolean],
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, BooleanArray] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).map: validity =>
-      val bytes = new Array[Byte]((input.length + 7) >>> 3)
-      var index = 0
-      while index < input.length do
-        if input(index) then
-          val byteIndex = index >>> 3
-          bytes(byteIndex) = (bytes(byteIndex) | (1 << (index & 7))).toByte
-        index += 1
-      new BooleanArray(input.length, 0, Buffer.owned(bytes, tracker), validity)
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      val flags = if valid.isEmpty then allValid(input.length) else valid
+      validity(input.length, flags, tracker).map: validity =>
+        val bytes = new Array[Byte]((input.length + 7) >>> 3)
+        var index = 0
+        while index < input.length do
+          if input(index) then
+            val byteIndex = index >>> 3
+            bytes(byteIndex) = (bytes(byteIndex) | (1 << (index & 7))).toByte
+          index += 1
+        new BooleanArray(input.length, 0, Buffer.owned(bytes, tracker), validity)
 
   def utf8(
       input: Array[String],
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, Utf8Array] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).flatMap: validity =>
-      val encoded = new Array[Array[Byte]](input.length)
-      var total = 0
-      var index = 0
-      var error: Option[StorageError] = None
-      while index < input.length && error.isEmpty do
-        // A slot marked invalid carries no value, so its element is never dereferenced and
-        // occupies zero bytes. A slot marked valid must carry one: a null there is a caller
-        // error and belongs in the error channel, not a NullPointerException.
-        if !flags(index) then encoded(index) = Array.emptyByteArray
-        else
-          val value = input(index)
-          if value == null then error = Some(StorageError.NullValue(index))
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      val flags = if valid.isEmpty then allValid(input.length) else valid
+      validity(input.length, flags, tracker).flatMap: validity =>
+        val encoded = new Array[Array[Byte]](input.length)
+        var total = 0
+        var index = 0
+        var error: Option[StorageError] = None
+        while index < input.length && error.isEmpty do
+          // A slot marked invalid carries no value, so its element is never dereferenced and
+          // occupies zero bytes. A slot marked valid must carry one: a null there is a caller
+          // error and belongs in the error channel, not a NullPointerException.
+          if !flags(index) then encoded(index) = Array.emptyByteArray
           else
-            val bytes = value.getBytes("UTF-8")
-            encoded(index) = bytes
-            total += bytes.length
-        index += 1
-      error match
-        case Some(value) =>
-          validity.close()
-          Left(value)
-        case None =>
-          val offsets = new Array[Byte]((input.length + 1) * 4)
-          val values = new Array[Byte](total)
-          var cursor = 0
-          index = 0
-          while index < input.length do
-            LittleEndian.putInt(offsets, index * 4, cursor)
-            val bytes = encoded(index)
-            Array.copy(bytes, 0, values, cursor, bytes.length)
-            cursor += bytes.length
-            index += 1
-          LittleEndian.putInt(offsets, input.length * 4, cursor)
-          Right(
-            new Utf8Array(
-              input.length,
-              0,
-              Buffer.owned(offsets, tracker),
-              Buffer.owned(values, tracker),
-              validity
+            val value = input(index)
+            if value == null then error = Some(StorageError.NullValue(index))
+            else
+              val bytes = value.getBytes("UTF-8")
+              encoded(index) = bytes
+              total += bytes.length
+          index += 1
+        error match
+          case Some(value) =>
+            validity.close()
+            Left(value)
+          case None =>
+            val offsets = new Array[Byte]((input.length + 1) * 4)
+            val values = new Array[Byte](total)
+            var cursor = 0
+            index = 0
+            while index < input.length do
+              LittleEndian.putInt(offsets, index * 4, cursor)
+              val bytes = encoded(index)
+              Array.copy(bytes, 0, values, cursor, bytes.length)
+              cursor += bytes.length
+              index += 1
+            LittleEndian.putInt(offsets, input.length * 4, cursor)
+            Right(
+              new Utf8Array(
+                input.length,
+                0,
+                Buffer.owned(offsets, tracker),
+                Buffer.owned(values, tracker),
+                validity
+              )
             )
-          )
 
   def timestamp(
       input: Array[Long],
@@ -1112,14 +1171,17 @@ object ColumnArray:
       valid: Array[Boolean] = Array.emptyBooleanArray,
       tracker: BufferTracker = new BufferTracker
   ): Either[StorageError, TimestampArray] =
-    val flags = if valid.isEmpty then allValid(input.length) else valid
-    validity(input.length, flags, tracker).map: validity =>
-      val bytes = new Array[Byte](input.length * 8)
-      var index = 0
-      while index < input.length do
-        LittleEndian.putLong(bytes, index * 8, input(index))
-        index += 1
-      new TimestampArray(unit, input.length, 0, Buffer.owned(bytes, tracker), validity)
+    publicInputs(input, valid, tracker).flatMap: _ =>
+      if unit == null then Left(StorageError.NullInput("timestamp unit"))
+      else
+        val flags = if valid.isEmpty then allValid(input.length) else valid
+        validity(input.length, flags, tracker).map: validity =>
+          val bytes = new Array[Byte](input.length * 8)
+          var index = 0
+          while index < input.length do
+            LittleEndian.putLong(bytes, index * 8, input(index))
+            index += 1
+          new TimestampArray(unit, input.length, 0, Buffer.owned(bytes, tracker), validity)
 
   /** Nulls in a dictionary-encoded column are carried by the index vector's validity, following
     * Arrow. A null in the dictionary itself would be invisible to `nullCount` and could therefore
@@ -1129,7 +1191,9 @@ object ColumnArray:
       indices: Int32Array,
       values: ColumnArray
   ): Either[StorageError, DictionaryArray] =
-    if values.nullCount > 0 then Left(StorageError.DictionaryContainsNull(values.nullCount))
+    if indices == null then Left(StorageError.NullInput("dictionary indices"))
+    else if values == null then Left(StorageError.NullInput("dictionary values"))
+    else if values.nullCount > 0 then Left(StorageError.DictionaryContainsNull(values.nullCount))
     else Right(new DictionaryArray(indices, values))
 
 final class RecordBatch private (
@@ -1149,27 +1213,26 @@ final class RecordBatch private (
 
   def slice(offset: Int, length: Int): Either[StorageError, RecordBatch] =
     if isClosed then Left(StorageError.BufferClosed)
-    else if offset < 0 || length < 0 || offset + length > rowCount then
-      Left(StorageError.InvalidRange(offset, length, rowCount))
     else
-      val retained = ArrayBuffer.empty[ColumnArray]
-      var index = 0
-      var error: Option[StorageError] = None
-      while index < columns.length && error.isEmpty do
-        columns(index).slice(offset, length) match
-          case Right(column) => retained += column
-          case Left(value)   => error = Some(value)
-        index += 1
-      error match
-        case Some(value) =>
-          retained.foreach(_.close())
-          Left(value)
-        case None => Right(new RecordBatch(schema, retained.toVector, length))
+      RangeValidation(offset, length, rowCount).flatMap: _ =>
+        val retained = ArrayBuffer.empty[ColumnArray]
+        var index = 0
+        var error: Option[StorageError] = None
+        while index < columns.length && error.isEmpty do
+          columns(index).slice(offset, length) match
+            case Right(column) => retained += column
+            case Left(value)   => error = Some(value)
+          index += 1
+        error match
+          case Some(value) =>
+            ResourceRelease.quietly(retained)(_.close())
+            Left(value)
+          case None => Right(new RecordBatch(schema, retained.toVector, length))
 
   def close(): Unit = synchronized:
     if !closed then
       closed = true
-      columns.foreach(_.close())
+      ResourceRelease.all(columns)(_.close())
 
 object RecordBatch:
   def apply(schema: Schema, columns: Vector[ColumnArray]): Either[StorageError, RecordBatch] =
@@ -1201,6 +1264,11 @@ object RecordBatch:
     else if rowCount < 0 then Left(StorageError.InvalidRange(0, rowCount, 0))
     else Right(new RecordBatch(schema, Vector.empty, rowCount))
 
+/** An owned materialized read view over exactly typed record batches.
+  *
+  * Obtain a table from existing batches through [[Table.takeOwnership]] or [[Table.retainFrom]] so
+  * the lifetime contract is explicit. [[Table.fromRows]] builds and owns detached storage.
+  */
 final class Table[S <: NamedTuple.AnyNamedTuple] private (
     val schema: Schema,
     private[frame4s] val batches: Vector[RecordBatch]
@@ -1324,21 +1392,65 @@ final class Table[S <: NamedTuple.AnyNamedTuple] private (
   def close(): Unit = synchronized:
     if !closed then
       closed = true
-      batches.foreach(_.close())
+      ResourceRelease.all(batches)(_.close())
 
 object Table:
-  def apply[S <: NamedTuple.AnyNamedTuple](
+  /** Transfer ownership of every supplied batch to a new table.
+    *
+    * The transfer begins when this method is called. On success, callers must not close or reuse
+    * the batches. On validation failure, this method closes every supplied batch before returning
+    * the structured error. Already closed batches are rejected.
+    */
+  def takeOwnership[S <: NamedTuple.AnyNamedTuple](
       batches: Vector[RecordBatch]
   )(using descriptor: SchemaDescriptor[S]): Either[StorageError, Table[S]] =
     val expected = descriptor.schema
-    batches.find(_.schema != expected) match
-      case Some(batch) => Left(StorageError.SchemaMismatch(expected, batch.schema))
-      case None        => Right(new Table(expected, batches))
+    validateInputs(expected, batches) match
+      case Some(error) =>
+        closeBatches(batches)
+        Left(error)
+      case None => Right(unsafeAdoptValidated(expected, batches))
+
+  /** Retain independent full-batch views for a new table.
+    *
+    * The caller keeps ownership of every supplied batch and may close them immediately after this
+    * method returns. If validation or retention fails, all views created by this invocation are
+    * closed and the supplied batches remain caller-owned.
+    */
+  def retainFrom[S <: NamedTuple.AnyNamedTuple](
+      batches: Vector[RecordBatch]
+  )(using descriptor: SchemaDescriptor[S]): Either[StorageError, Table[S]] =
+    val expected = descriptor.schema
+    validateInputs(expected, batches) match
+      case Some(error) => Left(error)
+      case None        =>
+        val retained = ArrayBuffer.empty[RecordBatch]
+        var index = 0
+        var error: Option[StorageError] = None
+        while index < batches.length && error.isEmpty do
+          val result =
+            try batches(index).slice(0, batches(index).rowCount)
+            catch case NonFatal(cause) => Left(StorageError.Unexpected(boundedFailureDetail(cause)))
+          result match
+            case Right(batch) => retained += batch
+            case Left(value)  => error = Some(value)
+          index += 1
+        error match
+          case Some(value) =>
+            closeBatches(retained.toVector)
+            Left(value)
+          case None => Right(unsafeAdoptValidated(expected, retained.toVector))
+
+  private[frame4s] def unsafeAdoptValidated[S <: NamedTuple.AnyNamedTuple](
+      schema: Schema,
+      batches: Vector[RecordBatch]
+  ): Table[S] =
+    new Table(schema, batches)
 
   /** Construct a fully owned table from detached named-tuple rows.
     *
-    * Rows are encoded in bounded batches. If any batch fails validation, all previously allocated
-    * buffers are released before the structured error is returned.
+    * Rows are encoded in bounded batches. If iteration, encoding, or batch validation fails, all
+    * previously allocated buffers are released before the structured error is returned.
     */
   def fromRows[S <: NamedTuple.AnyNamedTuple](
       rows: IterableOnce[S],
@@ -1357,33 +1469,65 @@ object Table:
       descriptor: SchemaDescriptor[S],
       codec: RowCodec[S]
   ): Either[TableReadError, Table[S]] =
+    fromRowsTrackedWithEncoder[S, S](rows, batchSize, tracker)(codec.encode)
+
+  private[frame4s] def fromRowsTrackedWithEncoder[
+      Input,
+      S <: NamedTuple.AnyNamedTuple
+  ](
+      rows: IterableOnce[Input],
+      batchSize: Int,
+      tracker: BufferTracker
+  )(
+      encode: Input => Either[RowEncodingError, Vector[ScalarValue]]
+  )(using descriptor: SchemaDescriptor[S]): Either[TableReadError, Table[S]] =
     if batchSize <= 0 then Left(TableReadError.InvalidBatchSize(batchSize))
     else
-      val batches = ArrayBuffer.empty[RecordBatch]
-      val iterator = rows.iterator
-      var error: Option[TableReadError] = None
-      var logicalStart = 0L
-      while iterator.hasNext && error.isEmpty do
-        val chunkBuilder = Vector.newBuilder[Vector[ScalarValue]]
-        var count = 0
-        while count < batchSize && iterator.hasNext do
-          chunkBuilder += codec.encode(iterator.next())
-          count += 1
-        val chunk = chunkBuilder.result()
-        TableConstruction.batch(descriptor.schema, chunk, logicalStart, tracker) match
-          case Right(batch) => batches += batch
-          case Left(value)  => error = Some(value)
-        logicalStart += chunk.length.toLong
-      error match
-        case Some(value) =>
-          batches.foreach(_.close())
-          Left(value)
-        case None =>
-          apply[S](batches.toVector) match
-            case Right(table) => Right(table)
-            case Left(value)  =>
-              batches.foreach(_.close())
-              Left(TableReadError.Storage(value))
+      inputAttempt(TableInputStage.AcquireIterator, 0L)(rows.iterator).flatMap: iterator =>
+        val batches = ArrayBuffer.empty[RecordBatch]
+        var finished = false
+        var error: Option[TableReadError] = None
+        var logicalStart = 0L
+        while !finished && error.isEmpty do
+          val chunkBuilder = Vector.newBuilder[Vector[ScalarValue]]
+          var count = 0
+          while count < batchSize && !finished && error.isEmpty do
+            val logicalRow = logicalStart + count.toLong
+            inputAttempt(TableInputStage.HasNext, logicalRow)(iterator.hasNext) match
+              case Left(value)  => error = Some(value)
+              case Right(false) => finished = true
+              case Right(true)  =>
+                inputAttempt(TableInputStage.Next, logicalRow)(iterator.next()) match
+                  case Left(value) => error = Some(value)
+                  case Right(row)  =>
+                    inputAttempt(TableInputStage.EncodeRow, logicalRow)(encode(row)) match
+                      case Left(value)          => error = Some(value)
+                      case Right(Left(invalid)) =>
+                        val field = descriptor.schema.fields(invalid.column)
+                        error = Some(
+                          TableReadError.InvalidValue(
+                            logicalRow,
+                            invalid.column,
+                            field.name,
+                            invalid.error
+                          )
+                        )
+                      case Right(Right(encoded)) =>
+                        chunkBuilder += encoded
+                        count += 1
+          val chunk = chunkBuilder.result()
+          if error.isEmpty && chunk.nonEmpty then
+            TableConstruction.batch(descriptor.schema, chunk, logicalStart, tracker) match
+              case Left(value)  => error = Some(value)
+              case Right(batch) =>
+                batches += batch
+                logicalStart += chunk.length.toLong
+        error match
+          case Some(value) =>
+            closeBatches(batches.toVector)
+            Left(value)
+          case None =>
+            takeOwnership[S](batches.toVector).left.map(TableReadError.Storage.apply)
 
   /** Construct an owned typed table directly from an exactly matching case-class product. */
   def fromProducts[P <: Product](
@@ -1394,7 +1538,34 @@ object Table:
       descriptor: SchemaDescriptor[NamedTuple.From[P]],
       codec: RowCodec[NamedTuple.From[P]]
   ): Either[TableReadError, Table[NamedTuple.From[P]]] =
-    fromRows(rows.iterator.map(ProductRows.toNamedTuple(_)), batchSize)
+    fromRowsTrackedWithEncoder[P, NamedTuple.From[P]](
+      rows,
+      batchSize,
+      new BufferTracker
+    )(value => codec.encode(ProductRows.toNamedTuple(value)))
+
+  private def validateInputs(
+      expected: Schema,
+      batches: Vector[RecordBatch]
+  ): Option[StorageError] =
+    batches.find(_.isClosed) match
+      case Some(_) => Some(StorageError.BufferClosed)
+      case None    =>
+        batches
+          .find(_.schema != expected)
+          .map(batch => StorageError.SchemaMismatch(expected, batch.schema))
+
+  private def closeBatches(batches: Vector[RecordBatch]): Unit =
+    ResourceRelease.quietly(batches)(_.close())
+
+  private def inputAttempt[A](
+      stage: TableInputStage,
+      row: Long
+  )(operation: => A): Either[TableReadError, A] =
+    try Right(operation)
+    catch
+      case NonFatal(error) =>
+        Left(TableReadError.InputFailure(stage, row, boundedFailureDetail(error)))
 
 private object TableConstruction:
   def batch(
@@ -1404,23 +1575,34 @@ private object TableConstruction:
       tracker: BufferTracker
   ): Either[TableReadError, RecordBatch] =
     val columns = ArrayBuffer.empty[ColumnArray]
-    var column = 0
-    var error: Option[TableReadError] = None
-    while column < schema.size && error.isEmpty do
-      val field = schema.fields(column)
-      val values = rows.map(_(column))
-      buildColumn(field, column, values, logicalStart, tracker) match
-        case Right(array) => columns += array
-        case Left(value)  => error = Some(value)
-      column += 1
-    error match
-      case Some(value) =>
-        columns.foreach(_.close())
-        Left(value)
-      case None =>
-        if schema.size == 0 then
-          RecordBatch.empty(schema, rows.length).left.map(TableReadError.Storage.apply)
-        else RecordBatch(schema, columns.toVector).left.map(TableReadError.Storage.apply)
+    try
+      var column = 0
+      var error: Option[TableReadError] = None
+      while column < schema.size && error.isEmpty do
+        val field = schema.fields(column)
+        val values = rows.map(_(column))
+        buildColumn(field, column, values, logicalStart, tracker) match
+          case Right(array) => columns += array
+          case Left(value)  => error = Some(value)
+        column += 1
+      error match
+        case Some(value) =>
+          ResourceRelease.quietly(columns)(_.close())
+          Left(value)
+        case None =>
+          if schema.size == 0 then
+            RecordBatch.empty(schema, rows.length).left.map(TableReadError.Storage.apply)
+          else RecordBatch(schema, columns.toVector).left.map(TableReadError.Storage.apply)
+    catch
+      case NonFatal(error) =>
+        ResourceRelease.quietly(columns)(_.close())
+        Left(
+          TableReadError.InputFailure(
+            TableInputStage.BuildBatch,
+            logicalStart,
+            boundedFailureDetail(error)
+          )
+        )
 
   private def buildColumn(
       field: Field,
@@ -1453,7 +1635,7 @@ private object TableConstruction:
       case ScalarValue.Int64(_)           => field.dataType == DataType.Int64
       case ScalarValue.Float32(_)         => field.dataType == DataType.Float32
       case ScalarValue.Float64(_)         => field.dataType == DataType.Float64
-      case ScalarValue.Utf8(value)        => field.dataType == DataType.Utf8 && value != null
+      case ScalarValue.Utf8(_)            => field.dataType == DataType.Utf8
       case ScalarValue.Timestamp(_, unit) => field.dataType == DataType.Timestamp(unit)
 
     val incompatible =
@@ -1507,7 +1689,7 @@ private object TableConstruction:
             )
           case DataType.Utf8 =>
             collect(values):
-              case ScalarValue.Utf8(value) => Some(value)
+              case ScalarValue.Utf8(value) => Some(value.value)
               case ScalarValue.Null        => Some("")
               case _                       => None
             .flatMap(array =>
@@ -1630,15 +1812,15 @@ private object TableRendering:
     error.toLeft(output.result())
 
   private def renderScalar(value: ScalarValue): String = value match
-    case ScalarValue.Null                    => "null"
-    case ScalarValue.Bool(actual)            => actual.toString
-    case ScalarValue.Int32(actual)           => actual.toString
-    case ScalarValue.Int64(actual)           => actual.toString
-    case ScalarValue.Float32(actual)         => actual.toString
-    case ScalarValue.Float64(actual)         => actual.toString
-    case ScalarValue.Utf8("")                => "\"\""
-    case ScalarValue.Utf8(actual)            => actual
-    case ScalarValue.Timestamp(actual, unit) => s"$actual@$unit"
+    case ScalarValue.Null                                 => "null"
+    case ScalarValue.Bool(actual)                         => actual.toString
+    case ScalarValue.Int32(actual)                        => actual.toString
+    case ScalarValue.Int64(actual)                        => actual.toString
+    case ScalarValue.Float32(actual)                      => actual.toString
+    case ScalarValue.Float64(actual)                      => actual.toString
+    case ScalarValue.Utf8(actual) if actual.value.isEmpty => "\"\""
+    case ScalarValue.Utf8(actual)                         => actual.value
+    case ScalarValue.Timestamp(actual, unit)              => s"$actual@$unit"
 
   private def selectColumns(widths: Vector[Int], maxWidth: Int): Vector[Int] =
     val selected = Vector.newBuilder[Int]
@@ -1711,14 +1893,10 @@ trait BatchSource:
           case Left(value)        => error = Some(value)
       error match
         case Some(value) =>
-          batches.foreach(_.close())
+          ResourceRelease.quietly(batches)(_.close())
           Left(value)
         case None =>
-          Table[S](batches.toVector) match
-            case right @ Right(_) => right
-            case left @ Left(_)   =>
-              batches.foreach(_.close())
-              left
+          Table.takeOwnership[S](batches.toVector)
 
 private def exceptionDetail(error: Throwable): String =
   Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
@@ -1749,9 +1927,9 @@ final class OwnedBatchSource private (
           def close(): Unit = synchronized:
             if !closed then
               closed = true
-              while index < input.length do
-                input(index).close()
-                index += 1
+              val remaining = input.drop(index)
+              index = input.length
+              ResourceRelease.all(remaining)(_.close())
 
 object OwnedBatchSource:
   def apply(schema: Schema, batches: Vector[RecordBatch]): Either[StorageError, OwnedBatchSource] =

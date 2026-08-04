@@ -26,6 +26,8 @@ enum BindingIssue:
 enum FrameError:
   case NullSourceId
   case NullSourceName
+  case NullSourceOrder
+  case InvalidSourceOrder
   case InvalidSourceId(id: String)
   case InvalidSourceName(name: String)
   case InvalidSchema(error: SchemaError)
@@ -36,6 +38,12 @@ enum FrameError:
   case DuplicateColumnRequests(names: Vector[String])
   case InvalidColumnReference(name: String, index: Int)
   case ExpressionType(expected: DataType, actual: DataType)
+  case UnsupportedUnaryExpression(operator: UnaryOperator, actual: DataType)
+  case UnsupportedBinaryExpression(
+      operator: BinaryOperator,
+      left: DataType,
+      right: DataType
+  )
   case NullablePredicate(id: ExprId)
   case InvalidExpressionScope(id: ExprId)
   case InvalidLimit(count: Int)
@@ -48,6 +56,8 @@ enum FrameError:
   def message: String = this match
     case NullSourceId            => "source id is null"
     case NullSourceName          => "source name is null"
+    case NullSourceOrder         => "source order is null"
+    case InvalidSourceOrder      => "source order contains null expression keys"
     case InvalidSourceId(id)     => s"source id '$id' is empty"
     case InvalidSourceName(name) => s"source name '$name' is empty"
     case InvalidSchema(error)    => error.message
@@ -62,11 +72,16 @@ enum FrameError:
       s"column reference '$name' at index $index is not valid in this scope"
     case ExpressionType(expected, actual) =>
       s"expression has type $actual; expected $expected"
+    case UnsupportedUnaryExpression(operator, actual) =>
+      s"operator ${operator.symbol} is not supported for $actual"
+    case UnsupportedBinaryExpression(operator, left, right) =>
+      s"operator ${operator.symbol} is not supported for $left and $right"
     case NullablePredicate(id) =>
-      s"predicate ${id.value} is nullable; make it total before filtering"
-    case InvalidExpressionScope(id) => s"expression ${id.value} references a different input scope"
-    case InvalidLimit(count)        => s"limit must be non-negative, found $count"
-    case NotValuesSource(id, kind)  =>
+      s"predicate ${ExprId.diagnostic(id)} is nullable; make it total before filtering"
+    case InvalidExpressionScope(id) =>
+      s"expression ${ExprId.diagnostic(id)} references a different input scope"
+    case InvalidLimit(count)       => s"limit must be non-negative, found $count"
+    case NotValuesSource(id, kind) =>
       s"source '${id.value}' has kind $kind; expected a values source"
     case EmptySort                      => "sort requires at least one expression"
     case EmptyJoinKeys                  => "using join requires at least one key"
@@ -145,6 +160,19 @@ private object ExpressionValidation:
       schema
     )
 
+  def aggregateCurrent(
+      aggregate: ResolvedAggregate,
+      token: FrameScopeToken,
+      schema: Schema
+  ): Either[FrameError, Unit] = aggregate.node match
+    case AggregateNode.Count              => Right(())
+    case AggregateNode.Sum(input)         => current(input, token, schema)
+    case AggregateNode.Mean(input)        => current(input, token, schema)
+    case AggregateNode.VariancePop(input) => current(input, token, schema)
+    case AggregateNode.StddevPop(input)   => current(input, token, schema)
+    case AggregateNode.Min(input)         => current(input, token, schema)
+    case AggregateNode.Max(input)         => current(input, token, schema)
+
   def join(
       expression: ResolvedExpr,
       leftToken: FrameScopeToken,
@@ -193,62 +221,172 @@ final class DynamicExpr private[frame4s] (private[frame4s] val resolved: Resolve
   def nullable: Boolean = resolved.nullable
 
   def ===(other: DynamicExpr): Either[FrameError, DynamicExpr] =
-    if dataType != other.dataType then Left(FrameError.ExpressionType(dataType, other.dataType))
-    else
-      val combined = ResolvedExpr(
-        ExprId.derived(s"Equal(${id.value},${other.id.value})"),
+    comparison(BinaryOperator.Equal, other)
+
+  def =!=(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    comparison(BinaryOperator.NotEqual, other)
+
+  def nullSafeEq(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    comparison(BinaryOperator.NullSafeEqual, other, total = true)
+
+  def <(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    comparison(BinaryOperator.LessThan, other)
+
+  def <=(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    comparison(BinaryOperator.LessThanOrEqual, other)
+
+  def >(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    comparison(BinaryOperator.GreaterThan, other)
+
+  def >=(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    comparison(BinaryOperator.GreaterThanOrEqual, other)
+
+  def +(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    numeric(BinaryOperator.Add, other)
+
+  def -(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    numeric(BinaryOperator.Subtract, other)
+
+  def *(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    numeric(BinaryOperator.Multiply, other)
+
+  def /(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    numeric(BinaryOperator.Divide, other)
+
+  def &&(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    boolean(BinaryOperator.And, other)
+
+  def ||(other: DynamicExpr): Either[FrameError, DynamicExpr] =
+    boolean(BinaryOperator.Or, other)
+
+  def isNull: DynamicExpr =
+    new DynamicExpr(
+      Expr.resolvedUnary(UnaryOperator.IsNull, resolved, DataType.Bool, nullable = false)
+    )
+
+  def isNotNull: DynamicExpr =
+    new DynamicExpr(
+      Expr.resolvedUnary(
+        UnaryOperator.IsNotNull,
+        resolved,
         DataType.Bool,
-        nullable || other.nullable,
-        ExprNode.Binary(BinaryOperator.Equal, resolved, other.resolved)
+        nullable = false
       )
-      Right(new DynamicExpr(combined))
+    )
 
   def isTrue: Either[FrameError, DynamicExpr] =
-    if dataType != DataType.Bool then Left(FrameError.ExpressionType(DataType.Bool, dataType))
-    else
+    booleanUnary(UnaryOperator.IsTrue): input =>
+      Expr.resolvedUnary(UnaryOperator.IsTrue, input, DataType.Bool, nullable = false)
+
+  def isFalse: Either[FrameError, DynamicExpr] =
+    booleanUnary(UnaryOperator.IsFalse): input =>
+      Expr.resolvedUnary(UnaryOperator.IsFalse, input, DataType.Bool, nullable = false)
+
+  def negate: Either[FrameError, DynamicExpr] =
+    if DynamicExpr.numeric(dataType) then
       Right:
-        new DynamicExpr(
-          ResolvedExpr(
-            ExprId.derived(s"IsTrue(${id.value})"),
-            DataType.Bool,
-            nullable = false,
-            ExprNode.Unary(UnaryOperator.IsTrue, resolved)
-          )
-        )
+        new DynamicExpr(Expr.resolvedUnary(UnaryOperator.Negate, resolved, dataType, nullable))
+    else Left(FrameError.UnsupportedUnaryExpression(UnaryOperator.Negate, dataType))
 
   def sqrt: Either[FrameError, DynamicExpr] =
     dataType match
       case DataType.Float32 | DataType.Float64 =>
         Right:
           new DynamicExpr(
-            ResolvedExpr(
-              ExprId.derived(s"Sqrt(${id.value})"),
-              dataType,
-              nullable,
-              ExprNode.Unary(UnaryOperator.Sqrt, resolved)
-            )
+            Expr.resolvedUnary(UnaryOperator.Sqrt, resolved, dataType, nullable)
           )
-      case other => Left(FrameError.ExpressionType(DataType.Float64, other))
+      case other => Left(FrameError.UnsupportedUnaryExpression(UnaryOperator.Sqrt, other))
+
+  private def comparison(
+      operator: BinaryOperator,
+      other: DynamicExpr,
+      total: Boolean = false
+  ): Either[FrameError, DynamicExpr] =
+    if dataType != other.dataType then
+      Left(FrameError.UnsupportedBinaryExpression(operator, dataType, other.dataType))
+    else
+      Right:
+        new DynamicExpr(
+          Expr.resolvedBinary(
+            operator,
+            resolved,
+            other.resolved,
+            DataType.Bool,
+            if total then false else nullable || other.nullable
+          )
+        )
+
+  private def numeric(
+      operator: BinaryOperator,
+      other: DynamicExpr
+  ): Either[FrameError, DynamicExpr] =
+    if dataType != other.dataType || !DynamicExpr.numeric(dataType) then
+      Left(FrameError.UnsupportedBinaryExpression(operator, dataType, other.dataType))
+    else
+      Right:
+        new DynamicExpr(
+          Expr.resolvedBinary(
+            operator,
+            resolved,
+            other.resolved,
+            dataType,
+            nullable || other.nullable
+          )
+        )
+
+  private def boolean(
+      operator: BinaryOperator,
+      other: DynamicExpr
+  ): Either[FrameError, DynamicExpr] =
+    if dataType != DataType.Bool || other.dataType != DataType.Bool then
+      Left(FrameError.UnsupportedBinaryExpression(operator, dataType, other.dataType))
+    else
+      Right:
+        new DynamicExpr(
+          Expr.resolvedBinary(
+            operator,
+            resolved,
+            other.resolved,
+            DataType.Bool,
+            nullable || other.nullable
+          )
+        )
+
+  private def booleanUnary(
+      operator: UnaryOperator
+  )(build: ResolvedExpr => ResolvedExpr): Either[FrameError, DynamicExpr] =
+    if dataType == DataType.Bool then Right(new DynamicExpr(build(resolved)))
+    else Left(FrameError.UnsupportedUnaryExpression(operator, dataType))
 
 object DynamicExpr:
+  private[frame4s] def numeric(dataType: DataType): Boolean = dataType match
+    case DataType.Int32 | DataType.Int64 | DataType.Float32 | DataType.Float64 => true
+    case _                                                                     => false
+
   def literal(value: LiteralValue): DynamicExpr =
-    val (dataType, nullable) = value match
-      case LiteralValue.Null(dataType)     => (dataType, true)
-      case LiteralValue.Bool(_)            => (DataType.Bool, false)
-      case LiteralValue.Int32(_)           => (DataType.Int32, false)
-      case LiteralValue.Int64(_)           => (DataType.Int64, false)
-      case LiteralValue.Float32(_)         => (DataType.Float32, false)
-      case LiteralValue.Float64(_)         => (DataType.Float64, false)
-      case LiteralValue.Utf8(_)            => (DataType.Utf8, false)
-      case LiteralValue.Timestamp(_, unit) => (DataType.Timestamp(unit), false)
-    new DynamicExpr(
-      ResolvedExpr(
-        ExprId.derived(s"literal:$value"),
-        dataType,
-        nullable,
-        ExprNode.Literal(value)
-      )
-    )
+    literalChecked(value).fold(error => throw InvalidValueFailure(error), identity)
+
+  def literalChecked(value: LiteralValue): Either[ValueError, DynamicExpr] =
+    LiteralValue
+      .validate(value)
+      .map: valid =>
+        val (dataType, nullable) = valid match
+          case LiteralValue.Null(dataType)     => (dataType, true)
+          case LiteralValue.Bool(_)            => (DataType.Bool, false)
+          case LiteralValue.Int32(_)           => (DataType.Int32, false)
+          case LiteralValue.Int64(_)           => (DataType.Int64, false)
+          case LiteralValue.Float32(_)         => (DataType.Float32, false)
+          case LiteralValue.Float64(_)         => (DataType.Float64, false)
+          case LiteralValue.Utf8(_)            => (DataType.Utf8, false)
+          case LiteralValue.Timestamp(_, unit) => (DataType.Timestamp(unit), false)
+        new DynamicExpr(
+          ResolvedExpr(
+            ExprId.literal(valid),
+            dataType,
+            nullable,
+            ExprNode.Literal(valid)
+          )
+        )
 
 /** A runtime-typed aggregate expression constructed through [[DynamicAggregate]]. */
 final class DynamicAggregate private[frame4s] (
@@ -266,7 +404,7 @@ object DynamicAggregate:
       new DynamicAggregate(
         ResolvedAggregate(
           expression.dataType,
-          expression.nullable,
+          nullable = true,
           AggregateNode.Sum(expression.resolved)
         )
       )
@@ -276,7 +414,7 @@ object DynamicAggregate:
       new DynamicAggregate(
         ResolvedAggregate(
           DataType.Float64,
-          expression.nullable,
+          nullable = true,
           AggregateNode.Mean(expression.resolved)
         )
       )
@@ -286,7 +424,7 @@ object DynamicAggregate:
       new DynamicAggregate(
         ResolvedAggregate(
           DataType.Float64,
-          expression.nullable,
+          nullable = true,
           AggregateNode.VariancePop(expression.resolved)
         )
       )
@@ -296,7 +434,7 @@ object DynamicAggregate:
       new DynamicAggregate(
         ResolvedAggregate(
           DataType.Float64,
-          expression.nullable,
+          nullable = true,
           AggregateNode.StddevPop(expression.resolved)
         )
       )
@@ -305,7 +443,7 @@ object DynamicAggregate:
     new DynamicAggregate(
       ResolvedAggregate(
         expression.dataType,
-        expression.nullable,
+        nullable = true,
         AggregateNode.Min(expression.resolved)
       )
     )
@@ -314,7 +452,7 @@ object DynamicAggregate:
     new DynamicAggregate(
       ResolvedAggregate(
         expression.dataType,
-        expression.nullable,
+        nullable = true,
         AggregateNode.Max(expression.resolved)
       )
     )
@@ -338,7 +476,7 @@ final class DynamicScope private[frame4s] (
       Right:
         new DynamicExpr(
           ResolvedExpr(
-            ExprId.derived(s"column:${input.qualifier}:${field.id.value}"),
+            ExprId.column(input, field.id, field.dataType, field.nullable),
             field.dataType,
             field.nullable,
             ExprNode.Column(input, scopeId, field.id, field.name, index)
@@ -372,7 +510,7 @@ final class DynamicFrame private[frame4s] (
       NamedExpression(
         field.name,
         ResolvedExpr(
-          ExprId.derived(s"column:current:${field.id.value}"),
+          ExprId.column(InputRef.Current, field.id, field.dataType, field.nullable),
           field.dataType,
           field.nullable,
           ExprNode.Column(InputRef.Current, scopeId, field.id, field.name, index)
@@ -597,7 +735,7 @@ final class DynamicFrame private[frame4s] (
             NamedExpression(
               field.name,
               ResolvedExpr(
-                ExprId.derived(s"column:current:${field.id.value}"),
+                ExprId.column(InputRef.Current, field.id, field.dataType, field.nullable),
                 field.dataType,
                 field.nullable,
                 ExprNode.Column(InputRef.Current, scopeId, field.id, field.name, index)
@@ -807,39 +945,51 @@ final class DynamicGroupedFrame private[frame4s] (
   def aggregate(
       expressions: (String, DynamicAggregate)*
   ): Either[FrameError, DynamicFrame] =
-    val names = (keys.map(_.name) ++ expressions.map(_._1)).toVector
+    val aggregates = expressions.toVector
+    val names = keys.map(_.name) ++ aggregates.map(_._1)
     OutputNameValidation.duplicates(names) match
       case duplicates if duplicates.nonEmpty =>
         Left(FrameError.DuplicateOutputNames(duplicates))
       case _ =>
-        val fields =
-          keys.map: key =>
-            Field(
-              ColumnId.derived(key.name),
-              key.name,
-              key.expression.dataType,
-              key.expression.nullable
-            )
-          ++ expressions.toVector.map: (name, aggregate) =>
-            Field(
-              ColumnId.derived(name),
-              name,
-              aggregate.resolved.dataType,
-              aggregate.resolved.nullable
-            )
-        Schema(fields).left
-          .map(FrameError.InvalidSchema.apply)
-          .map: output =>
-            new DynamicFrame(
-              LogicalPlan.Aggregate(
-                input.plan,
-                keys,
-                expressions.toVector.map: (name, aggregate) =>
-                  NamedAggregateExpression(name, aggregate.resolved),
-                output
-              ),
-              output
-            )
+        aggregates
+          .foldLeft[Either[FrameError, Unit]](Right(())):
+            case (validated, (_, aggregate)) =>
+              validated.flatMap(_ =>
+                ExpressionValidation.aggregateCurrent(
+                  aggregate.resolved,
+                  input.scopeToken,
+                  input.schema
+                )
+              )
+          .flatMap: _ =>
+            val fields =
+              keys.map: key =>
+                Field(
+                  ColumnId.derived(key.name),
+                  key.name,
+                  key.expression.dataType,
+                  key.expression.nullable
+                )
+              ++ aggregates.map: (name, aggregate) =>
+                Field(
+                  ColumnId.derived(name),
+                  name,
+                  aggregate.resolved.dataType,
+                  aggregate.resolved.nullable
+                )
+            Schema(fields).left
+              .map(FrameError.InvalidSchema.apply)
+              .map: output =>
+                new DynamicFrame(
+                  LogicalPlan.Aggregate(
+                    input.plan,
+                    keys,
+                    aggregates.map: (name, aggregate) =>
+                      NamedAggregateExpression(name, aggregate.resolved),
+                    output
+                  ),
+                  output
+                )
 
 object DynamicFrame:
   def scan(reference: SourceRef, fields: Vector[Field]): Either[FrameError, DynamicFrame] =
@@ -885,7 +1035,7 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
       NamedExpression(
         field.name,
         ResolvedExpr(
-          ExprId.derived(s"column:current:${field.id.value}"),
+          ExprId.column(InputRef.Current, field.id, field.dataType, field.nullable),
           field.dataType,
           field.nullable,
           ExprNode.Column(InputRef.Current, scopeId, field.id, field.name, index)
@@ -929,7 +1079,7 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
       NamedExpression(
         field.name,
         ResolvedExpr(
-          ExprId.derived(s"column:current:${field.id.value}"),
+          ExprId.column(InputRef.Current, field.id, field.dataType, field.nullable),
           field.dataType,
           field.nullable,
           ExprNode.Column(InputRef.Current, scopeId, field.id, field.name, index)
@@ -963,34 +1113,26 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
       output
     )
 
-  def renameAll[
-      From1 <: String & Singleton,
-      To1 <: String & Singleton,
-      From2 <: String & Singleton,
-      To2 <: String & Singleton
-  ](
-      first: (From1, To1),
-      second: (From2, To2)
+  def renameAll[Requests <: Tuple](
+      requests: Requests
   )(using
-      firstAt: ColumnLookup[
+      nonEmpty: NonEmptyRequests[Requests],
+      edits: RenameRequests[
         NamedTuple.Names[S],
         NamedTuple.DropNames[S],
-        From1
+        Requests
       ],
-      secondAt: ColumnLookup[
-        NamedTuple.Names[S],
-        NamedTuple.DropNames[S],
-        From2
+      uniqueRequests: UniqueRequestNames[RenameRequestSources[Requests]],
+      uniqueTargets: UniqueRequestNames[RenameRequestTargets[Requests]],
+      targetsDisjoint: RenameTargetsDisjoint[
+        RenameRequestTargets[Requests],
+        NamedTuple.Names[
+          DropManySchema[S, RenameRequestSources[Requests]]
+        ]
       ],
-      uniqueRequests: UniqueNames[From1 *: From2 *: EmptyTuple],
-      uniqueOutput: UniqueNames[
-        RenameTwoNames[NamedTuple.Names[S], From1, To1, From2, To2]
-      ],
-      output: SchemaDescriptor[
-        RenamedTwoSchema[S, From1, To1, From2, To2]
-      ]
-  ): Frame[RenamedTwoSchema[S, From1, To1, From2, To2]] =
-    val renames = Map(first, second)
+      output: SchemaDescriptor[RenamedManySchema[S, Requests]]
+  ): Frame[RenamedManySchema[S, Requests]] =
+    val renames = edits.pairs(requests).toMap
     val expressions = currentExpressions.map: expression =>
       expression.copy(name = renames.getOrElse(expression.name, expression.name))
     new Frame(
@@ -1015,29 +1157,21 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
       output
     )
 
-  def dropAll[
-      Name1 <: String & Singleton,
-      Name2 <: String & Singleton
-  ](
-      first: Name1,
-      second: Name2
+  def dropAll[Requests <: Tuple](
+      requests: Requests
   )(using
-      firstAt: ColumnLookup[
+      nonEmpty: NonEmptyRequests[Requests],
+      edits: DropRequests[
         NamedTuple.Names[S],
         NamedTuple.DropNames[S],
-        Name1
+        Requests
       ],
-      secondAt: ColumnLookup[
-        NamedTuple.Names[S],
-        NamedTuple.DropNames[S],
-        Name2
-      ],
-      unique: UniqueNames[Name1 *: Name2 *: EmptyTuple],
+      unique: UniqueRequestNames[DropRequestNames[Requests]],
       output: SchemaDescriptor[
-        DropManySchema[S, Name1 *: Name2 *: EmptyTuple]
+        DropManySchema[S, DropRequestNames[Requests]]
       ]
-  ): Frame[DropManySchema[S, Name1 *: Name2 *: EmptyTuple]] =
-    val dropped = Set(first, second)
+  ): Frame[DropManySchema[S, DropRequestNames[Requests]]] =
+    val dropped = edits.names(requests).toSet
     new Frame(
       LogicalPlan.Project(
         plan,
@@ -1279,6 +1413,41 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
     )
     new Frame(dynamic.plan, output.schema, output)
 
+  def innerJoinUsing[
+      Right <: NamedTuple.AnyNamedTuple,
+      Keys <: Tuple
+  ](right: Frame[Right], keys: Keys)(using
+      nonEmpty: NonEmptyRequests[Keys],
+      resolved: UsingKeys[
+        NamedTuple.Names[S],
+        NamedTuple.DropNames[S],
+        NamedTuple.Names[Right],
+        NamedTuple.DropNames[Right],
+        Keys
+      ],
+      unique: UniqueRequestNames[UsingKeyNames[Keys]],
+      disjoint: DisjointNames[
+        NamedTuple.Names[S],
+        NamedTuple.Names[
+          DropManySchema[Right, UsingKeyNames[Keys]]
+        ],
+        NamedTuple.DropNames[
+          DropManySchema[Right, UsingKeyNames[Keys]]
+        ]
+      ],
+      output: SchemaDescriptor[
+        UsingJoinManySchema[S, Right, UsingKeyNames[Keys]]
+      ]
+  ): Frame[UsingJoinManySchema[S, Right, UsingKeyNames[Keys]]] =
+    val dynamic = JoinPlanning.typedUsingMany(
+      this.dynamic,
+      right.dynamic,
+      JoinKind.Inner,
+      resolved.columns(keys),
+      output.schema
+    )
+    new Frame(dynamic.plan, output.schema, output)
+
   def leftJoinUsing[
       Right <: NamedTuple.AnyNamedTuple,
       Name <: String & Singleton
@@ -1304,6 +1473,41 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
     )
     new Frame(dynamic.plan, output.schema, output)
 
+  def leftJoinUsing[
+      Right <: NamedTuple.AnyNamedTuple,
+      Keys <: Tuple
+  ](right: Frame[Right], keys: Keys)(using
+      nonEmpty: NonEmptyRequests[Keys],
+      resolved: UsingKeys[
+        NamedTuple.Names[S],
+        NamedTuple.DropNames[S],
+        NamedTuple.Names[Right],
+        NamedTuple.DropNames[Right],
+        Keys
+      ],
+      unique: UniqueRequestNames[UsingKeyNames[Keys]],
+      disjoint: DisjointNames[
+        NamedTuple.Names[S],
+        NamedTuple.Names[
+          DropManySchema[Right, UsingKeyNames[Keys]]
+        ],
+        NamedTuple.DropNames[
+          DropManySchema[Right, UsingKeyNames[Keys]]
+        ]
+      ],
+      output: SchemaDescriptor[
+        LeftUsingJoinManySchema[S, Right, UsingKeyNames[Keys]]
+      ]
+  ): Frame[LeftUsingJoinManySchema[S, Right, UsingKeyNames[Keys]]] =
+    val dynamic = JoinPlanning.typedUsingMany(
+      this.dynamic,
+      right.dynamic,
+      JoinKind.LeftOuter,
+      resolved.columns(keys),
+      output.schema
+    )
+    new Frame(dynamic.plan, output.schema, output)
+
   def groupBy[
       Keys <: Tuple,
       KeyNames <: Tuple,
@@ -1319,10 +1523,16 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
     new GroupedFrame(this, selection.expressions(selected))
 
   def sortBy(
-      first: Scope[S, this.Origin] => ExprOf[?, this.Origin],
-      rest: (Scope[S, this.Origin] => ExprOf[?, this.Origin])*
+      first: Scope[S, this.Origin] => SortKey[this.Origin],
+      rest: (Scope[S, this.Origin] => SortKey[this.Origin])*
   ): Frame[S] =
-    sortBy(SortDirection.Ascending, NullPlacement.Last)(first, rest*)
+    val scope = Scope.current[S, this.Origin](scopeToken, schema)
+    val expressions = (first +: rest)
+      .map: build =>
+        val key = build(scope)
+        SortExpression(key.expression, key.direction, key.nulls)
+      .toVector
+    sorted(expressions)
 
   def sortBy(
       direction: SortDirection,
@@ -1335,6 +1545,9 @@ final class Frame[S <: NamedTuple.AnyNamedTuple] private[frame4s] (
     val expressions = (first +: rest)
       .map(build => SortExpression(build(scope).resolved, direction, nulls))
       .toVector
+    sorted(expressions)
+
+  private def sorted(expressions: Vector[SortExpression]): Frame[S] =
     new Frame(LogicalPlan.Sort(plan, expressions, schema), schema, descriptor)
 
   def limit(count: Int): Either[FrameError, Frame[S]] =
@@ -1382,7 +1595,7 @@ private object JoinPlanning:
   ): ResolvedExpr =
     val scopeId = ExprScopeId.forInput(token, input)
     ResolvedExpr(
-      ExprId.derived(s"column:${input.qualifier}:${field.id.value}"),
+      ExprId.column(input, field.id, field.dataType, field.nullable),
       field.dataType,
       field.nullable,
       ExprNode.Column(input, scopeId, field.id, field.name, index)
@@ -1390,13 +1603,19 @@ private object JoinPlanning:
 
   private def equality(left: ResolvedExpr, right: ResolvedExpr): ResolvedExpr =
     val equal = ResolvedExpr(
-      ExprId.derived(s"Equal(${left.id.value},${right.id.value})"),
+      ExprId.binary(
+        BinaryOperator.Equal,
+        left.id,
+        right.id,
+        DataType.Bool,
+        left.nullable || right.nullable
+      ),
       DataType.Bool,
       left.nullable || right.nullable,
       ExprNode.Binary(BinaryOperator.Equal, left, right)
     )
     ResolvedExpr(
-      ExprId.derived(s"IsTrue(${equal.id.value})"),
+      ExprId.unary(UnaryOperator.IsTrue, equal.id, DataType.Bool, nullable = false),
       DataType.Bool,
       nullable = false,
       ExprNode.Unary(UnaryOperator.IsTrue, equal)
@@ -1407,7 +1626,13 @@ private object JoinPlanning:
   ): ResolvedExpr =
     comparisons.tail.foldLeft(comparisons.head): (acc, next) =>
       ResolvedExpr(
-        ExprId.derived(s"And(${acc.id.value},${next.id.value})"),
+        ExprId.binary(
+          BinaryOperator.And,
+          acc.id,
+          next.id,
+          DataType.Bool,
+          nullable = false
+        ),
         DataType.Bool,
         nullable = false,
         ExprNode.Binary(BinaryOperator.And, acc, next)
@@ -1431,7 +1656,12 @@ private object JoinPlanning:
         NamedExpression(
           outputField.name,
           ResolvedExpr(
-            ExprId.derived(s"column:current:${source.id.value}"),
+            ExprId.column(
+              InputRef.Current,
+              source.id,
+              source.dataType,
+              source.nullable
+            ),
             source.dataType,
             source.nullable,
             ExprNode.Column(
@@ -1520,16 +1750,42 @@ private object JoinPlanning:
       rightIndex: Int,
       output: Schema
   ): DynamicFrame =
-    val leftField = left.schema.fields(leftIndex)
-    val rightField = right.schema.fields(rightIndex)
-    val condition = equality(
-      column(left.scopeToken, InputRef.Left, leftField, leftIndex),
-      column(right.scopeToken, InputRef.Right, rightField, rightIndex)
+    typedUsingMany(
+      left,
+      right,
+      kind,
+      Vector((key, leftIndex, rightIndex)),
+      output
     )
+
+  def typedUsingMany(
+      left: DynamicFrame,
+      right: DynamicFrame,
+      kind: JoinKind,
+      keys: Vector[(String, Int, Int)],
+      output: Schema
+  ): DynamicFrame =
+    val condition = allEqual:
+      keys.map: (_, leftIndex, rightIndex) =>
+        equality(
+          column(
+            left.scopeToken,
+            InputRef.Left,
+            left.schema.fields(leftIndex),
+            leftIndex
+          ),
+          column(
+            right.scopeToken,
+            InputRef.Right,
+            right.schema.fields(rightIndex),
+            rightIndex
+          )
+        )
+    val rightKeys = keys.map(_._3).toSet
     val columns =
       Vector.tabulate(left.schema.size)(JoinColumn.Left.apply) ++
         right.schema.fields.indices
-          .filter(_ != rightIndex)
+          .filterNot(rightKeys)
           .map(JoinColumn.Right.apply)
           .toVector
     new DynamicFrame(

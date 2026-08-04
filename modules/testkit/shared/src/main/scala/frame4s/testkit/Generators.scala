@@ -237,8 +237,4 @@ object ConformanceFixtures:
     else
       val built = rows.grouped(batchSize).toVector.map(batch(_, tracker))
       sequence(built).flatMap: batches =>
-        Table[RowSchema](batches) match
-          case right @ Right(_) => right
-          case left @ Left(_)   =>
-            batches.foreach(_.close())
-            left
+        Table.takeOwnership[RowSchema](batches)

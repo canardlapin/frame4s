@@ -55,10 +55,10 @@ def metrics(input: Frame[Person]): Frame[Metrics] =
 existing names; a computed expression needs `.as("name")` when it appears
 directly in a selection.
 
-`height` and `mass` are `Option[Double]`, so their arithmetic operands are
-explicitly nullable. Missing height or mass produces a missing derived value.
-frame4s does not install arithmetic for ordinary Scala `Option` values or
-silently lift a non-null operand.
+`height` and `mass` are `Option[Double]`, so a missing value produces a missing
+derived value. A required `Double` may also be combined with either column; the
+result remains `Option[Double]`. This is a closed expression rule inside
+frame4s, not a global arithmetic instance for ordinary Scala `Option` values.
 
 ## Replace an existing column
 
@@ -140,12 +140,16 @@ The public names describe immutable Scala operations:
 | Recompute an existing column | `replace` |
 | Group and calculate summaries | `groupBy(...).aggregate(...)` |
 
-The practical benchmark court exercises the first and third examples as
-complete pipelines rather than isolated operators. Its
+The historical practical benchmark court exercises the first and third
+examples as complete pipelines rather than isolated operators. Its
 [versioned receipt](https://github.com/canardlapin/frame4s/blob/main/docs/benchmarks/receipts/2026-07-29-dplyr-practical/dplyr/summary.md)
-compares an internal columnar candidate with dplyr after checking both outputs
-against the semantic reference backend. Public `FrameRuntime` still selects
-the reference backend; the receipt does not claim otherwise.
+compares a package-internal columnar endpoint with dplyr after checking both
+outputs against the semantic reference backend; it is not a public-runtime
+timing. The later
+[public-path replacement court](https://github.com/canardlapin/frame4s/blob/main/docs/benchmarks/receipts/2026-08-02-p4-public-path/summary.md)
+verifies the engine receipt from `FrameRuntime.collectWithReceipt` and measures
+a separate set of admitted plans. Both receipts state their narrow scope and
+do not establish cross-machine performance.
 
 Next, read [schemas and errors](schemas-and-errors.md) for compile-time column
 checking and nullable predicate rules.
