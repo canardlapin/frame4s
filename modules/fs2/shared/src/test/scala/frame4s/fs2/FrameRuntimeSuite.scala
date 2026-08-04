@@ -7,6 +7,7 @@ import cats.effect.Resource
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import frame4s.*
+import _root_.fs2.Stream
 
 class FrameRuntimeSuite extends munit.FunSuite:
   type Input = (id: Int)
@@ -29,7 +30,7 @@ class FrameRuntimeSuite extends munit.FunSuite:
           schema,
           Vector(storage(ColumnArray.int32(input, tracker = tracker)))
         )
-    storage(Table[Input](batches))
+    storage(Table.takeOwnership[Input](batches))
 
   test("stream scopes each batch and preserves source ownership"):
     val tracker = new BufferTracker
@@ -128,6 +129,81 @@ class FrameRuntimeSuite extends munit.FunSuite:
           assertEquals(tracker.snapshot.activeOwners, 0)
       .unsafeToFuture()
 
+  test("canceling table acquisition releases every retained batch created so far"):
+    val tracker = new BufferTracker
+    val sourceBatch = storage(
+      RecordBatch(
+        schema,
+        Vector(storage(ColumnArray.int32(Array(1, 2), tracker = tracker)))
+      )
+    )
+    val baseline = tracker.snapshot
+
+    val program = for
+      started <- Deferred[IO, Unit]
+      source = new FrameSource[IO]:
+        def inspect: IO[Either[SourceError, SourceInspection]] =
+          IO.pure(
+            Right(
+              SourceInspection(
+                schema,
+                SourceCapabilities(
+                  projection = false,
+                  predicate = false,
+                  limit = false,
+                  batchSize = false,
+                  streaming = true
+                )
+              )
+            )
+          )
+
+        def plan(request: ScanRequest): IO[Either[SourceError, PlannedScan[IO]]] =
+          val emitted = Stream
+            .bracket(
+              IO.fromEither(
+                sourceBatch
+                  .slice(0, sourceBatch.rowCount)
+                  .leftMap(error => TableReadFailure(TableReadError.Storage(error)))
+              )
+            )(batch => IO(batch.close()))
+            .flatMap(Stream.emit)
+          val blocked = Stream.eval(started.complete(())).drain ++ Stream.never[IO]
+          IO.pure(
+            Right(
+              PlannedScan(
+                schema,
+                PushdownReceipt(
+                  request.requestedFeatures,
+                  Vector.empty,
+                  request.requestedFeatures,
+                  schema.fields.map(_.name)
+                ),
+                emitted ++ blocked
+              )
+            )
+          )
+
+        private[fs2] def close: IO[Either[SourceError, Unit]] = IO.pure(Right(()))
+      binding = SourceBinding[IO, Input, FrameSource[IO]](
+        reference,
+        Resource.pure[IO, FrameSource[IO]](source)
+      )
+      fiber <- FrameRuntime
+        .resource(binding)
+        .flatMap(_.collect(binding.frame))
+        .use(_ => IO.unit)
+        .start
+      _ <- started.get
+      _ <- fiber.cancel
+      _ <- IO:
+        assertEquals(tracker.snapshot, baseline)
+        sourceBatch.close()
+        assertEquals(tracker.snapshot.activeOwners, 0)
+    yield ()
+
+    program.unsafeToFuture()
+
   test("failed collection closes acquired output and source leases"):
     val tracker = new BufferTracker
     val input = table(tracker, Vector(Array(Int.MaxValue), Array(2)))
@@ -151,6 +227,46 @@ class FrameRuntimeSuite extends munit.FunSuite:
           assertEquals(tracker.snapshot.activeOwners, 0)
       .unsafeToFuture()
 
+  test("collect surfaces the engine decision in the execution receipt"):
+    val tracker = new BufferTracker
+    val input = table(tracker, Vector(Array(1, 2, 3)))
+    val runtime = FrameRuntime[IO](ReferenceSources.empty.bind(reference, input))
+    val supported = frame.filter(row => row.col("id") > 1)
+
+    def ids(output: Table[Input]): Vector[ScalarValue] =
+      output.batches.flatMap: batch =>
+        val column = storage(batch.column("id"))
+        Vector.tabulate(batch.rowCount)(index => storage(column.scalar(index)))
+
+    runtime
+      .collectWithReceipt(supported)
+      .use: execution =>
+        IO:
+          val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+          // A silent decline here would make every runtime comparison vacuous, because both
+          // sides would be the reference interpreter.
+          assertEquals(engine.engine, EngineId.Columnar)
+          assertEquals(engine.fallback, None)
+          assert(engine.physicalPlan.contains("FilterSelection"), engine.physicalPlan)
+          assertEquals(ids(execution.table), Vector(2, 3).map(ScalarValue.Int32.apply))
+      .flatMap: _ =>
+        runtime
+          .collectWithReceipt(frame)
+          .use: execution =>
+            IO:
+              val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+              assertEquals(engine.engine, EngineId.Reference)
+              assertEquals(
+                engine.fallback,
+                Some(EngineFallbackReason.UnsupportedLogicalShape("Values"))
+              )
+              assertEquals(ids(execution.table), Vector(1, 2, 3).map(ScalarValue.Int32.apply))
+      .flatMap: _ =>
+        IO:
+          input.close()
+          assertEquals(tracker.snapshot.activeOwners, 0)
+      .unsafeToFuture()
+
   test("physical explain names the selected backend and forbids fallback"):
     val tracker = new BufferTracker
     val input = table(tracker, Vector(Array(1)))
@@ -161,6 +277,74 @@ class FrameRuntimeSuite extends munit.FunSuite:
       "ReferenceExecution(mode=streaming, blocking=none, operators=Values, estimatedRows=unknown, fallback=none)"
     )
     input.close()
+
+  test("engine policies are explicit, typed, and enforced"):
+    val tracker = new BufferTracker
+    val input = table(tracker, Vector(Array(Int.MaxValue, 2, 3)))
+    val sources = ReferenceSources.empty.bind(reference, input)
+    val supported = frame.filter(row => row.col("id") > 1)
+    val unsupportedOverflow = frame
+      .withColumn("next")(_.col("id") + 1)
+      .limit(1)
+      .fold(error => fail(error.message), identity)
+    val referenceOnly = FrameRuntime[IO](sources, EnginePolicy.ReferenceOnly)
+    val requireColumnar = FrameRuntime[IO](sources, EnginePolicy.RequireColumnar)
+    val baseline = tracker.snapshot
+
+    referenceOnly
+      .collectWithReceipt(supported)
+      .use: execution =>
+        IO:
+          val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+          assertEquals(engine.engine, EngineId.Reference)
+          assertEquals(engine.fallback, None)
+          assert(engine.physicalPlan.startsWith("ReferenceExecution"), engine.physicalPlan)
+      .flatMap: _ =>
+        requireColumnar
+          .collectWithReceipt(supported)
+          .use: execution =>
+            IO:
+              val engine = execution.receipt.engine.getOrElse(fail("missing engine receipt"))
+              assertEquals(engine.engine, EngineId.Columnar)
+              assertEquals(engine.fallback, None)
+      .flatMap: _ =>
+        requireColumnar.collectWithReceipt(frame).use(_ => IO.unit).attempt
+      .flatMap:
+        case Left(
+              EnginePolicyFailure(
+                EnginePolicyError.RequiredEngineUnavailable(
+                  EngineId.Columnar,
+                  EngineFallbackReason.UnsupportedLogicalShape("Values")
+                )
+              )
+            ) =>
+          IO.unit
+        case other => IO(fail(s"expected a typed require-columnar failure, found $other"))
+      .flatMap: _ =>
+        requireColumnar.collectWithReceipt(unsupportedOverflow).use(_ => IO.unit).attempt
+      .flatMap:
+        case Left(
+              EnginePolicyFailure(
+                EnginePolicyError.RequiredEngineUnavailable(
+                  EngineId.Columnar,
+                  EngineFallbackReason.UnsupportedLogicalShape("Limit")
+                )
+              )
+            ) =>
+          IO.unit
+        case other =>
+          IO(fail(s"expected require-columnar to decline before reference overflow, found $other"))
+      .flatMap: _ =>
+        IO:
+          assertEquals(tracker.snapshot, baseline)
+          assertEquals(
+            requireColumnar.physicalExplain(frame),
+            "ColumnarExecution(operator=Unavailable, policy=RequireColumnar, " +
+              "reason=unsupported logical shape Values)"
+          )
+          input.close()
+          assertEquals(tracker.snapshot.activeOwners, 0)
+      .unsafeToFuture()
 
   test("union and existential joins release execution leases on cancellation"):
     type Right = (key: Int)
@@ -273,6 +457,7 @@ class FrameRuntimeSuite extends munit.FunSuite:
             result.receipt.residual.map(_._2),
             Vector(PushdownFeature.BatchSize, PushdownFeature.BatchSize)
           )
+          assertEquals(result.receipt.engine.map(_.engine), Some(EngineId.Columnar))
       .guarantee(IO(leftTable.close()) *> IO(rightTable.close()))
       .unsafeToFuture()
 

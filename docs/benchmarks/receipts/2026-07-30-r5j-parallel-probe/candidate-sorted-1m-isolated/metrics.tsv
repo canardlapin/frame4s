@@ -1,0 +1,2 @@
+rows	order	milliseconds	nanoseconds_per_row	allocation_bytes
+1000000	sorted	9.294549567	9.294550	32007922.624

@@ -8,7 +8,7 @@ type Grouped = (name: String, n: Long, mean: Option[Double])
 
 def grouped(input: Frame[Person]): Frame[Grouped] =
   input
-    .groupBy(row => Tuple1(row.col("name").as("name")))
+    .groupBy(row => Tuple1(row.col("name")))
     .aggregate(row =>
       (
         Aggregate.count.as("n"),
@@ -17,7 +17,10 @@ def grouped(input: Frame[Person]): Frame[Grouped] =
     )
 
 def ordered(input: Frame[Person]): Frame[Person] =
-  input.sortBy(_.col("id"))
+  input.sortBy(
+    row => SortKey(row.col("name")),
+    row => SortKey(row.col("score")).descending.nullsFirst
+  )
 
 def combined(left: Frame[Person], right: Frame[Person]): Frame[Person] =
   left.unionAll(right).distinct
@@ -36,6 +39,26 @@ def existing(left: Frame[Left], right: Frame[Right]): Frame[Left] =
 
 def missing(left: Frame[Left], right: Frame[Right]): Frame[Left] =
   left.antiJoin(right)((lhs, rhs) => lhs.col("id") === rhs.col("key"))
+```
+
+Using joins resolve each key by name on both sides, even when the physical
+field order differs:
+
+```scala mdoc:compile-only
+import frame4s.*
+
+type Visits = (personId: Int, session: Int, label: String)
+type Measures = (session: Int, personId: Int, value: Double)
+type Joined = (personId: Int, session: Int, label: String, value: Double)
+
+def joined(
+    visits: Frame[Visits],
+    measures: Frame[Measures]
+): Frame[Joined] =
+  visits.innerJoinUsing(
+    measures,
+    (UsingKey("personId"), UsingKey("session"))
+  )
 ```
 
 See the

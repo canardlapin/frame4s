@@ -24,6 +24,19 @@ class StorageSuite extends munit.FunSuite:
     assertEquals(array.value(1), Left(StorageError.NullValue(1)))
     array.close()
 
+  test("public column builders remain detached from caller-owned arrays"):
+    val values = Array(7, 8)
+    val valid = Array(true, false)
+    val array = value(ColumnArray.int32(values, valid))
+
+    values(0) = 99
+    valid(0) = false
+    valid(1) = true
+
+    assertEquals(array.scalar(0), Right(ScalarValue.Int32(7)))
+    assertEquals(array.scalar(1), Right(ScalarValue.Null))
+    array.close()
+
   test("booleans pack values and validity independently"):
     val array = value(
       ColumnArray.bool(
@@ -63,7 +76,7 @@ class StorageSuite extends munit.FunSuite:
     val physical = value(utf8.copyPhysicalBuffers)
     assertEquals(utf8.layout.buffers.map(_.role), Vector(BufferRole.Offsets, BufferRole.Values))
     assertEquals(physical(0).length, 16)
-    assertEquals(utf8.scalar(2), Right(ScalarValue.Utf8("γ")))
+    assertEquals(utf8.scalar(2), Right(ScalarValue.checkedUtf8("γ")))
 
     val indices = value(ColumnArray.int32(Array(1, 0, 1)))
     val preciseSlice: Either[StorageError, Int32Array] = indices.slice(0, 1)
@@ -74,9 +87,9 @@ class StorageSuite extends munit.FunSuite:
       dictionary.encoding,
       PhysicalEncoding.Dictionary(DataType.Int32, DataType.Utf8)
     )
-    assertEquals(dictionary.scalar(0), Right(ScalarValue.Utf8("blue")))
+    assertEquals(dictionary.scalar(0), Right(ScalarValue.checkedUtf8("blue")))
     val sliced = value(dictionary.slice(1, 2))
-    assertEquals(sliced.scalar(0), Right(ScalarValue.Utf8("red")))
+    assertEquals(sliced.scalar(0), Right(ScalarValue.checkedUtf8("red")))
 
     sliced.close()
     dictionary.close()
@@ -133,7 +146,7 @@ class StorageSuite extends munit.FunSuite:
     val batch = value(RecordBatch(schema, Vector(ids, labels)))
 
     assertEquals(batch.rowCount, 2)
-    assertEquals(value(batch.column("label")).scalar(1), Right(ScalarValue.Utf8("b")))
+    assertEquals(value(batch.column("label")).scalar(1), Right(ScalarValue.checkedUtf8("b")))
 
     val bad = value(ColumnArray.int64(Array(1L, 2L)))
     assertEquals(
@@ -149,7 +162,7 @@ class StorageSuite extends munit.FunSuite:
     def batch(values: Array[Int]): RecordBatch =
       value(RecordBatch(schema, Vector(value(ColumnArray.int32(values)))))
 
-    val table = value(Table[S](Vector(batch(Array(1, 2)), batch(Array(3)))))
+    val table = value(Table.takeOwnership[S](Vector(batch(Array(1, 2)), batch(Array(3)))))
     assertEquals(table.rowCount, 3L)
     assertEquals(table.batches.map(_.rowCount), Vector(2, 1))
     assert(!table.isClosed)

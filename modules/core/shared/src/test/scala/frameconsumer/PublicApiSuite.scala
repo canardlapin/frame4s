@@ -27,6 +27,15 @@ class PublicApiSuite extends munit.FunSuite:
       "a forged SchemaDescriptor compiles, so Frame[S] can carry an unrelated runtime schema"
     )
 
+  test("unsupported schema fields retain a user-facing derivation error"):
+    val errors = typeCheckErrors("""
+      import frame4s.*
+      summon[SchemaDescriptor[(amount: BigDecimal)]]
+    """)
+    val message = errors.headOption.fold(fail("expected a compile error"))(_.message)
+    assert(message.contains("Schema field 'amount' has unsupported type"), message)
+    assert(!message.contains("match type"), message)
+
   test("resolved plan node constructors are not part of the public API"):
     val errors = typeCheckErrors("""
       import frame4s.*

@@ -110,25 +110,27 @@ class CompileTimeCourtSuite extends munit.FunSuite:
     val wide48 = source[Wide48]("wide-48")
 
     val narrowProjection: Frame[(id: Int, score: Option[Double])] =
-      narrow.select(row => (row.col("id").as("id"), row.col("score").as("score")))
-    val projection32: Frame[(first: Int, middle: Int, last: Int)] =
+      narrow
+        .filter(row => row.col("id") > 0)
+        .select(row => (row.col("id"), row.col("score")))
+    val projection32: Frame[(c01: Int, c16: Int, c32: Int)] =
       wide32.select: row =>
         (
-          row.col("c01").as("first"),
-          row.col("c16").as("middle"),
-          row.col("c32").as("last")
+          row.col("c01"),
+          row.col("c16"),
+          row.col("c32")
         )
-    val projection48: Frame[(first: Int, middle: Int, last: Int)] =
+    val projection48: Frame[(c01: Int, c24: Int, c48: Int)] =
       wide48.select: row =>
         (
-          row.col("c01").as("first"),
-          row.col("c24").as("middle"),
-          row.col("c48").as("last")
+          row.col("c01"),
+          row.col("c24"),
+          row.col("c48")
         )
 
     assertEquals(narrowProjection.schema.fields.map(_.name), Vector("id", "score"))
-    assertEquals(projection32.schema.fields.map(_.name), Vector("first", "middle", "last"))
-    assertEquals(projection48.schema.fields.map(_.name), Vector("first", "middle", "last"))
+    assertEquals(projection32.schema.fields.map(_.name), Vector("c01", "c16", "c32"))
+    assertEquals(projection48.schema.fields.map(_.name), Vector("c01", "c24", "c48"))
 
   test("a missing-column diagnostic names the field and gives actionable context"):
     val message = firstDiagnostic(
@@ -136,7 +138,7 @@ class CompileTimeCourtSuite extends munit.FunSuite:
         import frame4s.*
         type Input = (id: Int, label: String)
         val frame = Frame.source[Input]("input").toOption.get
-        frame.sortBy(row => row.col("missing"))
+        frame.sortBy(row => SortKey(row.col("missing")))
       """)
     )
     assert(message.contains("missing"), message)

@@ -81,7 +81,7 @@ class FrameApiSuite extends munit.FunSuite:
     assert(joined.explain.startsWith("Join"))
 
   test("grouping and core aggregates compute their result schema"):
-    val grouped: Frame[(name: String, n: Long, maxId: Int)] =
+    val grouped: Frame[(name: String, n: Long, maxId: Option[Int])] =
       people
         .groupBy: row =>
           Tuple1(row.col("name").as("name"))
@@ -170,7 +170,16 @@ class FrameApiSuite extends munit.FunSuite:
     val name = dynamic.col("name").fold(error => fail(error.message), identity)
     val active = dynamic.col("active").fold(error => fail(error.message), identity)
 
-    assertEquals(id === name, Left(FrameError.ExpressionType(DataType.Int32, DataType.Utf8)))
+    assertEquals(
+      id === name,
+      Left(
+        FrameError.UnsupportedBinaryExpression(
+          BinaryOperator.Equal,
+          DataType.Int32,
+          DataType.Utf8
+        )
+      )
+    )
     assertEquals(dynamic.filter(active), Left(FrameError.NullablePredicate(active.id)))
 
     val total = active.isTrue.fold(error => fail(error.message), identity)
@@ -290,9 +299,13 @@ class FrameApiSuite extends munit.FunSuite:
     assertEquals(first.explain, second.explain)
     assertEquals(
       first.explain,
-      "Filter[expr:GreaterThan(expr:column:current:column:id,expr:literal:Int32(0))] " +
+      "Filter[e1] " +
         "Schema(id: Int32, name: Utf8, score: Float64?, active: Bool?)\n" +
-        "  Scan[people; id=people] Schema(id: Int32, name: Utf8, score: Float64?, active: Bool?)"
+        "  Scan[people; id=people] Schema(id: Int32, name: Utf8, score: Float64?, active: Bool?)\n" +
+        "Expressions\n" +
+        "  e1 = GreaterThan(e2,e3)\n" +
+        "  e2 = column(current,0)\n" +
+        "  e3 = literal(Int32)"
     )
 
   test("invalid dynamic schemas and limits return structured errors"):
@@ -312,6 +325,17 @@ class FrameApiSuite extends munit.FunSuite:
     assertEquals(
       Frame.values[People](scanRef),
       Left(FrameError.NotValuesSource(scanRef.id, SourceKind.Scan))
+    )
+
+  test("source constructors reject null identifiers without throwing"):
+    assertEquals(SourceRef.scan(null, "people"), Left(FrameError.NullSourceId))
+    assertEquals(SourceRef.values("people", null), Left(FrameError.NullSourceName))
+    assertEquals(SourceRef.scan(" ", "people"), Left(FrameError.InvalidSourceId(" ")))
+    assertEquals(SourceRef.scan("people", " "), Left(FrameError.InvalidSourceName(" ")))
+    assertEquals(Frame.source[People](null), Left(FrameError.NullSourceId))
+    assertEquals(
+      DynamicFrame.source(null, Vector(DynamicFrame.field("id", DataType.Int32, false))),
+      Left(FrameError.NullSourceId)
     )
 
   test("missing and mistyped columns are rejected at compile time"):

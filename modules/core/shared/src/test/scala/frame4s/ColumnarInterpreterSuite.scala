@@ -114,6 +114,233 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       assertEquals(run.receipt.fallback, None)
     finally input.close()
 
+  test("typed filter and withColumn chains compile as a general Float64 expression pipeline"):
+    type Input = (name: String, height: Double, mass: Double)
+    type Output = (name: String, heightM: Double, bmi: Double)
+    val ref = reference("columnar-expression-pipeline-float64")
+    val input = table[Input](
+      Vector(
+        (name = "short", height = 160.0, mass = 60.0),
+        (name = "keep", height = 180.0, mass = 81.0),
+        (name = "edge", height = 170.0, mass = 68.0)
+      ),
+      batchSize = 1
+    )
+    val source = value(Frame.values[Input](ref))
+    val withHeight = source
+      .filter(row => row.col("height") >= 170.0)
+      .withColumn("heightM")(row => row.col("height") / 100.0)
+    val withBmi = withHeight.withColumn("bmi"): row =>
+      row.col("mass") / (row.col("heightM") * row.col("heightM"))
+    val query: Frame[Output] =
+      withBmi.select(row => (row.col("name"), row.col("heightM"), row.col("bmi")))
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("ExpressionPipeline"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(
+              ScalarValue.checkedUtf8("keep"),
+              ScalarValue.Float64(1.8),
+              ScalarValue.Float64(81.0 / (1.8 * 1.8))
+            ),
+            Vector(
+              ScalarValue.checkedUtf8("edge"),
+              ScalarValue.Float64(1.7),
+              ScalarValue.Float64(68.0 / (1.7 * 1.7))
+            )
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
+  test("general filter preserves nullable predicates and SQL isTrue semantics"):
+    type Input = (id: Int, height: Option[Double])
+    val ref = reference("columnar-expression-pipeline-null-filter")
+    val input = table[Input](
+      Vector(
+        (id = 1, height = None),
+        (id = 2, height = Some(169.0)),
+        (id = 3, height = Some(170.0))
+      ),
+      batchSize = 1
+    )
+    val query = value(Frame.values[Input](ref)).filter: row =>
+      (row.col("height") >= Expr.literal(Option(170.0))).isTrue
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("ExpressionPipeline"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(ScalarValue.Int32(3), ScalarValue.Float64(170.0))
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
+  test("general filter compiles UTF-8 equality and boolean conjunction"):
+    type Input = (name: String, skin: String, eyes: String)
+    type Output = (name: String)
+    val ref = reference("columnar-expression-pipeline-utf8")
+    val input = table[Input](
+      Vector(
+        (name = "one", skin = "light", eyes = "brown"),
+        (name = "two", skin = "light", eyes = "blue"),
+        (name = "three", skin = "dark", eyes = "brown"),
+        (name = "四", skin = "light", eyes = "brown")
+      ),
+      batchSize = 1
+    )
+    val query: Frame[Output] = value(Frame.values[Input](ref))
+      .filter(row => (row.col("skin") === "light") && (row.col("eyes") === "brown"))
+      .select(row => Tuple1(row.col("name")))
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("ExpressionPipeline"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(ScalarValue.checkedUtf8("one")),
+            Vector(ScalarValue.checkedUtf8("四"))
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
+  test("general filter keeps dictionary-encoded direct projections detached"):
+    type Input = (id: Int, word: String)
+    type Output = (word: String)
+    val descriptor = summon[SchemaDescriptor[Input]]
+    val ids = value(ColumnArray.int32(Array(1, 2, 3)))
+    val indices = value(ColumnArray.int32(Array(0, 1, 0)))
+    val dictionaryValues = value(ColumnArray.utf8(Array("alpha", "beta")))
+    val words = value(ColumnArray.dictionary(indices, dictionaryValues))
+    val batch = RecordBatch(descriptor.schema, Vector(ids, words)) match
+      case Right(value) => value
+      case Left(error)  =>
+        ids.close()
+        words.close()
+        fail(error.message)
+    val input = value(Table.takeOwnership[Input](Vector(batch)))
+    val ref = reference("columnar-expression-pipeline-dictionary")
+    val query: Frame[Output] = value(Frame.values[Input](ref))
+      .filter(row => row.col("id") >= 2)
+      .select(row => Tuple1(row.col("word")))
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    input.close()
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("ExpressionPipeline"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(ScalarValue.checkedUtf8("beta")),
+            Vector(ScalarValue.checkedUtf8("alpha"))
+          )
+        )
+      )
+    finally result.close()
+
+  test("general Int32 filter and withColumn preserve boolean composition and checked arithmetic"):
+    type Input = (id: Int, label: String)
+    type Output = (id: Int, label: String, score: Int)
+    val ref = reference("columnar-expression-pipeline-int32")
+    val input = table[Input](
+      Vector.tabulate(5)(index => (id = index, label = s"row-$index")),
+      batchSize = 2
+    )
+    val query: Frame[Output] = value(Frame.values[Input](ref))
+      .filter(row => (row.col("id") >= 1) && (row.col("id") < 4))
+      .withColumn("score")(row => row.col("id") * 3 - 1)
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("ExpressionPipeline"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(ScalarValue.Int32(1), ScalarValue.checkedUtf8("row-1"), ScalarValue.Int32(2)),
+            Vector(ScalarValue.Int32(2), ScalarValue.checkedUtf8("row-2"), ScalarValue.Int32(5)),
+            Vector(ScalarValue.Int32(3), ScalarValue.checkedUtf8("row-3"), ScalarValue.Int32(8))
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
+  test("general verb compiler covers Int64 and Float32 expressions"):
+    type Input = (count: Long, ratio: Float)
+    type Output = (count: Long, ratio: Float, scaled: Float, total: Long)
+    val ref = reference("columnar-expression-pipeline-int64-float32")
+    val input = table[Input](
+      Vector(
+        (count = 1L, ratio = 1.0f),
+        (count = 2L, ratio = 2.0f),
+        (count = 3L, ratio = 4.0f)
+      ),
+      batchSize = 1
+    )
+    val filtered = value(Frame.values[Input](ref)).filter: row =>
+      (row.col("count") >= 2L) && (row.col("ratio") < 3.0f)
+    val withScaled = filtered.withColumn("scaled")(row => row.col("ratio") / 2.0f)
+    val query: Frame[Output] =
+      withScaled.withColumn("total")(row => row.col("count") * 2L)
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("ExpressionPipeline"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(
+              ScalarValue.Int64(2L),
+              ScalarValue.Float32(2.0f),
+              ScalarValue.Float32(1.0f),
+              ScalarValue.Int64(4L)
+            )
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
   test("unsupported logical shapes fall back for the whole plan with a receipt"):
     type Input = (id: Int, label: String)
     val ref = reference("columnar-fallback")
@@ -130,7 +357,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       assert(run.receipt.physicalPlan.contains("oracle=ReferenceExecution"))
       assertEquals(
         result.rows,
-        Right(Vector(Vector(ScalarValue.Int32(2), ScalarValue.Utf8("b"))))
+        Right(Vector(Vector(ScalarValue.Int32(2), ScalarValue.checkedUtf8("b"))))
       )
     finally
       result.close()
@@ -177,14 +404,14 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         Right(
           Vector(
             Vector(
-              ScalarValue.Utf8("a"),
+              ScalarValue.checkedUtf8("a"),
               ScalarValue.Int64(2L),
               ScalarValue.Float64(4.0),
               ScalarValue.Float64(2.0),
               ScalarValue.Float64(1.0)
             ),
             Vector(
-              ScalarValue.Utf8("b"),
+              ScalarValue.checkedUtf8("b"),
               ScalarValue.Int64(1L),
               ScalarValue.Null,
               ScalarValue.Null,
@@ -226,9 +453,9 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
         result.rows,
         Right(
           Vector(
-            Vector(ScalarValue.Utf8("a"), ScalarValue.Float64(4.0)),
-            Vector(ScalarValue.Utf8("b"), ScalarValue.Null),
-            Vector(ScalarValue.Utf8("long-key-abcdefgh"), ScalarValue.Float64(7.0))
+            Vector(ScalarValue.checkedUtf8("a"), ScalarValue.Float64(4.0)),
+            Vector(ScalarValue.checkedUtf8("b"), ScalarValue.Null),
+            Vector(ScalarValue.checkedUtf8("long-key-abcdefgh"), ScalarValue.Float64(7.0))
           )
         )
       )
@@ -236,7 +463,223 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       result.close()
       input.close()
 
-  test("hash inner and left joins preserve duplicate order and SQL null-key semantics"):
+  test("projected multi-key and multi-measure aggregation uses the general kernel"):
+    type Input = (
+        species: Option[String],
+        sex: String,
+        height: Option[Double],
+        mass: Option[Double],
+        ignored: Int
+    )
+    type Selected = (
+        mass: Option[Double],
+        species: Option[String],
+        height: Option[Double],
+        sex: String
+    )
+    type Output = (
+        species: Option[String],
+        sex: String,
+        n: Long,
+        meanHeight: Option[Double],
+        meanMass: Option[Double]
+    )
+    val ref = reference("columnar-general-aggregate")
+    val input = table[Input](
+      Vector(
+        (
+          species = Some("human"),
+          sex = "female",
+          height = Some(160.0),
+          mass = Some(55.0),
+          ignored = 1
+        ),
+        (
+          species = None,
+          sex = "unknown",
+          height = None,
+          mass = Some(20.0),
+          ignored = 2
+        ),
+        (
+          species = Some("human"),
+          sex = "female",
+          height = Some(180.0),
+          mass = None,
+          ignored = 3
+        ),
+        (
+          species = Some("human"),
+          sex = "male",
+          height = Some(190.0),
+          mass = Some(90.0),
+          ignored = 4
+        )
+      ),
+      batchSize = 1
+    )
+    val selected: Frame[Selected] = value(Frame.values[Input](ref)).select: row =>
+      (
+        row.col("mass"),
+        row.col("species"),
+        row.col("height"),
+        row.col("sex")
+      )
+    val query: Frame[Output] = selected
+      .groupBy(row => (row.col("species"), row.col("sex")))
+      .aggregate: row =>
+        (
+          Aggregate.count.as("n"),
+          Aggregate.mean(row.col("height")).as("meanHeight"),
+          Aggregate.mean(row.col("mass")).as("meanMass")
+        )
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("HashAggregate[General,keys=2,measures=2]"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(
+              ScalarValue.checkedUtf8("human"),
+              ScalarValue.checkedUtf8("female"),
+              ScalarValue.Int64(2L),
+              ScalarValue.Float64(170.0),
+              ScalarValue.Float64(55.0)
+            ),
+            Vector(
+              ScalarValue.Null,
+              ScalarValue.checkedUtf8("unknown"),
+              ScalarValue.Int64(1L),
+              ScalarValue.Null,
+              ScalarValue.Float64(20.0)
+            ),
+            Vector(
+              ScalarValue.checkedUtf8("human"),
+              ScalarValue.checkedUtf8("male"),
+              ScalarValue.Int64(1L),
+              ScalarValue.Float64(190.0),
+              ScalarValue.Float64(90.0)
+            )
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
+  test("optimized sums preserve a first negative zero without changing mean semantics"):
+    type Input = (id: Int, group: String, value: Option[Double])
+    type IntOutput = (id: Int, sum: Option[Double], mean: Option[Double])
+    type Utf8Output = (group: String, sum: Option[Double])
+    val ref = reference("columnar-aggregate-negative-zero")
+    val input = table[Input](Vector((id = 1, group = "g", value = Some(-0.0))))
+    val source = value(Frame.values[Input](ref))
+    val intQuery: Frame[IntOutput] =
+      source
+        .groupBy(row => Tuple1(row.col("id").as("id")))
+        .aggregate: row =>
+          (
+            Aggregate.sum(row.col("value")).as("sum"),
+            Aggregate.mean(row.col("value")).as("mean")
+          )
+    val utf8Query: Frame[Utf8Output] =
+      source
+        .groupBy(row => Tuple1(row.col("group").as("group")))
+        .aggregate(row => Tuple1(Aggregate.sum(row.col("value")).as("sum")))
+    val sources = ReferenceSources.empty.bind(ref, input)
+    val intResult = completed(ColumnarInterpreter.prepare(intQuery.plan, sources).run())
+    val utf8Result = completed(ColumnarInterpreter.prepare(utf8Query.plan, sources).run())
+    try
+      intResult.rows match
+        case Right(Vector(Vector(_, ScalarValue.Float64(sum), ScalarValue.Float64(mean)))) =>
+          assertEquals(
+            java.lang.Double.doubleToRawLongBits(sum),
+            java.lang.Double.doubleToRawLongBits(-0.0)
+          )
+          assertEquals(
+            java.lang.Double.doubleToRawLongBits(mean),
+            java.lang.Double.doubleToRawLongBits(0.0)
+          )
+        case other => fail(s"unexpected Int32 aggregate result: $other")
+      utf8Result.rows match
+        case Right(Vector(Vector(_, ScalarValue.Float64(sum)))) =>
+          assertEquals(
+            java.lang.Double.doubleToRawLongBits(sum),
+            java.lang.Double.doubleToRawLongBits(-0.0)
+          )
+        case other => fail(s"unexpected UTF-8 aggregate result: $other")
+    finally
+      intResult.close()
+      utf8Result.close()
+      input.close()
+
+  test("required Int32 grouping uses primitive accumulators without changing moments"):
+    type Input = (id: Int, value: Option[Double])
+    type Output = (
+        id: Int,
+        n: Long,
+        sum: Option[Double],
+        mean: Option[Double],
+        variancePop: Option[Double]
+    )
+    val ref = reference("columnar-aggregate-int32")
+    val input = table[Input](
+      Vector(
+        (id = 2, value = Some(1.0)),
+        (id = 1, value = None),
+        (id = 2, value = Some(3.0)),
+        (id = 1, value = Some(4.0))
+      ),
+      batchSize = 1
+    )
+    val query: Frame[Output] =
+      value(Frame.values[Input](ref))
+        .groupBy(row => Tuple1(row.col("id").as("id")))
+        .aggregate: row =>
+          (
+            Aggregate.count.as("n"),
+            Aggregate.sum(row.col("value")).as("sum"),
+            Aggregate.mean(row.col("value")).as("mean"),
+            Aggregate.variancePop(row.col("value")).as("variancePop")
+          )
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("HashAggregate[Int32,Primitive]"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(
+              ScalarValue.Int32(2),
+              ScalarValue.Int64(2L),
+              ScalarValue.Float64(4.0),
+              ScalarValue.Float64(2.0),
+              ScalarValue.Float64(1.0)
+            ),
+            Vector(
+              ScalarValue.Int32(1),
+              ScalarValue.Int64(2L),
+              ScalarValue.Float64(4.0),
+              ScalarValue.Float64(4.0),
+              ScalarValue.Float64(0.0)
+            )
+          )
+        )
+      )
+    finally
+      result.close()
+      input.close()
+
+  test("one-shot and prepared hash joins preserve duplicate order and SQL null-key semantics"):
     type Left = (key: Option[Int], leftValue: Long)
     type Right = (rightKey: Option[Int], rightValue: Long)
     val leftRef = reference("columnar-join-left")
@@ -262,15 +705,32 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     val inner = left.innerJoin(right)((lhs, rhs) => (lhs.col("key") === rhs.col("rightKey")).isTrue)
     val outer = left.leftJoin(right)((lhs, rhs) => (lhs.col("key") === rhs.col("rightKey")).isTrue)
     val sources = ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
-    val innerRun = ColumnarInterpreter.prepare(inner.plan, sources).run()
-    val outerRun = ColumnarInterpreter.prepare(outer.plan, sources).run()
+    val innerExecution = ColumnarInterpreter.prepare(inner.plan, sources)
+    val outerExecution = ColumnarInterpreter.prepare(outer.plan, sources)
+    val preparedExecution = value(ColumnarInterpreter.prepareIndexed(inner.plan, sources))
+    val innerRun = innerExecution.run()
+    val outerRun = outerExecution.run()
+    rightInput.close()
+    val preparedRun = preparedExecution.run()
+    val repeatedPreparedRun = preparedExecution.run()
     val innerResult = completed(innerRun)
     val outerResult = completed(outerRun)
+    val preparedResult = completed(preparedRun)
+    val repeatedPreparedResult = completed(repeatedPreparedRun)
+    innerExecution.close()
+    outerExecution.close()
+    preparedExecution.close()
+    leftInput.close()
     try
       assertEquals(innerRun.receipt.fallback, None)
       assertEquals(outerRun.receipt.fallback, None)
       assert(innerRun.receipt.physicalPlan.contains("HashJoin[Inner"))
       assert(outerRun.receipt.physicalPlan.contains("HashJoin[LeftOuter"))
+      assert(innerRun.receipt.physicalPlan.contains("SelectionGather"))
+      assert(outerRun.receipt.physicalPlan.contains("SelectionGather"))
+      assert(preparedExecution.physicalExplain.contains("PreparedHashJoin[Inner"))
+      assert(preparedRun.receipt.physicalPlan.contains("PreparedHashJoin[Inner"))
+      assert(preparedRun.receipt.physicalPlan.contains("SelectionGather"))
       assertEquals(
         innerResult.rows,
         Right(
@@ -290,6 +750,8 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           )
         )
       )
+      assertEquals(preparedResult.rows, innerResult.rows)
+      assertEquals(repeatedPreparedResult.rows, innerResult.rows)
       assertEquals(
         outerResult.rows.map(_.map(_.drop(2))),
         Right(
@@ -301,11 +763,718 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
           )
         )
       )
+      assertEquals(
+        preparedExecution.run().result,
+        Left(ExecutionError.Storage(StorageError.SourceClosed))
+      )
     finally
       innerResult.close()
       outerResult.close()
+      preparedResult.close()
+      repeatedPreparedResult.close()
+      preparedExecution.close()
+      innerExecution.close()
+      outerExecution.close()
       leftInput.close()
       rightInput.close()
+
+  test("sorted merge joins preserve unique and duplicate order across batches"):
+    type Left = (key: Int, leftValue: Long)
+    type Right = (rightKey: Int, rightValue: Long)
+    val rows = 16384
+    val leftRef = reference("columnar-sorted-merge-left")
+    val uniqueRightRef = reference("columnar-sorted-merge-right-unique")
+    val duplicateRightRef = reference("columnar-sorted-merge-right-duplicate")
+    val leftRows = Vector.tabulate(rows): key =>
+      (key = key, leftValue = key.toLong * 3L)
+    val uniqueRightRows = Vector.tabulate(rows): key =>
+      (rightKey = key, rightValue = key.toLong * 5L)
+    val duplicateRightRows = Vector.tabulate(rows * 2): index =>
+      val key = index / 2
+      (rightKey = key, rightValue = key.toLong * 5L + (index & 1).toLong)
+    val leftInput = table[Left](leftRows, batchSize = 257)
+    val uniqueRightInput = table[Right](uniqueRightRows, batchSize = 509)
+    val duplicateRightInput = table[Right](duplicateRightRows, batchSize = 511)
+    val left = value(Frame.values[Left](leftRef))
+    val uniqueRight = value(Frame.values[Right](uniqueRightRef))
+    val duplicateRight = value(Frame.values[Right](duplicateRightRef))
+    val unique = left.innerJoin(uniqueRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+    val duplicate =
+      left.innerJoin(duplicateRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+
+    def expectedChecksum(duplicates: Int): Long =
+      var hash = rows.toLong * duplicates.toLong
+      var key = 0
+      while key < rows do
+        var duplicate = 0
+        while duplicate < duplicates do
+          hash = hash * 31L + key.toLong
+          hash = hash * 31L + key.toLong * 3L
+          hash = hash * 31L + key.toLong
+          hash = hash * 31L + key.toLong * 5L + duplicate.toLong
+          duplicate += 1
+        key += 1
+      hash
+
+    def assertMerge(
+        frame: Frame[(key: Int, leftValue: Long, rightKey: Int, rightValue: Long)],
+        sources: ReferenceSources,
+        duplicates: Int
+    ): Unit =
+      val execution = ColumnarInterpreter.prepare(frame.plan, sources)
+      try
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        try
+          assertEquals(profiled.run.receipt.fallback, None)
+          assert(profiled.run.receipt.physicalPlan.contains("SortedMergeOrHash"))
+          assert(profiled.stages.exists(_.stage == "merge-probe"))
+          assertEquals(result.rowCount, rows.toLong * duplicates.toLong)
+          assertEquals(value(result.checksum), expectedChecksum(duplicates))
+        finally result.close()
+      finally execution.close()
+
+    try
+      assertMerge(
+        unique,
+        ReferenceSources.empty.bind(leftRef, leftInput).bind(uniqueRightRef, uniqueRightInput),
+        duplicates = 1
+      )
+      assertMerge(
+        duplicate,
+        ReferenceSources.empty
+          .bind(leftRef, leftInput)
+          .bind(duplicateRightRef, duplicateRightInput),
+        duplicates = 2
+      )
+    finally
+      leftInput.close()
+      uniqueRightInput.close()
+      duplicateRightInput.close()
+
+  test("a late key inversion rejects merge dispatch and preserves stable hash output"):
+    type Left = (key: Int, leftValue: Long)
+    type Right = (rightKey: Int, rightValue: Long)
+    val rows = 16384
+    val leftRef = reference("columnar-late-inversion-left")
+    val rightRef = reference("columnar-late-inversion-right")
+    val leftRows = Vector.tabulate(rows): key =>
+      (key = key, leftValue = key.toLong * 3L)
+    val rightRows = Vector.tabulate(rows): row =>
+      val key =
+        if row == rows - 2 then rows - 1
+        else if row == rows - 1 then rows - 2
+        else row
+      (rightKey = key, rightValue = row.toLong * 5L)
+    val leftInput = table[Left](leftRows, batchSize = 257)
+    val rightInput = table[Right](rightRows, batchSize = 509)
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val joined =
+      left.innerJoin(right)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val execution = ColumnarInterpreter.prepare(joined.plan, sources)
+    var expectedChecksum = rows.toLong
+    var key = 0
+    while key < rows do
+      val rightRow =
+        if key == rows - 2 then rows - 1
+        else if key == rows - 1 then rows - 2
+        else key
+      expectedChecksum = expectedChecksum * 31L + key.toLong
+      expectedChecksum = expectedChecksum * 31L + key.toLong * 3L
+      expectedChecksum = expectedChecksum * 31L + key.toLong
+      expectedChecksum = expectedChecksum * 31L + rightRow.toLong * 5L
+      key += 1
+
+    try
+      (0 until 3).foreach: _ =>
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        try
+          assert(!profiled.stages.exists(_.stage == "merge-probe"))
+          assert(profiled.stages.exists(_.stage == "build"))
+          assertEquals(result.rowCount, rows.toLong)
+          assertEquals(value(result.checksum), expectedChecksum)
+        finally result.close()
+    finally
+      execution.close()
+      leftInput.close()
+      rightInput.close()
+
+  test("compressed join row runs preserve random and sequential batch/row mapping"):
+    val multiBatch = new JoinRowRunBuilder(singleBatch = false)
+    multiBatch.append(outputIndex = 0, batch = 0, row = 7)
+    multiBatch.append(outputIndex = 1, batch = 0, row = 8)
+    // Output indices 2 and 3 model invalid right-side outer-join slots. No source row is appended.
+    multiBatch.append(outputIndex = 4, batch = 1, row = 3)
+    multiBatch.append(outputIndex = 5, batch = 1, row = 4)
+    multiBatch.append(outputIndex = 6, batch = 1, row = 4)
+    val selected = multiBatch.result()
+
+    assertEquals(selected.batch(0), 0)
+    assertEquals(selected.row(0), 7)
+    assertEquals(selected.batch(1), 0)
+    assertEquals(selected.row(1), 8)
+    assertEquals(selected.batch(4), 1)
+    assertEquals(selected.row(4), 3)
+    assertEquals(selected.batch(5), 1)
+    assertEquals(selected.row(5), 4)
+    assertEquals(selected.batch(6), 1)
+    assertEquals(selected.row(6), 4)
+
+    val cursor = selected.cursor()
+    assertEquals(cursor.batch, 0)
+    assertEquals(cursor.row, 7)
+    cursor.advance()
+    assertEquals(cursor.batch, 0)
+    assertEquals(cursor.row, 8)
+    cursor.advance()
+    cursor.advance()
+    cursor.advance()
+    assertEquals(cursor.batch, 1)
+    assertEquals(cursor.row, 3)
+    cursor.advance()
+    assertEquals(cursor.batch, 1)
+    assertEquals(cursor.row, 4)
+    cursor.advance()
+    assertEquals(cursor.batch, 1)
+    assertEquals(cursor.row, 4)
+
+    val positioned = selected.cursorAt(4)
+    assertEquals(positioned.batch, 1)
+    assertEquals(positioned.row, 3)
+    positioned.advance()
+    assertEquals(positioned.batch, 1)
+    assertEquals(positioned.row, 4)
+
+    val gapPositioned = selected.cursorAt(2)
+    gapPositioned.advance()
+    gapPositioned.advance()
+    assertEquals(gapPositioned.batch, 1)
+    assertEquals(gapPositioned.row, 3)
+
+    val singleBatch = new JoinRowRunBuilder(singleBatch = true)
+    singleBatch.append(outputIndex = 0, batch = 0, row = 10)
+    singleBatch.append(outputIndex = 1, batch = 0, row = 11)
+    singleBatch.append(outputIndex = 2, batch = 0, row = 13)
+    val single = singleBatch.result()
+    assertEquals(single.batch(0), 0)
+    assertEquals(single.row(0), 10)
+    assertEquals(single.row(1), 11)
+    assertEquals(single.row(2), 13)
+    val singlePositioned = single.cursorAt(2)
+    assertEquals(singlePositioned.row, 13)
+
+  test("chunk-parallel gather materialization matches row-computed output above the threshold"):
+    type Left = (key: Int, label: Option[String], amount: Long)
+    type Right = (rightKey: Int, score: Option[Double])
+    val rows = 70000
+    val leftRef = reference("parallel-gather-left")
+    val rightRef = reference("parallel-gather-right")
+    val leftInput = table[Left](
+      Vector.tabulate(rows): i =>
+        (
+          key = i,
+          label = if i % 7 == 0 then None else Some(s"v$i"),
+          amount = i.toLong * 3L
+        ),
+      batchSize = 16384
+    )
+    val rightInput = table[Right](
+      Vector.tabulate(rows / 2): j =>
+        (
+          rightKey = j * 2,
+          score = if j % 5 == 0 then None else Some(j * 0.5)
+        ),
+      batchSize = 16384
+    )
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val query =
+      left.leftJoin(right): (lhs, rhs) =>
+        lhs.col("key") === rhs.col("rightKey")
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val execution = ColumnarInterpreter.prepare(query.plan, sources)
+    val result = completed(execution.run())
+    execution.close()
+    leftInput.close()
+    rightInput.close()
+    try
+      val batches = result.recordBatches.fold(reason => fail(reason), identity)
+      try
+        assertEquals(batches.map(_.rowCount).sum, rows)
+        var index = 0
+        batches.foreach: batch =>
+          var row = 0
+          while row < batch.rowCount do
+            val expectedLabel =
+              if index % 7 == 0 then ScalarValue.Null else ScalarValue.checkedUtf8(s"v$index")
+            val (expectedRightKey, expectedScore) =
+              if index % 2 == 0 then
+                val j = index / 2
+                (
+                  ScalarValue.Int32(index),
+                  if j % 5 == 0 then ScalarValue.Null else ScalarValue.Float64(j * 0.5)
+                )
+              else (ScalarValue.Null, ScalarValue.Null)
+            assertEquals(value(batch.columns(0).scalar(row)), ScalarValue.Int32(index))
+            assertEquals(value(batch.columns(1).scalar(row)), expectedLabel)
+            assertEquals(
+              value(batch.columns(2).scalar(row)),
+              ScalarValue.Int64(index.toLong * 3L)
+            )
+            assertEquals(value(batch.columns(3).scalar(row)), expectedRightKey)
+            assertEquals(value(batch.columns(4).scalar(row)), expectedScore)
+            row += 1
+            index += 1
+      finally batches.foreach(_.close())
+    finally result.close()
+
+  test("sorted merge preserves sparse kinds and falls back for nullable and empty keys"):
+    type Left = (key: Int, leftValue: Long)
+    type Right = (rightKey: Int, rightValue: Long)
+    val leftRowsCount = 32768
+    val rightRowsCount = 16384
+    val leftRef = reference("columnar-sorted-sparse-left")
+    val rightRef = reference("columnar-sorted-sparse-right")
+    val leftRows = Vector.tabulate(leftRowsCount): key =>
+      (key = key, leftValue = key.toLong * 3L)
+    val rightRows = Vector.tabulate(rightRowsCount): index =>
+      val key = index * 2
+      (rightKey = key, rightValue = key.toLong * 5L)
+    val leftInput = table[Left](leftRows, batchSize = 1021)
+    val rightInput = table[Right](rightRows, batchSize = 509)
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val condition = (lhs: Scope[Left, left.Origin], rhs: Scope[Right, right.Origin]) =>
+      lhs.col("key") === rhs.col("rightKey")
+    val inner = left.innerJoin(right)(condition)
+    val outer = left.leftJoin(right)(condition)
+    val semi = left.semiJoin(right)(condition)
+    val anti = left.antiJoin(right)(condition)
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val nullHash = 0x61c8864680b583ebL
+
+    def expected(kind: JoinKind): (Long, Long) =
+      val outputRows =
+        kind match
+          case JoinKind.Inner | JoinKind.LeftSemi => rightRowsCount.toLong
+          case JoinKind.LeftOuter                 => leftRowsCount.toLong
+          case JoinKind.LeftAnti                  => leftRowsCount.toLong - rightRowsCount.toLong
+      var hash = outputRows
+      var key = 0
+      while key < leftRowsCount do
+        val matched = (key & 1) == 0
+        val emit =
+          kind match
+            case JoinKind.Inner | JoinKind.LeftSemi => matched
+            case JoinKind.LeftOuter                 => true
+            case JoinKind.LeftAnti                  => !matched
+        if emit then
+          hash = hash * 31L + key.toLong
+          hash = hash * 31L + key.toLong * 3L
+          kind match
+            case JoinKind.Inner =>
+              hash = hash * 31L + key.toLong
+              hash = hash * 31L + key.toLong * 5L
+            case JoinKind.LeftOuter =>
+              if matched then
+                hash = hash * 31L + key.toLong
+                hash = hash * 31L + key.toLong * 5L
+              else
+                hash = hash * 31L + nullHash
+                hash = hash * 31L + nullHash
+            case JoinKind.LeftSemi => ()
+            case JoinKind.LeftAnti => ()
+        key += 1
+      outputRows -> hash
+
+    def assertMerge[S <: scala.NamedTuple.AnyNamedTuple](
+        frame: Frame[S],
+        kind: JoinKind
+    ): Unit =
+      val execution = ColumnarInterpreter.prepare(frame.plan, sources)
+      try
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        val expectedResult = expected(kind)
+        try
+          assert(profiled.stages.exists(_.stage == "merge-probe"))
+          assertEquals(result.rowCount, expectedResult._1)
+          assertEquals(value(result.checksum), expectedResult._2)
+        finally result.close()
+      finally execution.close()
+
+    try
+      assertMerge(inner, JoinKind.Inner)
+      assertMerge(outer, JoinKind.LeftOuter)
+      assertMerge(semi, JoinKind.LeftSemi)
+      assertMerge(anti, JoinKind.LeftAnti)
+    finally
+      leftInput.close()
+      rightInput.close()
+
+    type NullableLeft = (key: Option[Int], leftValue: Long)
+    type NullableRight = (rightKey: Option[Int], rightValue: Long)
+    val nullableLeftRef = reference("columnar-sorted-nullable-left")
+    val nullableRightRef = reference("columnar-sorted-nullable-right")
+    val nullableLeftRows = Vector.tabulate(16384): key =>
+      (key = Option.when(key != 8192)(key), leftValue = key.toLong)
+    val nullableRightRows = Vector.tabulate(16384): key =>
+      (rightKey = Some(key), rightValue = key.toLong * 2L)
+    val nullableLeftInput = table[NullableLeft](nullableLeftRows, batchSize = 1024)
+    val nullableRightInput = table[NullableRight](nullableRightRows, batchSize = 1024)
+    val nullableLeft = value(Frame.values[NullableLeft](nullableLeftRef))
+    val nullableRight = value(Frame.values[NullableRight](nullableRightRef))
+    val nullableCondition =
+      (
+          lhs: Scope[NullableLeft, nullableLeft.Origin],
+          rhs: Scope[NullableRight, nullableRight.Origin]
+      ) => (lhs.col("key") === rhs.col("rightKey")).isTrue
+    val nullableJoin = nullableLeft.innerJoin(nullableRight)(nullableCondition)
+    val nullableExecution = ColumnarInterpreter.prepare(
+      nullableJoin.plan,
+      ReferenceSources.empty
+        .bind(nullableLeftRef, nullableLeftInput)
+        .bind(nullableRightRef, nullableRightInput)
+    )
+    try
+      val profiled = nullableExecution.profileRun()
+      val result = completed(profiled.run)
+      try
+        assert(!profiled.stages.exists(_.stage == "merge-probe"))
+        assert(profiled.stages.exists(_.stage == "build"))
+        assertEquals(result.rowCount, 16383L)
+      finally result.close()
+    finally
+      nullableExecution.close()
+      nullableLeftInput.close()
+      nullableRightInput.close()
+
+    val emptyLeftRef = reference("columnar-empty-merge-left")
+    val emptyRightRef = reference("columnar-empty-merge-right")
+    val emptyLeftInput =
+      table[Left](Vector((key = 1, leftValue = 10L), (key = 2, leftValue = 20L)))
+    val emptyRightInput = table[Right](Vector.empty)
+    val emptyLeft = value(Frame.values[Left](emptyLeftRef))
+    val emptyRight = value(Frame.values[Right](emptyRightRef))
+    val emptySources =
+      ReferenceSources.empty.bind(emptyLeftRef, emptyLeftInput).bind(emptyRightRef, emptyRightInput)
+
+    def emptyRows[S <: scala.NamedTuple.AnyNamedTuple](frame: Frame[S]): Long =
+      val execution = ColumnarInterpreter.prepare(frame.plan, emptySources)
+      try
+        val profiled = execution.profileRun()
+        val result = completed(profiled.run)
+        try
+          assert(!profiled.stages.exists(_.stage == "merge-probe"))
+          result.rowCount
+        finally result.close()
+      finally execution.close()
+
+    try
+      assertEquals(
+        emptyRows(
+          emptyLeft.innerJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        0L
+      )
+      assertEquals(
+        emptyRows(
+          emptyLeft.leftJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        2L
+      )
+      assertEquals(
+        emptyRows(
+          emptyLeft.semiJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        0L
+      )
+      assertEquals(
+        emptyRows(
+          emptyLeft.antiJoin(emptyRight)((lhs, rhs) => lhs.col("key") === rhs.col("rightKey"))
+        ),
+        2L
+      )
+    finally
+      emptyLeftInput.close()
+      emptyRightInput.close()
+
+  test("hash joins preserve order and checksums at the bounded-probe admission threshold"):
+    type Left = (key: Option[Int], leftValue: Long)
+    type Right = (rightKey: Option[Int], rightValue: Long)
+    val leftRef = reference("columnar-threshold-left")
+    val rightRef = reference("columnar-threshold-right")
+    val rowCount = Parallelism.MinimumRows
+    val mask = rowCount - 1
+    val rightKeyCount = rowCount / 2
+    val rightMask = rightKeyCount - 1
+
+    val leftRows: Vector[Left] = Vector.tabulate(rowCount): index =>
+      val key = (index * 40503) & mask
+      val nullableKey = if key % 8192 == 0 then None else Some(key)
+      (key = nullableKey, leftValue = index.toLong * 3L)
+    val rightRows: Vector[Right] = Vector.tabulate(rowCount): index =>
+      val pair = index / 2
+      val duplicate = index & 1
+      val key = ((pair * 16411) & rightMask) * 2
+      (rightKey = Some(key), rightValue = key.toLong * 5L + duplicate.toLong)
+
+    val leftInput =
+      table[Left](leftRows, batchSize = Parallelism.MinimumChunkRows + 3)
+    val rightInput =
+      table[Right](rightRows, batchSize = Parallelism.MinimumChunkRows - 1)
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val condition = (lhs: Scope[Left, left.Origin], rhs: Scope[Right, right.Origin]) =>
+      (lhs.col("key") === rhs.col("rightKey")).isTrue
+    val inner = left.innerJoin(right)(condition)
+    val outer = left.leftJoin(right)(condition)
+    val semi = left.semiJoin(right)(condition)
+    val anti = left.antiJoin(right)(condition)
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+
+    def mix(hash: Long, value: Long): Long = hash * 31L + value
+    def mixKey(hash: Long, key: Option[Int]): Long =
+      mix(hash, key.fold(0x61c8864680b583ebL)(_.toLong))
+
+    var innerRows = 0L
+    var outerRows = 0L
+    var semiRows = 0L
+    var antiRows = 0L
+    leftRows.foreach: row =>
+      val matched = row.key.exists(_ % 2 == 0)
+      if matched then
+        innerRows += 2L
+        outerRows += 2L
+        semiRows += 1L
+      else
+        outerRows += 1L
+        antiRows += 1L
+
+    var innerChecksum = innerRows
+    var outerChecksum = outerRows
+    var semiChecksum = semiRows
+    var antiChecksum = antiRows
+    leftRows.foreach: row =>
+      val matched = row.key.exists(_ % 2 == 0)
+      if matched then
+        val matchedKey = row.key.get
+        var duplicate = 0
+        while duplicate < 2 do
+          innerChecksum = mixKey(innerChecksum, row.key)
+          innerChecksum = mix(innerChecksum, row.leftValue)
+          innerChecksum = mixKey(innerChecksum, Some(matchedKey))
+          innerChecksum = mix(innerChecksum, matchedKey.toLong * 5L + duplicate.toLong)
+
+          outerChecksum = mixKey(outerChecksum, row.key)
+          outerChecksum = mix(outerChecksum, row.leftValue)
+          outerChecksum = mixKey(outerChecksum, Some(matchedKey))
+          outerChecksum = mix(outerChecksum, matchedKey.toLong * 5L + duplicate.toLong)
+          duplicate += 1
+
+        semiChecksum = mixKey(semiChecksum, row.key)
+        semiChecksum = mix(semiChecksum, row.leftValue)
+      else
+        outerChecksum = mixKey(outerChecksum, row.key)
+        outerChecksum = mix(outerChecksum, row.leftValue)
+        outerChecksum = mix(outerChecksum, 0x61c8864680b583ebL)
+        outerChecksum = mix(outerChecksum, 0x61c8864680b583ebL)
+
+        antiChecksum = mixKey(antiChecksum, row.key)
+        antiChecksum = mix(antiChecksum, row.leftValue)
+
+    def assertStable[S <: scala.NamedTuple.AnyNamedTuple](
+        frame: Frame[S],
+        expectedRows: Long,
+        expectedChecksum: Long
+    ): Unit =
+      val execution = ColumnarInterpreter.prepare(frame.plan, sources)
+      try
+        (0 until 3).foreach: _ =>
+          val run = execution.run()
+          val result = completed(run)
+          try
+            assertEquals(run.receipt.fallback, None)
+            assert(run.receipt.physicalPlan.contains("HashJoin"))
+            assertEquals(result.order, frame.plan.order)
+            assertEquals(result.rowCount, expectedRows)
+            assertEquals(value(result.checksum), expectedChecksum)
+          finally result.close()
+      finally execution.close()
+
+    try
+      assertStable(inner, innerRows, innerChecksum)
+      assertStable(outer, outerRows, outerChecksum)
+      assertStable(semi, semiRows, semiChecksum)
+      assertStable(anti, antiRows, antiChecksum)
+    finally
+      leftInput.close()
+      rightInput.close()
+
+  test("selection-backed outer joins gather every primitive family and survive owner closure"):
+    type Left =
+      (
+          key: Int,
+          code: Option[Int],
+          count: Option[Long],
+          flag: Option[Boolean],
+          ratio: Option[Float],
+          label: Option[String],
+          at: Option[TimestampMicros]
+      )
+    type Right = (rightKey: Int, score: Option[Double])
+    val leftRef = reference("columnar-gather-left")
+    val rightRef = reference("columnar-gather-right")
+    val leftInput = table[Left](
+      Vector(
+        (
+          key = 1,
+          code = Some(11),
+          count = Some(101L),
+          flag = Some(true),
+          ratio = Some(1.5f),
+          label = Some("one"),
+          at = Some(TimestampMicros(7L))
+        ),
+        (
+          key = 2,
+          code = None,
+          count = None,
+          flag = None,
+          ratio = None,
+          label = None,
+          at = None
+        )
+      ),
+      batchSize = 1
+    )
+    val rightInput = table[Right](
+      Vector((rightKey = 1, score = Some(Double.NaN))),
+      batchSize = 1
+    )
+    val left = value(Frame.values[Left](leftRef))
+    val right = value(Frame.values[Right](rightRef))
+    val query =
+      left.leftJoin(right): (lhs, rhs) =>
+        lhs.col("key") === rhs.col("rightKey")
+    val sources =
+      ReferenceSources.empty.bind(leftRef, leftInput).bind(rightRef, rightInput)
+    val execution = ColumnarInterpreter.prepare(query.plan, sources)
+    val prepared = value(ColumnarInterpreter.prepareIndexed(query.plan, sources))
+    val run = execution.run()
+    val preparedRun = prepared.run()
+    val result = completed(run)
+    val preparedResult = completed(preparedRun)
+    execution.close()
+    prepared.close()
+    leftInput.close()
+    rightInput.close()
+    try
+      assert(run.receipt.physicalPlan.contains("SelectionGather"))
+      assert(preparedRun.receipt.physicalPlan.contains("SelectionGather"))
+      val expected =
+        Vector(
+          Vector(
+            ScalarValue.Int32(1),
+            ScalarValue.Int32(11),
+            ScalarValue.Int64(101L),
+            ScalarValue.Bool(true),
+            ScalarValue.Float32(1.5f),
+            ScalarValue.checkedUtf8("one"),
+            ScalarValue.Timestamp(7L, TimeUnit.Microsecond),
+            ScalarValue.Int32(1),
+            ScalarValue.Float64(Double.NaN)
+          ),
+          Vector(
+            ScalarValue.Int32(2),
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null,
+            ScalarValue.Null
+          )
+        )
+      val actual = value(result.rows)
+      val preparedActual = value(preparedResult.rows)
+      def normalized(rows: Vector[Vector[ScalarValue]]): Vector[Vector[String]] =
+        rows.map:
+          _.map:
+            case ScalarValue.Float64(value) if value.isNaN => "Float64(NaN)"
+            case value                                     => value.toString
+      assertEquals(normalized(actual), normalized(expected))
+      assertEquals(normalized(preparedActual), normalized(expected))
+      actual.head(8) match
+        case ScalarValue.Float64(value) =>
+          assertEquals(
+            java.lang.Double.doubleToRawLongBits(value),
+            java.lang.Double.doubleToRawLongBits(Double.NaN)
+          )
+        case value => fail(s"expected gathered NaN, received $value")
+      assertEquals(result.checksum, preparedResult.checksum)
+
+      def physicalRows(value: ColumnarResult): Vector[Vector[ScalarValue]] =
+        val batches = value.recordBatches.fold(reason => fail(reason), identity)
+        try
+          batches.flatMap: batch =>
+            Vector.tabulate(batch.rowCount): row =>
+              batch.columns.map(column => this.value(column.scalar(row)))
+        finally batches.foreach(_.close())
+
+      assertEquals(normalized(physicalRows(result)), normalized(expected))
+      assertEquals(normalized(physicalRows(preparedResult)), normalized(expected))
+    finally
+      result.close()
+      preparedResult.close()
+      execution.close()
+      prepared.close()
+      leftInput.close()
+      rightInput.close()
+
+  test("single required Int32 distinct uses a stable primitive accumulator"):
+    type Input = (id: Int)
+    val ref = reference("columnar-distinct-int32")
+    val input = table[Input](
+      Vector(
+        (id = 3),
+        (id = 1),
+        (id = 3),
+        (id = -1),
+        (id = 1),
+        (id = 2)
+      ),
+      batchSize = 2
+    )
+    val query = value(Frame.values[Input](ref)).distinct
+    val run = ColumnarInterpreter
+      .prepare(query.plan, ReferenceSources.empty.bind(ref, input))
+      .run()
+    val result = completed(run)
+    input.close()
+    try
+      assertEquals(run.receipt.fallback, None)
+      assert(run.receipt.physicalPlan.contains("HashDistinct[Int32,Primitive]"))
+      assertEquals(
+        result.rows,
+        Right(
+          Vector(
+            Vector(ScalarValue.Int32(3)),
+            Vector(ScalarValue.Int32(1)),
+            Vector(ScalarValue.Int32(-1)),
+            Vector(ScalarValue.Int32(2))
+          )
+        )
+      )
+    finally result.close()
 
   test("hash distinct compares decoded dictionary values and canonical floating keys"):
     type Input = (word: String, value: Double)
@@ -329,7 +1498,7 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
     val nanA = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
     val nanB = java.lang.Double.longBitsToDouble(0x7ff8000000000011L)
     val input = value(
-      Table[Input](
+      Table.takeOwnership[Input](
         Vector(
           dictionaryBatch(Array(0, 1), Array("a", "b"), Array(nanA, 0.0)),
           dictionaryBatch(Array(1, 0), Array("b", "a"), Array(nanB, -0.0))
@@ -391,6 +1560,42 @@ class ColumnarInterpreterSuite extends munit.FunSuite:
       direct.close()
       dictionary.close()
 
+  test("collect materializes Arrow batches matching the reference interpreter"):
+    type Input = (id: Int, value: Option[Double], label: String)
+    type Output = (id: Int, value: Option[Double], label: String)
+    val ref = reference("columnar-collect")
+    val rows = Vector(
+      (id = 1, value = Some(1.5), label = "a"),
+      (id = 2, value = None, label = "b"),
+      (id = 3, value = Some(-0.0), label = "c"),
+      (id = 4, value = Some(2.25), label = "d")
+    )
+    val input = table[Input](rows)
+    val source = value(Frame.values[Input](ref))
+    val query: Frame[Output] = source.filter(row => row.col("id") > 1)
+    val sources = ReferenceSources.empty.bind(ref, input)
+
+    // The engine must actually take this plan; a silent fallback would make the comparison
+    // below vacuous, because both sides would then be the reference interpreter.
+    val collected = ColumnarInterpreter.collect(query.plan, sources) match
+      case Left(reason) => fail(s"columnar engine declined a supported plan: $reason")
+      case Right(value) => value
+    assertEquals(collected.receipt.fallback, None)
+    assert(collected.receipt.physicalPlan.contains("FilterSelection"))
+    val batches = collected.batches
+
+    val produced = batches.flatMap: batch =>
+      (0 until batch.rowCount).toVector.map: row =>
+        batch.columns.map(column => value(column.scalar(row)))
+    val expected =
+      value(ReferenceInterpreter.prepare(query.plan, sources).collect[Output]).batches
+        .flatMap: batch =>
+          (0 until batch.rowCount).toVector.map: row =>
+            batch.columns.map(column => value(column.scalar(row)))
+
+    assertEquals(produced, expected)
+    assertEquals(produced.length, 3)
+
 object ColumnarInterpreterSuite:
   private def fingerprint(row: Vector[ScalarValue]): String = row match
     case Vector(ScalarValue.Utf8(word), ScalarValue.Float64(value)) =>
@@ -398,5 +1603,5 @@ object ColumnarInterpreterSuite:
         if value.isNaN then "nan"
         else if value == 0.0 then "zero"
         else java.lang.Double.doubleToLongBits(value).toString
-      s"$word|$floating"
+      s"${word.value}|$floating"
     case other => other.toString

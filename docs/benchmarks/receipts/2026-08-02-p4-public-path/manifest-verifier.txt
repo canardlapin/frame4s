@@ -1,0 +1,13 @@
+source manifest verified: 18 paths
+
+self-test: one valid path
+source manifest verified: 1 paths
+
+self-test: hash mismatch (expected exit 1)
+manifest hash mismatch: scripts/verify-source-manifest.sh
+
+self-test: missing manifest path (expected exit 1)
+manifest path missing: scripts/verify-source-manifest.sh
+
+self-test: unexpected manifest path (expected exit 1)
+unexpected manifest path: build.sbt

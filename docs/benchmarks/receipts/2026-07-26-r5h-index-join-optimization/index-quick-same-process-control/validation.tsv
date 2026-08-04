@@ -1,0 +1,81 @@
+benchmark	input_rows	output_rows	checksum_or_bytes	status	layout	shape
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	fast-hash	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	fast-hash	unique
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	32	14554966086508252864	same-counting-pass primitive-sort control; exact parity with stable linear scan	fast-hash	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	20777216	owned index bytes	fast-hash	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	0	0	exact parity with stable linear scan	fast-hash	mixed-miss
+ExtendedIndexLookupCourt.batch32Lookup	1000000	16	7260442535237621654	exact parity with stable linear scan; query unchanged	fast-hash	mixed-miss
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	16	7260442535237621654	same-counting-pass primitive-sort control; exact parity with stable linear scan	fast-hash	mixed-miss
+ExtendedIndexBuildCourt.build	1000000	1000000	20777216	owned index bytes	fast-hash	mixed-miss
+ExtendedIndexLookupCourt.singleLookup	1000000	8	3188334135560712	exact parity with stable linear scan	fast-hash	fanout-8
+ExtendedIndexLookupCourt.batch32Lookup	1000000	256	11883708537156009700	exact parity with stable linear scan; query unchanged	fast-hash	fanout-8
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	256	11883708537156009700	same-counting-pass primitive-sort control; exact parity with stable linear scan	fast-hash	fanout-8
+ExtendedIndexBuildCourt.build	1000000	1000000	20777216	owned index bytes	fast-hash	fanout-8
+ExtendedIndexLookupCourt.singleLookup	1000000	7813	14591963101091370202	exact parity with stable linear scan	fast-hash	skewed
+ExtendedIndexLookupCourt.batch32Lookup	1000000	7842	16398796646659458615	exact parity with stable linear scan; query unchanged	fast-hash	skewed
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	7842	16398796646659458615	same-counting-pass primitive-sort control; exact parity with stable linear scan	fast-hash	skewed
+ExtendedIndexBuildCourt.build	1000000	1000000	20777216	owned index bytes	fast-hash	skewed
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	compact-sorted	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	compact-sorted	unique
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	32	14554966086508252864	same-counting-pass primitive-sort control; exact parity with stable linear scan	compact-sorted	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	8000000	owned index bytes	compact-sorted	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	0	0	exact parity with stable linear scan	compact-sorted	mixed-miss
+ExtendedIndexLookupCourt.batch32Lookup	1000000	16	7260442535237621654	exact parity with stable linear scan; query unchanged	compact-sorted	mixed-miss
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	16	7260442535237621654	same-counting-pass primitive-sort control; exact parity with stable linear scan	compact-sorted	mixed-miss
+ExtendedIndexBuildCourt.build	1000000	1000000	8000000	owned index bytes	compact-sorted	mixed-miss
+ExtendedIndexLookupCourt.singleLookup	1000000	8	3188334135560712	exact parity with stable linear scan	compact-sorted	fanout-8
+ExtendedIndexLookupCourt.batch32Lookup	1000000	256	11883708537156009700	exact parity with stable linear scan; query unchanged	compact-sorted	fanout-8
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	256	11883708537156009700	same-counting-pass primitive-sort control; exact parity with stable linear scan	compact-sorted	fanout-8
+ExtendedIndexBuildCourt.build	1000000	1000000	8000000	owned index bytes	compact-sorted	fanout-8
+ExtendedIndexLookupCourt.singleLookup	1000000	7813	14591963101091370202	exact parity with stable linear scan	compact-sorted	skewed
+ExtendedIndexLookupCourt.batch32Lookup	1000000	7842	16398796646659458615	exact parity with stable linear scan; query unchanged	compact-sorted	skewed
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	7842	16398796646659458615	same-counting-pass primitive-sort control; exact parity with stable linear scan	compact-sorted	skewed
+ExtendedIndexBuildCourt.build	1000000	1000000	8000000	owned index bytes	compact-sorted	skewed
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	packed-sorted	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	packed-sorted	unique
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	32	14554966086508252864	same-counting-pass primitive-sort control; exact parity with stable linear scan	packed-sorted	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	6500000	owned index bytes	packed-sorted	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	0	0	exact parity with stable linear scan	packed-sorted	mixed-miss
+ExtendedIndexLookupCourt.batch32Lookup	1000000	16	7260442535237621654	exact parity with stable linear scan; query unchanged	packed-sorted	mixed-miss
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	16	7260442535237621654	same-counting-pass primitive-sort control; exact parity with stable linear scan	packed-sorted	mixed-miss
+ExtendedIndexBuildCourt.build	1000000	1000000	6500000	owned index bytes	packed-sorted	mixed-miss
+ExtendedIndexLookupCourt.singleLookup	1000000	8	3188334135560712	exact parity with stable linear scan	packed-sorted	fanout-8
+ExtendedIndexLookupCourt.batch32Lookup	1000000	256	11883708537156009700	exact parity with stable linear scan; query unchanged	packed-sorted	fanout-8
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	256	11883708537156009700	same-counting-pass primitive-sort control; exact parity with stable linear scan	packed-sorted	fanout-8
+ExtendedIndexBuildCourt.build	1000000	1000000	6500000	owned index bytes	packed-sorted	fanout-8
+ExtendedIndexLookupCourt.singleLookup	1000000	7813	14591963101091370202	exact parity with stable linear scan	packed-sorted	skewed
+ExtendedIndexLookupCourt.batch32Lookup	1000000	7842	16398796646659458615	exact parity with stable linear scan; query unchanged	packed-sorted	skewed
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	7842	16398796646659458615	same-counting-pass primitive-sort control; exact parity with stable linear scan	packed-sorted	skewed
+ExtendedIndexBuildCourt.build	1000000	1000000	6500000	owned index bytes	packed-sorted	skewed
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	flat-hash-rows	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	flat-hash-rows	unique
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	32	14554966086508252864	same-counting-pass primitive-sort control; exact parity with stable linear scan	flat-hash-rows	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	flat-hash-rows	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	0	0	exact parity with stable linear scan	flat-hash-rows	mixed-miss
+ExtendedIndexLookupCourt.batch32Lookup	1000000	16	7260442535237621654	exact parity with stable linear scan; query unchanged	flat-hash-rows	mixed-miss
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	16	7260442535237621654	same-counting-pass primitive-sort control; exact parity with stable linear scan	flat-hash-rows	mixed-miss
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	flat-hash-rows	mixed-miss
+ExtendedIndexLookupCourt.singleLookup	1000000	8	3188334135560712	exact parity with stable linear scan	flat-hash-rows	fanout-8
+ExtendedIndexLookupCourt.batch32Lookup	1000000	256	11883708537156009700	exact parity with stable linear scan; query unchanged	flat-hash-rows	fanout-8
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	256	11883708537156009700	same-counting-pass primitive-sort control; exact parity with stable linear scan	flat-hash-rows	fanout-8
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	flat-hash-rows	fanout-8
+ExtendedIndexLookupCourt.singleLookup	1000000	7813	14591963101091370202	exact parity with stable linear scan	flat-hash-rows	skewed
+ExtendedIndexLookupCourt.batch32Lookup	1000000	7842	16398796646659458615	exact parity with stable linear scan; query unchanged	flat-hash-rows	skewed
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	7842	16398796646659458615	same-counting-pass primitive-sort control; exact parity with stable linear scan	flat-hash-rows	skewed
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	flat-hash-rows	skewed
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	grouped-hash	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	grouped-hash	unique
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	32	14554966086508252864	same-counting-pass primitive-sort control; exact parity with stable linear scan	grouped-hash	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	grouped-hash	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	0	0	exact parity with stable linear scan	grouped-hash	mixed-miss
+ExtendedIndexLookupCourt.batch32Lookup	1000000	16	7260442535237621654	exact parity with stable linear scan; query unchanged	grouped-hash	mixed-miss
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	16	7260442535237621654	same-counting-pass primitive-sort control; exact parity with stable linear scan	grouped-hash	mixed-miss
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	grouped-hash	mixed-miss
+ExtendedIndexLookupCourt.singleLookup	1000000	8	3188334135560712	exact parity with stable linear scan	grouped-hash	fanout-8
+ExtendedIndexLookupCourt.batch32Lookup	1000000	256	11883708537156009700	exact parity with stable linear scan; query unchanged	grouped-hash	fanout-8
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	256	11883708537156009700	same-counting-pass primitive-sort control; exact parity with stable linear scan	grouped-hash	fanout-8
+ExtendedIndexBuildCourt.build	1000000	1000000	5833336	owned index bytes	grouped-hash	fanout-8
+ExtendedIndexLookupCourt.singleLookup	1000000	7813	14591963101091370202	exact parity with stable linear scan	grouped-hash	skewed
+ExtendedIndexLookupCourt.batch32Lookup	1000000	7842	16398796646659458615	exact parity with stable linear scan; query unchanged	grouped-hash	skewed
+ExtendedIndexLookupCourt.sortedBatchControl	1000000	7842	16398796646659458615	same-counting-pass primitive-sort control; exact parity with stable linear scan	grouped-hash	skewed
+ExtendedIndexBuildCourt.build	1000000	1000000	10614600	owned index bytes	grouped-hash	skewed

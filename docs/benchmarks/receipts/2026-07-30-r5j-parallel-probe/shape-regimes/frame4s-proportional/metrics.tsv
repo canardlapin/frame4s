@@ -1,0 +1,9 @@
+rows	workload	order	milliseconds	allocation_bytes
+1000000	anti-sparse	both-shuffled	2.877363052	19324216.851
+1000000	join-skewed	both-shuffled	0.588109120	12083132.717
+1000000	join-sparse	both-shuffled	3.605554596	16999662.823
+1000000	semi-sparse	both-shuffled	3.465021099	16159259.829
+4000000	anti-sparse	both-shuffled	12.056328146	77218920.303
+4000000	join-skewed	both-shuffled	2.013179006	48083219.167
+4000000	join-sparse	both-shuffled	12.533712843	67827838.448
+4000000	semi-sparse	both-shuffled	12.390537842	64519890.745

@@ -1,0 +1,7 @@
+scale	query_shape	output_rows	checksum	status
+1000	single	1	1030	exact-internal-parity
+1000	batch32	32	4681416325217595444	exact-internal-parity
+100000	single	1	100030	exact-internal-parity
+100000	batch32	32	13590724320720048604	exact-internal-parity
+1000000	single	1	1000030	exact-internal-parity
+1000000	batch32	32	14554966086508252864	exact-internal-parity

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source_root="$(pwd)"
+user_root="${HOME:-}"
 candidate_commit="$(git rev-parse HEAD)"
 version="${FRAME4S_REHEARSAL_VERSION:-0.1.0-RC1}"
 receipt="${1:-docs/benchmarks/receipts/$(date +%F)-r6-release-rehearsal}"
@@ -13,15 +14,21 @@ mkdir -p "$receipt"
 repository="$(mktemp -d /tmp/frame4s-release-rehearsal.XXXXXX)"
 gpg_home="$(mktemp -d /tmp/frame4s-release-signing.XXXXXX)"
 workspace="$(mktemp -d /tmp/frame4s-release-workspace.XXXXXX)"
+repository_real="$(cd "$repository" && pwd -P)"
+workspace_real="$(cd "$workspace" && pwd -P)"
 chmod 700 "$gpg_home"
 cleanup() {
   rm -rf "$repository" "$gpg_home" "$workspace"
 }
 trap cleanup EXIT
 export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  echo "JAVA_HOME must name the JDK used by sbt so the receipt records the actual toolchain." >&2
+  exit 2
+fi
+java_command="$JAVA_HOME/bin/java"
 
 {
-  java_command="${JAVA_HOME:+$JAVA_HOME/bin/}java"
   echo "java.version=$("$java_command" -version 2>&1 | head -1)"
   echo "node.version=$(node --version)"
   echo "sbt.version=$(sed -n 's/^sbt.version=//p' project/build.properties)"
@@ -38,12 +45,19 @@ export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
 } >"$receipt/environment.properties"
 
 {
-  printf '%s\n' build.sbt project/build.properties project/plugins.sbt
+  printf '%s\n' \
+    build.sbt \
+    project/build.properties \
+    project/plugins.sbt \
+    project/WideSchemaGenerator.scala \
+    scripts/release-rehearsal.sh
   find \
     modules/core \
     modules/fs2 \
+    modules/arrow \
     modules/staged-consumer-jvm \
     modules/staged-consumer-js \
+    modules/staged-consumer-arrow \
     -path '*/src/main/*' \
     -type f \
     -print
@@ -56,6 +70,11 @@ export SBT_OPTS="${SBT_OPTS:-} -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
 rsync -a \
   --exclude .git \
   --exclude .mote \
+  --exclude .bloop \
+  --exclude .bsp \
+  --exclude .idea \
+  --exclude .metals \
+  --exclude .scala-build \
   --exclude target \
   --exclude vendor \
   --exclude docs/benchmarks/receipts \
@@ -69,25 +88,49 @@ git -C "$workspace" \
   commit --quiet --no-gpg-sign -m "release rehearsal snapshot"
 cd "$workspace"
 
-sbt \
-  -Dframe4s.rehearsal.enabled=true \
-  -Dframe4s.rehearsal.repo="$repository" \
-  "set ThisBuild / version := \"$version\"" \
-  "set coreJVM / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
-  "set coreJS / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
-  "set fs2JVM / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
-  "set fs2JS / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
-  coreJVM/publish \
-  coreJS/publish \
-  fs2JVM/publish \
-  fs2JS/publish \
-  stagedConsumerJVM/run \
-  stagedConsumerJS/run \
-  2>&1 |
+sbt_candidate() {
+  sbt \
+    -Dframe4s.rehearsal.enabled=true \
+    -Dframe4s.rehearsal.repo="$repository" \
+    "set ThisBuild / version := \"$version\"" \
+    "$@"
+}
+
+# Consumer projects are deliberately started in fresh sbt processes. That models independent
+# downstream builds and prevents compiler state from every earlier width from consuming the fixed
+# default heap before the 512-column stress tier. The court does not raise a consumer heap or inline
+# limit.
+(
+  sbt_candidate \
+    "set coreJVM / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
+    "set coreJS / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
+    "set fs2JVM / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
+    "set fs2JS / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
+    "set arrow / publishTo := Some(Resolver.file(\"frame4s-rehearsal-publish\", file(\"$repository\"))(Resolver.mavenStylePatterns))" \
+    coreJVM/publish \
+    coreJS/publish \
+    fs2JVM/publish \
+    fs2JS/publish \
+    arrow/publish
+
+  sbt_candidate \
+    stagedConsumerJVM/run \
+    stagedConsumerJS/run \
+    stagedConsumerArrow/run
+
+  for width in 32 48 128 256 512; do
+    sbt_candidate \
+      "stagedWide${width}JVM/run" \
+      "stagedWide${width}JS/run"
+  done
+) 2>&1 |
   sed \
+    -e "s|$repository_real|<rehearsal-repository>|g" \
     -e "s|$repository|<rehearsal-repository>|g" \
     -e "s|$source_root|<workspace>|g" \
+    -e "s|$workspace_real|<workspace>|g" \
     -e "s|$workspace|<workspace>|g" |
+  sed -e "s|$user_root|<user-home>|g" |
   tee "$receipt/publish-and-consumer-output.txt"
 
 rehearsal_uid="frame4s release rehearsal <rehearsal@frame4s.invalid>"
@@ -126,6 +169,7 @@ artifacts=(
   frame4s-core_sjs1_3
   frame4s-fs2_3
   frame4s-fs2_sjs1_3
+  frame4s-arrow_3
 )
 
 for artifact in "${artifacts[@]}"; do
@@ -168,6 +212,12 @@ for artifact in "${artifacts[@]}"; do
     exit 1
   fi
 done >"$receipt/artifact-verification.txt"
+
+fs2_pom="$repository/io/github/canardlapin/frame4s-fs2_3/$version/frame4s-fs2_3-$version.pom"
+if grep -F 'org.apache.arrow' "$fs2_pom"; then
+  echo "frame4s-fs2 unexpectedly depends on Apache Arrow" >&2
+  exit 1
+fi
 
 find "$repository/io/github/canardlapin" -type f -print |
   sed "s|^$repository/||" |

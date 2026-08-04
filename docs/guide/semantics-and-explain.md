@@ -15,20 +15,35 @@ type Row = (id: Int, value: Option[Double])
 
 def explanation(input: Frame[Row]): String =
   input
-    .filter(row => row.col("id") > Expr.literal(0))
+    .filter(row => row.col("id") > 0)
     .select(row =>
       (
-        row.col("id").as("id"),
+        row.col("id"),
         row.col("value").sqrt.as("root")
       )
     )
     .explain
 ```
 
-Physical explain belongs to the selected execution boundary and names physical
-operators, blocking behavior, estimates, and fallback. The always-available
-reference backend is the executable oracle. Comparative performance claims
-require the versioned
+Each explanation assigns short local names such as `e1` and `e2`, then emits a
+linear expression legend. The legend names operators and column positions but
+renders literals only by physical type. It never prints literal values,
+internal fingerprints, or expression provenance tokens. Reusing an expression
+therefore grows the explanation with the number of distinct nodes, not with a
+recursively expanded expression string.
+
+Physical explain belongs to an execution boundary. On `FrameRuntime`,
+`physicalExplain` describes materializing collection under the configured
+`EnginePolicy`, while `streamPhysicalExplain` describes the reference cursor
+and names any blocking operators. `collectWithReceipt` records the backend that
+actually ran and any typed fallback reason. Treat that receipt as data;
+`physicalPlan` and both explain strings are diagnostics rather than control-flow
+protocols.
+
+The always-available reference backend is the executable oracle.
+`EnginePolicy.Auto` may select admitted in-process columnar kernels for
+collection, `ReferenceOnly` bypasses them, and `RequireColumnar` rejects a
+declined plan. Comparative performance claims require the versioned
 [measurement court](https://github.com/canardlapin/frame4s/blob/main/docs/benchmarks/court.md)
 and include
 the workloads frame4s loses.

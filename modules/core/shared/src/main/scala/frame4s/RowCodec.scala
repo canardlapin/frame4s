@@ -3,6 +3,21 @@ package frame4s
 import scala.NamedTuple
 import scala.deriving.Mirror
 
+/** The input operation that failed while constructing a [[Table]] from rows. */
+enum TableInputStage:
+  case AcquireIterator
+  case HasNext
+  case Next
+  case EncodeRow
+  case BuildBatch
+
+  private[frame4s] def description: String = this match
+    case AcquireIterator => "acquiring the row iterator"
+    case HasNext         => "checking for the next row"
+    case Next            => "reading the next row"
+    case EncodeRow       => "encoding a row"
+    case BuildBatch      => "building a record batch"
+
 /** A structured failure while reading or constructing a materialized table.
   *
   * These errors deliberately sit above [[StorageError]]: a storage failure describes a physical
@@ -14,6 +29,8 @@ enum TableReadError:
   case RowOutOfBounds(index: Long, rowCount: Long)
   case SchemaMismatch(expected: Schema, actual: Schema)
   case InvalidBatchSize(size: Int)
+  case InputFailure(stage: TableInputStage, row: Long, detail: String)
+  case InvalidValue(row: Long, column: Int, name: String, error: ValueError)
   case ScalarDecode(
       row: Long,
       column: Int,
@@ -31,7 +48,11 @@ enum TableReadError:
       s"row index $index is outside a table with $rowCount rows"
     case SchemaMismatch(expected, actual) =>
       s"table schema $actual does not match row schema $expected"
-    case InvalidBatchSize(size) => s"row batch size must be positive; found $size"
+    case InvalidBatchSize(size)           => s"row batch size must be positive; found $size"
+    case InputFailure(stage, row, detail) =>
+      s"table input failed while ${stage.description} at row $row: $detail"
+    case InvalidValue(row, column, name, error) =>
+      s"row $row column $column ('$name') is invalid: ${error.message}"
     case ScalarDecode(row, column, name, value, expected, nullable) =>
       val suffix = if nullable then " or null" else ""
       s"row $row column $column ('$name') value $value cannot be decoded as $expected$suffix"
@@ -58,44 +79,44 @@ final case class TableRenderOptions(
   */
 sealed trait ScalarCodec[A]:
   private[frame4s] def decode(value: ScalarValue): Option[A]
-  private[frame4s] def encode(value: A): ScalarValue
+  private[frame4s] def encode(value: A): Either[ValueError, ScalarValue]
 
 object ScalarCodec:
   given ScalarCodec[Boolean] with
     private[frame4s] def decode(value: ScalarValue) = value match
       case ScalarValue.Bool(actual) => Some(actual)
       case _                        => None
-    private[frame4s] def encode(value: Boolean) = ScalarValue.Bool(value)
+    private[frame4s] def encode(value: Boolean) = Right(ScalarValue.Bool(value))
 
   given ScalarCodec[Int] with
     private[frame4s] def decode(value: ScalarValue) = value match
       case ScalarValue.Int32(actual) => Some(actual)
       case _                         => None
-    private[frame4s] def encode(value: Int) = ScalarValue.Int32(value)
+    private[frame4s] def encode(value: Int) = Right(ScalarValue.Int32(value))
 
   given ScalarCodec[Long] with
     private[frame4s] def decode(value: ScalarValue) = value match
       case ScalarValue.Int64(actual) => Some(actual)
       case _                         => None
-    private[frame4s] def encode(value: Long) = ScalarValue.Int64(value)
+    private[frame4s] def encode(value: Long) = Right(ScalarValue.Int64(value))
 
   given ScalarCodec[Float] with
     private[frame4s] def decode(value: ScalarValue) = value match
       case ScalarValue.Float32(actual) => Some(actual)
       case _                           => None
-    private[frame4s] def encode(value: Float) = ScalarValue.Float32(value)
+    private[frame4s] def encode(value: Float) = Right(ScalarValue.Float32(value))
 
   given ScalarCodec[Double] with
     private[frame4s] def decode(value: ScalarValue) = value match
       case ScalarValue.Float64(actual) => Some(actual)
       case _                           => None
-    private[frame4s] def encode(value: Double) = ScalarValue.Float64(value)
+    private[frame4s] def encode(value: Double) = Right(ScalarValue.Float64(value))
 
   given ScalarCodec[String] with
     private[frame4s] def decode(value: ScalarValue) = value match
-      case ScalarValue.Utf8(actual) => Some(actual)
+      case ScalarValue.Utf8(actual) => Some(actual.value)
       case _                        => None
-    private[frame4s] def encode(value: String) = ScalarValue.Utf8(value)
+    private[frame4s] def encode(value: String) = ScalarValue.utf8(value)
 
   given ScalarCodec[TimestampMicros] with
     private[frame4s] def decode(value: ScalarValue) = value match
@@ -103,7 +124,7 @@ object ScalarCodec:
         Some(TimestampMicros(actual))
       case _ => None
     private[frame4s] def encode(value: TimestampMicros) =
-      ScalarValue.Timestamp(value.toLong, TimeUnit.Microsecond)
+      Right(ScalarValue.Timestamp(value.toLong, TimeUnit.Microsecond))
 
   given [A](using valueCodec: ScalarCodec[A]): ScalarCodec[Option[A]] with
     private[frame4s] def decode(value: ScalarValue) = value match
@@ -111,72 +132,74 @@ object ScalarCodec:
       case actual           => valueCodec.decode(actual).map(Some(_))
     private[frame4s] def encode(value: Option[A]) = value match
       case Some(actual) => valueCodec.encode(actual)
-      case None         => ScalarValue.Null
+      case None         => Right(ScalarValue.Null)
 
-private[frame4s] trait TupleRowCodec[Values <: Tuple]:
-  def decode(
+final private[frame4s] case class RowEncodingError(column: Int, error: ValueError)
+
+private[frame4s] object RowCodecSupport:
+  def decodeField[A](
+      codec: ScalarCodec[A],
       table: Table[?],
       batch: RecordBatch,
       batchRow: Int,
       logicalRow: Long,
-      columnOffset: Int
-  ): Either[TableReadError, Values]
-  def encode(values: Values): Vector[ScalarValue]
+      column: Int
+  ): Either[TableReadError, A] =
+    val field = table.schema.fields(column)
+    batch
+      .columns(column)
+      .scalar(batchRow)
+      .left
+      .map(TableReadError.Storage.apply)
+      .flatMap: scalar =>
+        codec
+          .decode(scalar)
+          .toRight:
+            TableReadError.ScalarDecode(
+              logicalRow,
+              column,
+              field.name,
+              scalar,
+              field.dataType,
+              field.nullable
+            )
 
-private[frame4s] object TupleRowCodec:
-  given TupleRowCodec[EmptyTuple] with
-    def decode(
-        table: Table[?],
-        batch: RecordBatch,
-        batchRow: Int,
-        logicalRow: Long,
-        columnOffset: Int
-    ) = Right(EmptyTuple)
+  def encodeField[A](
+      codec: ScalarCodec[A],
+      value: A,
+      column: Int
+  ): Either[RowEncodingError, ScalarValue] =
+    codec.encode(value).left.map(RowEncodingError(column, _))
 
-    def encode(values: EmptyTuple) = Vector.empty
+  def sequence[Error, Value](
+      values: Seq[Either[Error, Value]]
+  ): Either[Error, Vector[Value]] =
+    val output = Vector.newBuilder[Value]
+    val iterator = values.iterator
+    var error: Option[Error] = None
+    while iterator.hasNext && error.isEmpty do
+      iterator.next() match
+        case Left(value)  => error = Some(value)
+        case Right(value) => output += value
+    error.toLeft(output.result())
 
-  given [Head, Tail <: Tuple](using
-      headCodec: ScalarCodec[Head],
-      tailCodec: TupleRowCodec[Tail]
-  ): TupleRowCodec[Head *: Tail] with
-    def decode(
-        table: Table[?],
-        batch: RecordBatch,
-        batchRow: Int,
-        logicalRow: Long,
-        columnOffset: Int
-    ): Either[TableReadError, Head *: Tail] =
-      val field = table.schema.fields(columnOffset)
-      batch
-        .columns(columnOffset)
-        .scalar(batchRow)
-        .left
-        .map(TableReadError.Storage.apply)
-        .flatMap: scalar =>
-          headCodec
-            .decode(scalar)
-            .toRight:
-              TableReadError.ScalarDecode(
-                logicalRow,
-                columnOffset,
-                field.name,
-                scalar,
-                field.dataType,
-                field.nullable
-              )
-        .flatMap: head =>
-          tailCodec
-            .decode(table, batch, batchRow, logicalRow, columnOffset + 1)
-            .map(head *: _)
+  def valuesTuple[
+      S <: NamedTuple.AnyNamedTuple,
+      Values <: Tuple
+  ](row: S): Values =
+    NamedTupleRepresentation.retype[S, Values](row)
 
-    def encode(values: Head *: Tail): Vector[ScalarValue] =
-      headCodec.encode(values.head) +: tailCodec.encode(values.tail)
+  def namedTuple[
+      S <: NamedTuple.AnyNamedTuple,
+      Values <: Tuple
+  ](values: Values): S =
+    NamedTupleRepresentation.retype[Values, S](values)
 
 /** Derives named-tuple rows from the same sealed schema descriptor used by [[Frame]].
   *
-  * Named tuples erase to their ordinary value tuple, so derivation is inductive over
-  * `NamedTuple.DropNames[S]`; construction and `.toTuple` are compiler-defined zero-copy
-  * conversions. No user-visible cast or macro is involved.
+  * A compile-time derivation writes one flat, ordered field program from the sealed [[ScalarCodec]]
+  * witnesses. This avoids a schema-width-sized implicit chain while preserving exact field types,
+  * deterministic first-error reporting, and the single audited named-tuple representation bridge.
   */
 sealed trait RowCodec[S <: NamedTuple.AnyNamedTuple]:
   def schema: Schema
@@ -186,14 +209,21 @@ sealed trait RowCodec[S <: NamedTuple.AnyNamedTuple]:
       batchRow: Int,
       logicalRow: Long
   ): Either[TableReadError, S]
-  private[frame4s] def encode(row: S): Vector[ScalarValue]
+  private[frame4s] def encode(row: S): Either[RowEncodingError, Vector[ScalarValue]]
 
 object RowCodec:
-  given derived[S <: NamedTuple.AnyNamedTuple](using
-      descriptor: SchemaDescriptor[S],
-      values: TupleRowCodec[NamedTuple.DropNames[S]]
-  ): RowCodec[S] with
-    val schema = descriptor.schema
+  final class Evidence[
+      S <: NamedTuple.AnyNamedTuple
+  ] @scala.annotation.publicInBinary private[frame4s] (
+      val schema: Schema,
+      decodeRow: (
+          Table[S],
+          RecordBatch,
+          Int,
+          Long
+      ) => Either[TableReadError, S],
+      encodeRow: S => Either[RowEncodingError, Vector[ScalarValue]]
+  ) extends RowCodec[S]:
 
     private[frame4s] def decode(
         table: Table[S],
@@ -201,20 +231,17 @@ object RowCodec:
         batchRow: Int,
         logicalRow: Long
     ): Either[TableReadError, S] =
-      values
-        .decode(table, batch, batchRow, logicalRow, 0)
-        .map: tuple =>
-          val named =
-            NamedTuple[NamedTuple.Names[S], NamedTuple.DropNames[S]](tuple)
-          NamedTupleRepresentation.retype[
-            NamedTuple.NamedTuple[NamedTuple.Names[S], NamedTuple.DropNames[S]],
-            S
-          ](named)
+      decodeRow(table, batch, batchRow, logicalRow)
 
-    private[frame4s] def encode(row: S): Vector[ScalarValue] =
-      values.encode(
-        NamedTupleRepresentation.retype[S, NamedTuple.DropNames[S]](row)
-      )
+    private[frame4s] def encode(
+        row: S
+    ): Either[RowEncodingError, Vector[ScalarValue]] =
+      encodeRow(row)
+
+  transparent inline given derived[S <: NamedTuple.AnyNamedTuple](using
+      descriptor: SchemaDescriptor[S]
+  ): RowCodec[S] =
+    ${ RowCodecMacros.rowCodec[S]('descriptor) }
 
 /** Exact case-class bridge. `NamedTuple.From[P]` preserves field labels, order, and types; the
   * compiler therefore refuses reordered, missing, extra, or differently nullable products.

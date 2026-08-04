@@ -69,7 +69,7 @@ class FrameIOSuite extends munit.FunSuite:
                   scan.receipt.residual,
                   Vector(PushdownFeature.Predicate, PushdownFeature.BatchSize)
                 )
-                assertEquals(labels, Vector("a", "b").map(ScalarValue.Utf8.apply))
+                assertEquals(labels, Vector("a", "b").map(ScalarValue.checkedUtf8))
       .flatMap: _ =>
         IO:
           assertEquals(tracker.snapshot.activeOwners, 5)
@@ -123,7 +123,7 @@ class FrameIOSuite extends munit.FunSuite:
                     assertEquals(observed.map(_._1), Vector(2, 1))
                     assertEquals(
                       observed.flatMap(_._2),
-                      Vector("a,b", "missing", "nan").map(ScalarValue.Utf8.apply)
+                      Vector("a,b", "missing", "nan").map(ScalarValue.checkedUtf8)
                     )
                     assertEquals(
                       observed.flatMap(_._3).take(2),
@@ -145,8 +145,8 @@ class FrameIOSuite extends munit.FunSuite:
                                 assert(result.text.contains("3,nan,NaN"))
       .flatMap: _ =>
         acquired.get.inspect.map:
-          case Left(SourceError.Open(_)) => ()
-          case other                     => fail(s"expected finalized CSV source, found $other")
+          case Left(SourceError.Closed) => ()
+          case other                    => fail(s"expected finalized CSV source, found $other")
       .unsafeToFuture()
 
   test("CSV decoding failures are structured and row-addressed"):
@@ -163,8 +163,12 @@ class FrameIOSuite extends munit.FunSuite:
             case Right(scan) => scan.batches.compile.drain
       .attempt
       .map:
-        case Left(SourceFailure(SourceError.Decode(2, 1, "not-an-int", DataType.Int32))) =>
-          ()
+        case Left(
+              SourceFailure(
+                SourceError.Decode(SourceLocation(2L, 1, 15L), excerpt, DataType.Int32)
+              )
+            ) =>
+          assertEquals(excerpt.text, "not-an-int")
         case other => fail(s"expected structured CSV decode error, found $other")
       .unsafeToFuture()
 
@@ -173,7 +177,7 @@ class FrameIOSuite extends munit.FunSuite:
   ):
     val text =
       "id,label,score\r\n" +
-        "1,\"東\n京\",1.0\r\n" +
+        "1,\"東😀\n京\",1.0\r\n" +
         "2,\"a\"\"b\",NULL\r\n" +
         "3,empty,\r\n"
     val oneByteChunks =
@@ -186,7 +190,13 @@ class FrameIOSuite extends munit.FunSuite:
     CsvFrameSource
       .bytes[IO](
         oneByteChunks,
-        CsvReadOptions(schema, nullTokens = Set("", "NULL"), batchSize = 2)
+        CsvReadOptions(
+          schema,
+          nullPolicy = NullPolicy
+            .unquotedTokens(Set("", "NULL"), "")
+            .fold(error => fail(error.message), identity),
+          batchSize = 2
+        )
       )
       .use: source =>
         source
@@ -202,7 +212,7 @@ class FrameIOSuite extends munit.FunSuite:
                 .map: observed =>
                   assertEquals(
                     observed.flatMap(_._1),
-                    Vector("東\n京", "a\"b", "empty").map(ScalarValue.Utf8.apply)
+                    Vector("東😀\n京", "a\"b", "empty").map(ScalarValue.checkedUtf8)
                   )
                   assertEquals(
                     observed.flatMap(_._2),
@@ -240,11 +250,14 @@ class FrameIOSuite extends munit.FunSuite:
       .map: (headerResult, malformedResult) =>
         headerResult match
           case Left(SourceFailure(SourceError.SchemaMismatch(detail))) =>
-            assert(detail.contains("label,id,score"))
-            assert(detail.contains("id,label,score"))
+            assertEquals(detail, "CSV header does not match the declared schema at column 1")
           case other => fail(s"expected exact header mismatch, found $other")
         malformedResult match
-          case Left(SourceFailure(SourceError.MalformedCsv(2, detail))) =>
+          case Left(
+                SourceFailure(
+                  SourceError.MalformedDelimited(SourceLocation(2L, 3, _), detail, _)
+                )
+              ) =>
             assert(detail.contains("expected 3 fields but found 2"))
           case other => fail(s"expected logical row 2 malformed error, found $other")
       .unsafeToFuture()
@@ -368,7 +381,7 @@ class FrameIOSuite extends munit.FunSuite:
                   IO:
                     assertEquals(
                       observed.flatMap(_._1),
-                      Vector("a\tb", "missing", "nan").map(ScalarValue.Utf8.apply)
+                      Vector("a\tb", "missing", "nan").map(ScalarValue.checkedUtf8)
                     )
                     assertEquals(
                       observed.flatMap(_._2).take(2),

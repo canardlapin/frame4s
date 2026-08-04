@@ -16,9 +16,7 @@ corresponding structured `FrameError`.
 
 ```scala mdoc:compile-only
 def totalPredicate(frame: Frame[Person]): Frame[Person] =
-  frame.filter(row =>
-    (row.col("score") > Expr.literal(Some(0.0): Option[Double])).isTrue
-  )
+  frame.filter(row => (row.col("score") > Some(0.0)).isTrue)
 
 def exactBinding(dynamic: DynamicFrame): Either[FrameError, Frame[Person]] =
   dynamic.typed[Person]
@@ -31,8 +29,39 @@ def misspelledColumn(frame: Frame[Person]) =
   frame.drop("naem")
 ```
 
-The repository's compile-time court separately protects the concise diagnostic
-wording used by the public API.
+Raw `null` is not a typed column value. Use `None` for a nullable column:
+
+```scala mdoc:fail
+def rawNull(frame: Frame[Person]) =
+  frame.filter(row => row.col("name") === null)
+```
+
+Projects compiled without explicit nulls can still place raw null inside a
+value declared as `String`, or inside `Some(null)`. frame4s checks those values
+when it constructs a literal. The direct typed syntax stops immediately with
+`InvalidValueFailure`; it does not return an expression or plan. Use the total
+constructor when the value came from Java or another untrusted boundary:
+
+```scala mdoc
+val checked = Expr.literalChecked(null: String)
+checked.left.map(_.message)
+```
+
+Dynamic literals and storage scalars use the same boundary through
+`LiteralValue.utf8` and `ScalarValue.utf8`. Their UTF-8 cases store an opaque
+`Utf8Value`, so a successfully constructed case cannot contain raw null.
+`None` remains the only supported representation of a missing typed value.
+
+The repository court protects both the compile-time `null` diagnostic and the
+runtime boundary for an ascribed null or `Some(null)`.
+
+Planning, storage, execution, and adapter failures use separate structured
+ADTs. In particular, source acquisition and streams raise `SourceFailure`, a
+runtime binding adds its `SourceId` in `RuntimeBindingError.Source`, and sinks
+return `Left(SinkError)` for ordinary failures. Their public messages are
+bounded and redact rejected values and exception text. Inspect `cause` only in
+an explicit debugging path. The complete repository decision is recorded in
+`docs/design/adr-0009-structured-adapter-failures.md`.
 
 Next, compose these expressions into
 [relational operations](relational-operations.md).

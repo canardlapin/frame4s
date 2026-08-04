@@ -1,0 +1,7 @@
+order	lower_rows	upper_rows	per_row_cost_ratio
+both-shuffled	1000	64000	1.397400
+both-shuffled	64000	1000000	1.092447
+both-shuffled	1000000	4000000	1.785199
+right-shuffled	1000	64000	1.442453
+right-shuffled	64000	1000000	1.070419
+right-shuffled	1000000	4000000	1.693727

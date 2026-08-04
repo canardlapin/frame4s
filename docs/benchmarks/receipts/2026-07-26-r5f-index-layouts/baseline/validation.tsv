@@ -1,0 +1,5 @@
+benchmark	input_rows	output_rows	checksum_or_bytes	status
+IndexScanCourt.singleLookup	100000	1	100030	linear-scan lower bound
+IndexScanCourt.batch32Lookup	100000	32	13590724320720048604	linear-scan lower bound
+IndexScanCourt.singleLookup	1000000	1	1000030	linear-scan lower bound
+IndexScanCourt.batch32Lookup	1000000	32	14554966086508252864	linear-scan lower bound

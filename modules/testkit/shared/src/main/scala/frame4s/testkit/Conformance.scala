@@ -22,9 +22,11 @@ object ObservedTable:
     case ScalarValue.Int32(actual)   => s"i32:$actual"
     case ScalarValue.Int64(actual)   => s"i64:$actual"
     case ScalarValue.Float32(actual) =>
-      s"f32:${java.lang.Float.floatToRawIntBits(actual)}"
+      if actual.isNaN then "f32:nan"
+      else s"f32:${java.lang.Float.floatToRawIntBits(actual)}"
     case ScalarValue.Float64(actual) =>
-      s"f64:${java.lang.Double.doubleToRawLongBits(actual)}"
+      if actual.isNaN then "f64:nan"
+      else s"f64:${java.lang.Double.doubleToRawLongBits(actual)}"
     case ScalarValue.Utf8(actual)            => s"utf8:$actual"
     case ScalarValue.Timestamp(actual, unit) => s"timestamp:$unit:$actual"
 

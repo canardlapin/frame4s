@@ -1,0 +1,6 @@
+stage	median_milliseconds	median_fraction_percent
+build	30.888958	34.588
+checksum	26.724125	31.393
+decode	1.049083	1.211
+materialize	0.085875	0.096
+probe	26.770375	32.849

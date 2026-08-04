@@ -116,3 +116,109 @@ ratified fixtures or thresholds. A
 [separate Pandas receipt](receipts/2026-07-26-r5c-pandas/summary.md)
 reports cross-runtime timings and their validation limits; those descriptive
 ratios are not retroactively promoted into JMH claim gates.
+
+## R5e secondary-index gates
+
+R5e is governed by
+[ADR 0003](../design/adr-0003-secondary-index.md). Before the index
+implementation is measured, the dedicated court records exact single-key and
+32-key lower-bound scans at 100,000 and 1,000,000 rows.
+
+The candidate must preserve exact source-order output and clear these
+precommitted gates:
+
+| Workload | Required warm improvement |
+|---|---:|
+| 100,000 rows, 32 keys | 2x |
+| 1,000,000 rows, one key | 2x |
+| 1,000,000 rows, 32 keys | 5x |
+
+At 1,000,000 rows, owned index arrays must use at most 24 bytes per source
+row. Cold construction, warm lookup, normalized allocation, and calculated
+break-even query counts are all published. These are internal-kernel admission
+gates, not a public `FrameRuntime` performance claim.
+
+The
+[R5e direct-index receipt](receipts/2026-07-26-r5e-index-admitted/summary.md)
+passes these gates: 8,685x single-key and 16,497x 32-key improvement at
+1,000,000 rows, 20.777 owned bytes per row, and respective break-even counts
+of 120.61 and 3.13 queries. The separate
+[prepared-join receipt](receipts/2026-07-26-r5e-prepared-join/summary.md)
+does not generally admit join reuse: only the sparse fixture improves both
+warm and cold, while one-to-one, one-to-many, and skewed joins regress.
+
+## R5f secondary-index layout gates
+
+R5f keeps the admitted hash layout as the speed control and tests the explicit
+`CompactSorted` layout described in
+[ADR 0003](../design/adr-0003-secondary-index.md). It reuses the frozen R5e
+scan fixtures, query keys, checksums, and sizes and re-executes them in the
+same runtime as both layouts.
+
+Before implementation, the compact candidate is required to:
+
+| Measure at 1,000,000 source rows | Required result |
+|---|---:|
+| Owned arrays | <= 12 bytes/source row |
+| Owned arrays versus `FastHash` | >= 40% reduction |
+| Warm one-key lookup versus scan | >= 2x faster |
+| Warm 32-key lookup versus scan | >= 5x faster |
+
+The optimized `FastHash` one-key path must be at least 1.25x faster than the
+same-run former batch-compatible one-key path and allocate no more than 72
+normalized bytes per operation. The earlier R5e timing is descriptive because
+it was captured on another JVM. Both layouts must publish construction,
+lookup, allocation, owned bytes, and break-even counts and pass the
+cross-platform semantic and metamorphic laws in ADR 0003.
+
+A denser open-addressed hash is rejected analytically: at a 0.75 load factor,
+its three required `Int32` arrays have a 14.67-byte/source-row lower bound
+before object overhead, so it cannot meet the 12-byte gate. This rejection is
+part of the precommitted court rather than a post-benchmark omission.
+
+The
+[full R5f receipt](receipts/2026-07-26-r5f-index-layouts/summary.md)
+passes all gates. At 1,000,000 rows, `CompactSorted` uses 8.000 bytes/source
+row, 61.50% less than `FastHash`, while remaining 8,761x faster than the
+single-key scan and 3,952x faster than the 32-key scan. The direct `FastHash`
+path is 2.32x faster than the former path and reports 0.001 B/op versus
+96.001 B/op. `FastHash` remains the explicit default; `CompactSorted` is
+admitted as the memory-oriented choice.
+
+## R5g packed and balanced-layout gates
+
+R5g preserves the R5f receipt as its speed/allocation control and widens the
+court before judging `PackedSorted`, the optimized batch engine, or
+`FlatHashRows`.
+
+| Candidate at 1,000,000 non-null source rows | Required result |
+|---|---:|
+| `PackedSorted` owned arrays | <= 6.75 bytes/source row |
+| `PackedSorted` versus `CompactSorted` memory | >= 15% reduction |
+| Optimized `FastHash` batch32 allocation | <= 500 B/op |
+| Optimized `CompactSorted` batch32 allocation | <= 500 B/op |
+| Either optimized control batch32 latency | <= 1.10x frozen R5f point |
+| `FlatHashRows` owned arrays | <= 12 bytes/source row |
+| `FlatHashRows` unique one-key versus `CompactSorted` | >= 1.25x faster |
+| `FlatHashRows` unique batch32 versus `CompactSorted` | >= 1.25x faster |
+
+The frozen R5f latency points are 0.000384870 ms/op for `FastHash` batch32 and
+0.00152138 ms/op for `CompactSorted` batch32. They are guardrails, not claims
+that different JDKs or hosts are directly rankable; the R5g receipt must also
+publish same-runtime controls. A cross-runtime miss is reported separately
+from a same-runtime regression.
+
+The wider court adds exact unique-hit, mixed-hit/miss, duplicate-fan-out, and
+skew/collision shapes. Candidate losses remain in the receipt. Passing the flat
+memory calculation without its speed and adversarial-shape gates does not
+admit it, and none of these gates changes the default layout automatically.
+
+The
+[full R5g receipt](receipts/2026-07-26-r5g-index-layouts/summary.md) clears
+every gate. `PackedSorted` retains 6.500 bytes/source row; the optimized
+batch32 path reports 432.018 B/op for `FastHash` and 472.049 B/op for
+`CompactSorted`; and `FlatHashRows` retains 10.667 bytes/source row while
+beating compact by 2.720x for the unique single hit and 2.575x for the unique
+batch. The flat layout is admitted only for low-fanout workloads: compact is
+4.65x faster for the skewed single-key lookup and 2.48x faster for the skewed
+batch. The default remains `FastHash`.

@@ -1,0 +1,6 @@
+rows	order	stage	median_milliseconds
+1000000	sorted	checksum	24.865625
+1000000	sorted	decode	2.179708
+1000000	sorted	detect-sorted	3.910125
+1000000	sorted	materialize	0.033791
+1000000	sorted	merge-probe	5.299000

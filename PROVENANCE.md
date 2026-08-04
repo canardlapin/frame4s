@@ -31,17 +31,21 @@ Reviewed: 2026-07-26
 
 The published `frame4s-core` artifact has no external runtime dependency beyond
 the Scala standard libraries. The published JVM and Scala.js `frame4s-fs2`
-artifacts directly depend on:
+artifacts directly depend on Cats Effect and FS2; neither base artifact depends
+on Apache Arrow. The optional JVM-only `frame4s-arrow` artifact depends on
+`frame4s-fs2` and the two Arrow libraries below.
 
-| Dependency | Version | Declared license |
-| --- | --- | --- |
-| Cats Effect | 3.7.0 | Apache-2.0 |
-| FS2 core and FS2 IO | 3.13.0 | MIT |
-| Apache Arrow Java vector and unsafe memory, JVM only | 19.0.0 | Apache-2.0 |
+| Published artifact | Direct dependency | Version | Declared license |
+| --- | --- | --- | --- |
+| `frame4s-fs2` | Cats Effect | 3.7.0 | Apache-2.0 |
+| `frame4s-fs2` | FS2 core and FS2 IO | 3.13.0 | MIT |
+| `frame4s-arrow` | Apache Arrow Java vector | 19.0.0 | Apache-2.0 |
+| `frame4s-arrow` | Apache Arrow unsafe memory | 19.0.0 | Apache-2.0 |
 
 The resolved runtime graph also contains the expected transitive Typelevel
-libraries, scodec-bits, ip4s/idna4s, Jackson, FlatBuffers, commons-codec, and
-SLF4J. Their Maven metadata and upstream license files were reviewed; the graph
+libraries, scodec-bits, and ip4s/idna4s. The optional Arrow graph additionally
+contains Jackson, FlatBuffers, commons-codec, and SLF4J. Their Maven metadata
+and upstream license files were reviewed; the graph
 contains permissive Apache-2.0, MIT, BSD-family, and similarly compatible
 licenses. The benchmark-only court additionally uses Saddle (MIT) and JMH
 (GPL-2.0 with Classpath Exception); neither benchmark dependency is published

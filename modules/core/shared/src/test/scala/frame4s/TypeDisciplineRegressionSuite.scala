@@ -31,6 +31,15 @@ class TypeDisciplineRegressionSuite extends munit.FunSuite:
     """)
     assertFirstDiagnostic(errors, "Output column 'x' is duplicated")
 
+  test("typed select rejects duplicate retained column names at compile time"):
+    val errors = typeCheckErrors("""
+      import frame4s.*
+      type People = (id: Int, name: String)
+      val frame = Frame.source[People]("people").toOption.get
+      frame.select(row => (row.col("id"), row.col("id")))
+    """)
+    assertFirstDiagnostic(errors, "Output column 'id' is duplicated")
+
   test("typed aggregate rejects a key/aggregate name collision at compile time"):
     val errors = typeCheckErrors("""
       import frame4s.*
@@ -84,6 +93,21 @@ class TypeDisciplineRegressionSuite extends munit.FunSuite:
     """)
     assertFirstDiagnostic(errors, "different frame scope")
 
+  test("a retained column expression cannot be smuggled into another frame"):
+    val errors = typeCheckErrors("""
+      import frame4s.*
+      type A = (p: Int, q: Int)
+      type B = (q: Int, p: Int)
+      val frameA = Frame.source[A]("a").toOption.get
+      val frameB = Frame.source[B]("b").toOption.get
+      var stolen: ColumnExprOf["p", Int, frameA.Origin] = null
+      frameA.select: scope =>
+        stolen = scope.col("p")
+        Tuple1(scope.col("p"))
+      frameB.select(_ => Tuple1(stolen))
+    """)
+    assertFirstDiagnostic(errors, "different frame scope")
+
   // ------------------------------------------------------------------ reduction semantics
 
   test("mean uses IEEE arithmetic and does not manufacture NaN from non-NaN input"):
@@ -93,7 +117,7 @@ class TypeDisciplineRegressionSuite extends munit.FunSuite:
     val batch = get(
       RecordBatch(schema, Vector(get(ColumnArray.float64(Array(Double.PositiveInfinity, 1.0)))))
     )
-    val table = get(Table[Values](Vector(batch)))
+    val table = get(Table.takeOwnership[Values](Vector(batch)))
     val source = get(Frame.values[Values](reference))
     val query = source
       .groupBy(_ => EmptyTuple)
@@ -101,7 +125,7 @@ class TypeDisciplineRegressionSuite extends munit.FunSuite:
     try
       val collected = ReferenceInterpreter
         .prepare(query.plan, ReferenceSources.empty.bind(reference, table))
-        .collect[(avg: Double)]
+        .collect[(avg: Option[Double])]
       collected.foreach: output =>
         // IEEE sum/count over [+Inf, 1.0] is +Infinity, not NaN.
         assertEquals(

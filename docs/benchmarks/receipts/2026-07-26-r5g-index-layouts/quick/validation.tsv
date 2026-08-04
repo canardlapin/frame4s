@@ -1,0 +1,13 @@
+benchmark	input_rows	output_rows	checksum_or_bytes	status	layout	shape
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	fast-hash	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	fast-hash	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	20777216	owned index bytes	fast-hash	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	compact-sorted	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	compact-sorted	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	8000000	owned index bytes	compact-sorted	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	packed-sorted	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	packed-sorted	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	6500000	owned index bytes	packed-sorted	unique
+ExtendedIndexLookupCourt.singleLookup	1000000	1	1000030	exact parity with stable linear scan	flat-hash-rows	unique
+ExtendedIndexLookupCourt.batch32Lookup	1000000	32	14554966086508252864	exact parity with stable linear scan; query unchanged	flat-hash-rows	unique
+ExtendedIndexBuildCourt.build	1000000	1000000	10666672	owned index bytes	flat-hash-rows	unique

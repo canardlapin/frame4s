@@ -1,0 +1,16 @@
+sample	stage	milliseconds
+1	decode	0.905666
+1	build	22.528584
+1	probe	4.792625
+1	materialize	0.063416
+1	checksum	25.961916
+2	decode	0.876500
+2	build	19.839792
+2	probe	4.952125
+2	materialize	0.074709
+2	checksum	25.572292
+3	decode	1.188958
+3	build	21.111917
+3	probe	3.799625
+3	materialize	0.060917
+3	checksum	25.797875

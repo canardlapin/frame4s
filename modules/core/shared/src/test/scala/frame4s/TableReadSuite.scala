@@ -197,7 +197,7 @@ class TableReadSuite extends munit.FunSuite:
       (id = 3, label = null, score = None, at = TimestampMicros(3L))
     val result = Table.fromRowsTracked(rows.take(2) :+ invalid, 2, tracker)
     result match
-      case Left(TableReadError.ScalarDecode(2, 1, "label", ScalarValue.Utf8(null), _, false)) =>
+      case Left(TableReadError.InvalidValue(2, 1, "label", ValueError.NullUtf8)) =>
         ()
       case other => fail(s"expected structured null-string encode failure, found $other")
     val snapshot = tracker.snapshot

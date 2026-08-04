@@ -17,36 +17,39 @@ opening an arbitrary runtime path or stream.
 Scautable also exposes an explicitly typed runtime form,
 `CSV.fromTyped[K, V]`, which is the closer ingestion comparison. frame4s takes
 the same explicit-contract position: a `SchemaDescriptor[S]` authorizes `S`,
-and owning sources are acquired through `Resource`. frame4s does not infer a
-binding schema silently; future inference may emit an explicit schema
-suggestion and receipt.
+and an owned table or stream remains scoped by `Resource` or `Stream`.
+`render` may bracket internally because it returns a detached `String`.
+frame4s does not infer a binding schema silently; future inference may emit an
+explicit schema suggestion and receipt.
 
 The current frame4s first-use specimen is executable with:
 
 ```sh
-scripts/first-use-court.sh docs/benchmarks/receipts/local-first-use
+scripts/first-use-court.sh docs/benchmarks/receipts/local-onboarding
 ```
 
-Its committed receipt is
-[2026-07-26-r3-first-contact](receipts/2026-07-26-r3-first-contact/summary.md).
+Its current committed receipt is
+[2026-07-28-e4-onboarding](receipts/2026-07-28-e4-onboarding/summary.md).
 The executable lives in a separate sbt project and a package outside
 `frame4s`, so it exercises downstream visibility and implicit derivation rather
 than relying on package-private access.
 
-The current path is:
+The detached one-source path is:
 
 1. declare a readable named-tuple row type;
-2. create a typed `CsvPathSource.binding` whose schema comes from that type;
+2. create a typed `CsvFrameSource.binding` or `CsvPathSource.binding` whose
+   schema comes from that type;
 3. build a pure filter/project from `binding.frame`;
-4. acquire one `FrameRuntime.resource`;
-5. collect with an accepted/residual pushdown receipt; and
-6. use typed materialized reads plus bounded `Table.show`.
+4. call `binding.render(query)` for a bounded detached string.
 
 There is no handwritten runtime `Schema`, manual batch, `ReferenceSources`,
-partial `.get`, internal member, or unsafe cast. Portable callers use
+partial `.get`, explicit source identity, runtime setup, internal member, or
+unsafe cast. `collect` and `stream` retain visible ownership for an escaping
+`Table` or batch stream. Multiple sources and receipt-bearing execution still
+use explicit `SourceRef` values and `FrameRuntime`. Portable callers use
 `CsvFrameSource.byteBinding` or `characterBinding`; the bounded whole-string
-entry point remains an explicitly in-memory convenience. CSV and TSV parsing
-is incremental across arbitrary chunks, including UTF-8 code points, quoted
+entry point remains an explicitly in-memory convenience. CSV and TSV parsing is
+incremental across arbitrary chunks, including UTF-8 code points, quoted
 newlines, escaped quotes, and CRLF boundaries.
 
 No throughput ratio is published between the fixed-resource macro path and

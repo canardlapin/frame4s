@@ -27,9 +27,14 @@ Published coordinates use version `@VERSION@`. JVM projects use `%%`:
 ```scala
 libraryDependencies += "io.github.canardlapin" %% "frame4s-core" % "@VERSION@"
 libraryDependencies += "io.github.canardlapin" %% "frame4s-fs2" % "@VERSION@"
+
+// Optional Apache Arrow IPC adapter, JVM only.
+libraryDependencies += "io.github.canardlapin" %% "frame4s-arrow" % "@VERSION@"
 ```
 
-Scala.js projects use `%%%` for the same modules.
+Scala.js projects use `%%%` for `frame4s-core` and `frame4s-fs2`.
+`frame4s-arrow` has no Scala.js artifact and requires
+`--add-opens=java.base/java.nio=ALL-UNNAMED` when an Arrow program starts.
 
 Return to the [documentation overview](README.md) or start the
 [first-result guide](quick-start.md).

@@ -40,6 +40,13 @@ class Workload:
     exact_checksum: bool = True
 
 
+@dataclass(frozen=True)
+class Frame4sTiming:
+    milliseconds: float
+    benchmark: str
+    consumption: str
+
+
 def java_string_hash(value: str) -> int:
     result = 0
     encoded = value.encode("utf-16-be")
@@ -264,11 +271,12 @@ def read_oracle(path: Path) -> dict[str, tuple[int, str]]:
         }
 
 
-def read_frame4s_times(path: Path | None) -> dict[str, float]:
+def read_frame4s_times(path: Path | None) -> dict[str, Frame4sTiming]:
     if path is None:
         return {}
     content = json.loads(path.read_text(encoding="utf-8"))
-    times: dict[str, float] = {}
+    consumed: dict[str, Frame4sTiming] = {}
+    execution_only: dict[str, Frame4sTiming] = {}
     for result in content:
         benchmark = result["benchmark"]
         if ".ColumnarBenchmarks." not in benchmark or result["mode"] != "avgt":
@@ -283,8 +291,14 @@ def read_frame4s_times(path: Path | None) -> dict[str, float]:
             score /= 1_000_000.0
         elif unit != "ms/op":
             continue
-        times[name] = score
-    return times
+        if name.endswith("ExecutionOnly"):
+            base = name.removesuffix("ExecutionOnly")
+            execution_only[base] = Frame4sTiming(
+                score, name, "detached-result-construction"
+            )
+        else:
+            consumed[name] = Frame4sTiming(score, name, "serial-full-result-checksum")
+    return consumed | execution_only
 
 
 def measure(
@@ -307,7 +321,7 @@ def write_receipt(
     args: argparse.Namespace,
     workloads: dict[str, Workload],
     oracle: dict[str, tuple[int, str]],
-    frame4s_times: dict[str, float],
+    frame4s_times: dict[str, Frame4sTiming],
 ) -> None:
     raw = receipt / "raw"
     raw.mkdir(parents=True, exist_ok=True)
@@ -351,7 +365,8 @@ def write_receipt(
         loops, samples = measure(workload.run, target, sample_count)
         median_ms = statistics.median(samples) * 1000.0
         frame4s_name = workload.oracle.rsplit(".", 1)[-1]
-        frame4s_ms = frame4s_times.get(frame4s_name)
+        frame4s_timing = frame4s_times.get(frame4s_name)
+        frame4s_ms = frame4s_timing.milliseconds if frame4s_timing else None
         timing_rows.append(
             {
                 "benchmark": workload.name,
@@ -361,6 +376,12 @@ def write_receipt(
                 "min_ms": min(samples) * 1000.0,
                 "max_ms": max(samples) * 1000.0,
                 "frame4s_ms": frame4s_ms,
+                "frame4s_benchmark": (
+                    frame4s_timing.benchmark if frame4s_timing else None
+                ),
+                "frame4s_consumption": (
+                    frame4s_timing.consumption if frame4s_timing else None
+                ),
                 "pandas_over_frame4s": (
                     median_ms / frame4s_ms if frame4s_ms is not None else None
                 ),
@@ -395,6 +416,9 @@ def write_receipt(
         "timing": f"timeit,{sample_count}-sample-median,target={target}s",
         "oracle.validation": str(args.oracle_validation),
         "frame4s.jmh": str(args.frame4s_jmh or "not-provided"),
+        "frame4s.timing": (
+            "execution-only-preferred; serial-checksum fallback is explicitly labeled"
+        ),
     }
     (receipt / "environment.properties").write_text(
         "".join(f"{key}={value}\n" for key, value in environment.items()),
@@ -413,16 +437,21 @@ def write_receipt(
         "Pandas runs eagerly in a pinned single-thread Python process. It is not invoked",
         "through JMH, and Python allocation is not compared with JVM GC allocation.",
         "",
-        "| Workload | Pandas median | Range | frame4s JMH | Pandas/frame4s |",
-        "|---|---:|---:|---:|---:|",
+        "| Workload | Pandas median | Range | frame4s JMH | frame4s path | Pandas/frame4s |",
+        "|---|---:|---:|---:|---|---:|",
     ]
     for row in timing_rows:
         frame4s = row["frame4s_ms"]
         ratio = row["pandas_over_frame4s"]
+        frame4s_path = row["frame4s_consumption"] or "n/a"
         lines.append(
             f"| `{row['benchmark']}` | {row['median_ms']:.6f} ms | "
             f"{row['min_ms']:.6f}–{row['max_ms']:.6f} ms | "
-            + (f"{frame4s:.6f} ms | {ratio:.2f}x |" if frame4s else "n/a | n/a |")
+            + (
+                f"{frame4s:.6f} ms | {frame4s_path} | {ratio:.2f}x |"
+                if frame4s
+                else "n/a | n/a | n/a |"
+            )
         )
     lines.extend(
         [

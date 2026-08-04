@@ -1,0 +1,17 @@
+# R5k.3 anti-fitting comparison
+
+Overall status: **PASS**.
+
+| Gate | Status | Observed | Limit | Detail |
+|---|---|---:|---:|---|
+| semantic identity | PASS | 0 mismatches | 0 mismatches | all exact validation fields match |
+| small-tier latency | PASS | 0.6339x | <=1.05x | 16000/offset-unique/deep-materialized |
+| large shuffled latency | PASS | 0.9556x | <=1.03x | 4000000/fully-shuffled/gather-view |
+| fallback allocation | PASS | 1.0023x | <=1.05x | 1000/late-inversion/gather-view |
+| 1M aligned deep speedup | PASS | 3.0712x | >=1.50x | 1000000/aligned-unique/deep-materialized |
+| 1M physical-output allocation | PASS | 24.504 MB (1.0210x payload) | <=1.10x useful payload | 1000000/aligned-unique/deep-materialized |
+| 4M aligned deep speedup | PASS | 2.7008x | >=1.50x | 4000000/aligned-unique/deep-materialized |
+| 4M physical-output allocation | PASS | 98.010 MB (1.0209x payload) | <=1.10x useful payload | 4000000/aligned-unique/deep-materialized |
+| 4M run-selection allocation | PASS | 0.7500x | <=0.80x | 4000000/aligned-unique/gather-view |
+
+`comparison.tsv` retains every baseline and candidate timing and allocation ratio.

@@ -30,6 +30,179 @@ class ConformanceLawsSuite extends ScalaCheckSuite:
       case BackendAttempt.Residual(capability, reason, _) =>
         fail(s"reference backend reported residual $capability: $reason")
 
+  test("observed equivalence canonicalizes NaN payloads without erasing signed zero"):
+    type Output = (f32: Float, f64: Double)
+    val schema = summon[SchemaDescriptor[Output]].schema
+    val left = ObservedTable(
+      schema,
+      Vector(
+        Vector(
+          ScalarValue.Float32(java.lang.Float.intBitsToFloat(0x7fc00001)),
+          ScalarValue.Float64(java.lang.Double.longBitsToDouble(0x7ff8000000000001L))
+        )
+      ),
+      OrderGuarantee.Stable
+    )
+    val otherNaNs = ObservedTable(
+      schema,
+      Vector(
+        Vector(
+          ScalarValue.Float32(java.lang.Float.intBitsToFloat(0x7fc00011)),
+          ScalarValue.Float64(java.lang.Double.longBitsToDouble(0x7ff8000000000011L))
+        )
+      ),
+      OrderGuarantee.Stable
+    )
+    val oppositeZeros = ObservedTable(
+      schema,
+      Vector(Vector(ScalarValue.Float32(0.0f), ScalarValue.Float64(0.0))),
+      OrderGuarantee.Stable
+    )
+    val negativeZeros = ObservedTable(
+      schema,
+      Vector(Vector(ScalarValue.Float32(-0.0f), ScalarValue.Float64(-0.0))),
+      OrderGuarantee.Stable
+    )
+
+    assert(left.equivalentTo(otherNaNs))
+    assert(!oppositeZeros.equivalentTo(negativeZeros))
+
+  test("empty and all-null reductions have truthful schemas and backend results"):
+    type Required = (i: Int, l: Long, f: Float, d: Double, text: String)
+    type NullableInput = (
+        i: Option[Int],
+        l: Option[Long],
+        f: Option[Float],
+        d: Option[Double],
+        text: Option[String]
+    )
+    type Result = (
+        n: Long,
+        sumI: Option[Int],
+        sumL: Option[Long],
+        sumF: Option[Float],
+        sumD: Option[Double],
+        meanI: Option[Double],
+        meanL: Option[Double],
+        meanF: Option[Double],
+        meanD: Option[Double],
+        varianceI: Option[Double],
+        varianceL: Option[Double],
+        varianceF: Option[Double],
+        varianceD: Option[Double],
+        stddevI: Option[Double],
+        stddevL: Option[Double],
+        stddevF: Option[Double],
+        stddevD: Option[Double],
+        minI: Option[Int],
+        minL: Option[Long],
+        minF: Option[Float],
+        minD: Option[Double],
+        minText: Option[String],
+        maxI: Option[Int],
+        maxL: Option[Long],
+        maxF: Option[Float],
+        maxD: Option[Double],
+        maxText: Option[String]
+    )
+
+    val emptyReference = value(SourceRef.values("empty-reductions", "empty-reductions"))
+    val emptySource = value(Frame.values[Required](emptyReference))
+    val emptyQuery: Frame[Result] = emptySource
+      .groupBy(_ => EmptyTuple)
+      .aggregate: row =>
+        (
+          Aggregate.count.as("n"),
+          Aggregate.sum(row.col("i")).as("sumI"),
+          Aggregate.sum(row.col("l")).as("sumL"),
+          Aggregate.sum(row.col("f")).as("sumF"),
+          Aggregate.sum(row.col("d")).as("sumD"),
+          Aggregate.mean(row.col("i")).as("meanI"),
+          Aggregate.mean(row.col("l")).as("meanL"),
+          Aggregate.mean(row.col("f")).as("meanF"),
+          Aggregate.mean(row.col("d")).as("meanD"),
+          Aggregate.variancePop(row.col("i")).as("varianceI"),
+          Aggregate.variancePop(row.col("l")).as("varianceL"),
+          Aggregate.variancePop(row.col("f")).as("varianceF"),
+          Aggregate.variancePop(row.col("d")).as("varianceD"),
+          Aggregate.stddevPop(row.col("i")).as("stddevI"),
+          Aggregate.stddevPop(row.col("l")).as("stddevL"),
+          Aggregate.stddevPop(row.col("f")).as("stddevF"),
+          Aggregate.stddevPop(row.col("d")).as("stddevD"),
+          Aggregate.min(row.col("i")).as("minI"),
+          Aggregate.min(row.col("l")).as("minL"),
+          Aggregate.min(row.col("f")).as("minF"),
+          Aggregate.min(row.col("d")).as("minD"),
+          Aggregate.min(row.col("text")).as("minText"),
+          Aggregate.max(row.col("i")).as("maxI"),
+          Aggregate.max(row.col("l")).as("maxL"),
+          Aggregate.max(row.col("f")).as("maxF"),
+          Aggregate.max(row.col("d")).as("maxD"),
+          Aggregate.max(row.col("text")).as("maxText")
+        )
+
+    val nullReference = value(SourceRef.values("null-reductions", "null-reductions"))
+    val nullSource = value(Frame.values[NullableInput](nullReference))
+    val nullQuery: Frame[Result] = nullSource
+      .groupBy(_ => EmptyTuple)
+      .aggregate: row =>
+        (
+          Aggregate.count.as("n"),
+          Aggregate.sum(row.col("i")).as("sumI"),
+          Aggregate.sum(row.col("l")).as("sumL"),
+          Aggregate.sum(row.col("f")).as("sumF"),
+          Aggregate.sum(row.col("d")).as("sumD"),
+          Aggregate.mean(row.col("i")).as("meanI"),
+          Aggregate.mean(row.col("l")).as("meanL"),
+          Aggregate.mean(row.col("f")).as("meanF"),
+          Aggregate.mean(row.col("d")).as("meanD"),
+          Aggregate.variancePop(row.col("i")).as("varianceI"),
+          Aggregate.variancePop(row.col("l")).as("varianceL"),
+          Aggregate.variancePop(row.col("f")).as("varianceF"),
+          Aggregate.variancePop(row.col("d")).as("varianceD"),
+          Aggregate.stddevPop(row.col("i")).as("stddevI"),
+          Aggregate.stddevPop(row.col("l")).as("stddevL"),
+          Aggregate.stddevPop(row.col("f")).as("stddevF"),
+          Aggregate.stddevPop(row.col("d")).as("stddevD"),
+          Aggregate.min(row.col("i")).as("minI"),
+          Aggregate.min(row.col("l")).as("minL"),
+          Aggregate.min(row.col("f")).as("minF"),
+          Aggregate.min(row.col("d")).as("minD"),
+          Aggregate.min(row.col("text")).as("minText"),
+          Aggregate.max(row.col("i")).as("maxI"),
+          Aggregate.max(row.col("l")).as("maxL"),
+          Aggregate.max(row.col("f")).as("maxF"),
+          Aggregate.max(row.col("d")).as("maxD"),
+          Aggregate.max(row.col("text")).as("maxText")
+        )
+
+    val empty = value(Table.takeOwnership[Required](Vector.empty))
+    val nullRows: Vector[NullableInput] =
+      Vector((i = None, l = None, f = None, d = None, text = None))
+    val allNull = value(Table.fromRows[NullableInput](nullRows, batchSize = 1))
+
+    def check[S <: scala.NamedTuple.AnyNamedTuple](
+        query: Frame[S],
+        sources: ReferenceSources,
+        count: Long
+    )(using SchemaDescriptor[S]): Unit =
+      BackendConformance.compare(query, sources, ColumnarBackend) match
+        case BackendComparison.Equivalent(_, _) => ()
+        case other                              => fail(s"aggregate backends disagreed: $other")
+      val (observed, _) = completed(ReferenceBackend.execute(query, sources))
+      assertEquals(observed.schema.fields.map(_.nullable), false +: Vector.fill(26)(true))
+      assertEquals(
+        observed.rows,
+        Vector(ScalarValue.Int64(count) +: Vector.fill(26)(ScalarValue.Null))
+      )
+
+    try
+      check(emptyQuery, ReferenceSources.empty.bind(emptyReference, empty), count = 0L)
+      check(nullQuery, ReferenceSources.empty.bind(nullReference, allNull), count = 1L)
+    finally
+      empty.close()
+      allNull.close()
+
   property("unique and deliberately invalid schemas are generated"):
     forAll(Frame4sGenerators.uniqueFields, Frame4sGenerators.invalidSchema): (valid, invalid) =>
       assert(Schema(valid).isRight)
@@ -165,6 +338,265 @@ class ConformanceLawsSuite extends ScalaCheckSuite:
             assert(candidate.physicalPlan.contains("ScanProject"))
           case other => fail(s"columnar projection disagreed with the oracle: $other")
       finally table.close()
+
+  property("general filter and withColumn expressions preserve exact values and failures"):
+    type Output = (
+        id: Int,
+        key: Option[String],
+        value: Option[Double],
+        at: TimestampMicros,
+        score: Int
+    )
+    forAll(
+      Frame4sGenerators.rows,
+      Frame4sGenerators.batchSize,
+      Frame4sGenerators.intValue
+    ): (rows, batchSize, threshold) =>
+      val reference = value(SourceRef.values("expression-pipeline-law", "expression-pipeline-law"))
+      val source = value(Frame.values[ConformanceFixtures.RowSchema](reference))
+      val filtered = source.filter: row =>
+        (row.col("id") >= Expr.literal(threshold)) &&
+          (row.col("id") <= Expr.literal(Int.MaxValue))
+      val query: Frame[Output] = filtered.withColumn("score"): row =>
+        row.col("id") * Expr.literal(3) - Expr.literal(1)
+      val table = value(ConformanceFixtures.table(rows, math.max(1, batchSize)))
+      try
+        BackendConformance.compare(
+          query,
+          ReferenceSources.empty.bind(reference, table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("ExpressionPipeline"))
+          case other => fail(s"general expression pipeline disagreed with the oracle: $other")
+      finally table.close()
+
+  property("nullable floating withColumn arithmetic preserves exact values and nulls"):
+    type Output = (
+        id: Int,
+        key: Option[String],
+        value: Option[Double],
+        at: TimestampMicros,
+        adjusted: Option[Double]
+    )
+    forAll(Frame4sGenerators.rows, Frame4sGenerators.batchSize): (rows, batchSize) =>
+      val reference =
+        value(SourceRef.values("nullable-arithmetic-law", "nullable-arithmetic-law"))
+      val source = value(Frame.values[ConformanceFixtures.RowSchema](reference))
+      val query: Frame[Output] = source.withColumn("adjusted"): row =>
+        (row.col("value") / Some(2.0)) + Some(1.0)
+      val table = value(ConformanceFixtures.table(rows, math.max(1, batchSize)))
+      try
+        BackendConformance.compare(
+          query,
+          ReferenceSources.empty.bind(reference, table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("ExpressionPipeline"))
+          case other => fail(s"nullable arithmetic pipeline disagreed with the oracle: $other")
+      finally table.close()
+
+  property("nullable UTF-8 filters preserve SQL truth and Unicode equality"):
+    type Projection = (id: Int, key: Option[String])
+    forAll(Frame4sGenerators.rows, Frame4sGenerators.batchSize): (rows, batchSize) =>
+      val reference = value(SourceRef.values("utf8-filter-law", "utf8-filter-law"))
+      val source = value(Frame.values[ConformanceFixtures.RowSchema](reference))
+      val filtered = source.filter: row =>
+        (row.col("key") === Expr.literal(Option("λ"))).isTrue
+      val query: Frame[Projection] = filtered
+        .select(row => (row.col("id"), row.col("key")))
+      val table = value(ConformanceFixtures.table(rows, math.max(1, batchSize)))
+      try
+        BackendConformance.compare(
+          query,
+          ReferenceSources.empty.bind(reference, table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("ExpressionPipeline"))
+          case other => fail(s"UTF-8 expression pipeline disagreed with the oracle: $other")
+      finally table.close()
+
+  property("UTF-8 ordering filters preserve unsigned binary collation"):
+    type Projection = (id: Int, key: Option[String])
+    forAll(
+      Frame4sGenerators.rows,
+      Frame4sGenerators.batchSize,
+      Frame4sGenerators.utf8Value
+    ): (rows, batchSize, threshold) =>
+      val reference = value(SourceRef.values("utf8-order-law", "utf8-order-law"))
+      val source = value(Frame.values[ConformanceFixtures.RowSchema](reference))
+      val filtered = source.filter: row =>
+        (row.col("key") >= Expr.literal(Option(threshold))).isTrue
+      val query: Frame[Projection] = filtered
+        .select(row => (row.col("id"), row.col("key")))
+      val table = value(ConformanceFixtures.table(rows, math.max(1, batchSize)))
+      try
+        BackendConformance.compare(
+          query,
+          ReferenceSources.empty.bind(reference, table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("ExpressionPipeline"))
+          case other => fail(s"UTF-8 ordering pipeline disagreed with the oracle: $other")
+      finally table.close()
+
+  property("general grouped reductions admit projected nullable keys and multiple measures"):
+    type Input = (
+        key: Option[String],
+        bucket: Int,
+        first: Option[Double],
+        second: Option[Double]
+    )
+    type Selected = (
+        second: Option[Double],
+        key: Option[String],
+        first: Option[Double],
+        bucket: Int
+    )
+    type Output = (
+        key: Option[String],
+        bucket: Int,
+        n: Long,
+        firstMean: Option[Double],
+        secondMean: Option[Double]
+    )
+    forAll(Frame4sGenerators.rows, Frame4sGenerators.batchSize): (rows, batchSize) =>
+      val reference = value(SourceRef.values("general-aggregate-law", "general-aggregate-law"))
+      val inputRows = rows.map: row =>
+        (
+          key = row.key,
+          bucket = row.id % 5,
+          first = row.value,
+          second = Option.when((row.id & 1) == 0)(row.id.toDouble / 8.0)
+        )
+      val source = value(Frame.values[Input](reference))
+      val selected: Frame[Selected] = source.select: row =>
+        (
+          row.col("second"),
+          row.col("key"),
+          row.col("first"),
+          row.col("bucket")
+        )
+      val query: Frame[Output] = selected
+        .groupBy(row => (row.col("key"), row.col("bucket")))
+        .aggregate: row =>
+          (
+            Aggregate.count.as("n"),
+            Aggregate.mean(row.col("first")).as("firstMean"),
+            Aggregate.mean(row.col("second")).as("secondMean")
+          )
+      val table = value(Table.fromRows[Input](inputRows, math.max(1, batchSize)))
+      try
+        BackendConformance.compare(
+          query,
+          ReferenceSources.empty.bind(reference, table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("HashAggregate[General"))
+          case other => fail(s"general aggregate disagreed with the oracle: $other")
+      finally table.close()
+
+  property("primitive Int32 distinct agrees with the oracle across generated batch boundaries"):
+    type Projection = (id: Int)
+    forAll(Frame4sGenerators.rows, Frame4sGenerators.batchSize): (rows, batchSize) =>
+      val legalBatchSize = math.max(1, batchSize)
+      val reference = value(SourceRef.values("int-distinct-law", "int-distinct-law"))
+      val source = value(Frame.values[ConformanceFixtures.RowSchema](reference))
+      val query: Frame[Projection] =
+        source.select(row => Tuple1(row.col("id").as("id"))).distinct
+      val table = value(ConformanceFixtures.table(rows, legalBatchSize))
+      try
+        BackendConformance.compare(
+          query,
+          ReferenceSources.empty.bind(reference, table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("HashDistinct[Int32,Primitive]"))
+          case other => fail(s"primitive Int32 distinct disagreed with the oracle: $other")
+      finally table.close()
+
+  property("primitive keyed aggregates preserve exact oracle moments and floating edge cases"):
+    type IntOutput = (
+        id: Int,
+        n: Long,
+        sum: Option[Double],
+        mean: Option[Double],
+        variancePop: Option[Double]
+    )
+    type Utf8Input = (key: String, value: Option[Double])
+    type Utf8Output = (
+        key: String,
+        n: Long,
+        sum: Option[Double],
+        mean: Option[Double],
+        variancePop: Option[Double]
+    )
+    forAll(Frame4sGenerators.rows, Frame4sGenerators.batchSize): (rows, batchSize) =>
+      val legalBatchSize = math.max(1, batchSize)
+      val intReference = value(SourceRef.values("int-aggregate-law", "int-aggregate-law"))
+      val intSource = value(Frame.values[ConformanceFixtures.RowSchema](intReference))
+      val intQuery: Frame[IntOutput] =
+        intSource
+          .groupBy(row => Tuple1(row.col("id").as("id")))
+          .aggregate: row =>
+            (
+              Aggregate.count.as("n"),
+              Aggregate.sum(row.col("value")).as("sum"),
+              Aggregate.mean(row.col("value")).as("mean"),
+              Aggregate.variancePop(row.col("value")).as("variancePop")
+            )
+      val intTable = value(ConformanceFixtures.table(rows, legalBatchSize))
+
+      val utf8Reference = value(SourceRef.values("utf8-aggregate-law", "utf8-aggregate-law"))
+      val utf8Source = value(Frame.values[Utf8Input](utf8Reference))
+      val utf8Query: Frame[Utf8Output] =
+        utf8Source
+          .groupBy(row => Tuple1(row.col("key").as("key")))
+          .aggregate: row =>
+            (
+              Aggregate.count.as("n"),
+              Aggregate.sum(row.col("value")).as("sum"),
+              Aggregate.mean(row.col("value")).as("mean"),
+              Aggregate.variancePop(row.col("value")).as("variancePop")
+            )
+      val utf8Rows = rows.map: row =>
+        (key = row.key.getOrElse("<generated-null>"), value = row.value)
+      val utf8Table = value(Table.fromRows[Utf8Input](utf8Rows, legalBatchSize))
+
+      try
+        BackendConformance.compare(
+          intQuery,
+          ReferenceSources.empty.bind(intReference, intTable),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("HashAggregate[Int32,Primitive]"))
+          case other => fail(s"primitive Int32 aggregate disagreed with the oracle: $other")
+
+        BackendConformance.compare(
+          utf8Query,
+          ReferenceSources.empty.bind(utf8Reference, utf8Table),
+          ColumnarBackend
+        ) match
+          case BackendComparison.Equivalent(_, candidate) =>
+            assertEquals(candidate.fallback, None)
+            assert(candidate.physicalPlan.contains("HashAggregate[Utf8,Primitive]"))
+          case other => fail(s"primitive UTF-8 aggregate disagreed with the oracle: $other")
+      finally
+        intTable.close()
+        utf8Table.close()
 
   property("columnar fused checked pipelines agree on values and exact failures"):
     type Projection = (id: Int, next: Int)
@@ -570,4 +1002,4 @@ class ConformanceLawsSuite extends ScalaCheckSuite:
       case Left(error)   =>
         column.close()
         fail(error.message)
-    value(Table[S](Vector(batch)))
+    value(Table.takeOwnership[S](Vector(batch)))

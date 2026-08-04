@@ -1,0 +1,18 @@
+benchmark	output_rows	checksum	status
+ColumnarBenchmarks.primitiveScan	1000000	5984889344555131744	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.nullableScan	1000000	11112288120000694880	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.utf8Scan	1000000	5380570838178160033	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.dictionaryScan	1000000	5380570838178160033	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.filter	500000	8226007018004208267	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.fusedFilterProjectArithmetic	500000	11436329713124332608	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.groupedLowCardinality	16	7216036759941470829	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.groupedLowCardinalitySumOnly	16	8755585898262683926	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.groupedHighCardinality	1000000	17637657079599010752	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.joinOneToOne	1000000	6706901494945186080	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.joinOneToMany	1000000	3230237087133107989	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.joinSparse	100000	9974464967841974896	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.joinSkewed	1000	6659192972797761300	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.distinctLowCardinality	333334	11583962868550969505	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.semiJoinSparse	100000	5135246031684690592	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.antiJoinSparse	900000	2512695010752838560	candidate kernel; self-consistency only, no oracle at this tier
+ColumnarBenchmarks.unionAll	2000000	7649885274515455104	candidate kernel; self-consistency only, no oracle at this tier

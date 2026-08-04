@@ -1,0 +1,4 @@
+db70f3123e2ece43a9e52f8b482b65f4d87de685c8fb039a6053c8d4ea052767  modules/core/shared/src/main/scala/frame4s/ColumnarInterpreter.scala
+c9c2dfe7a74aae47f2ccb94f723d0378d6802bdab9cdcecf26d6142351f4fd0c  modules/core/shared/src/test/scala/frame4s/ColumnarInterpreterSuite.scala
+5cddb246815e8e4837fb3514adb33f949e47464510e4de1e7864436dc3a85135  modules/benchmarks/src/main/scala/frame4s/benchmarks/JoinRegimeCourtRunner.scala
+db1971391ef2c6d94e357810a4a675794be16786d864cbaf284c21f1bb05f29a  modules/benchmarks/src/main/scala/frame4s/benchmarks/JoinRegimeBenchmarks.scala

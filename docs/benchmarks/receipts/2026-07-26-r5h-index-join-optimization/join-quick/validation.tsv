@@ -1,0 +1,5 @@
+workload	output_rows	checksum	status
+joinOneToOne	1000	17280505836941918740	exact parity with one-shot hash join
+joinOneToMany	1000	8449815210990138133	exact parity with one-shot hash join
+joinSparse	100	12312468580073833310	exact parity with one-shot hash join
+joinSkewed	1000	6659192972797761300	exact parity with one-shot hash join
