@@ -24,6 +24,6 @@ and any proposed embargo. Never include credentials, personal data, or
 production secrets in a report.
 
 Ordinary correctness, type-safety, resource-ownership, and performance bugs may
-be reported through public issues once the repository is published. A report
-that may cross a confidentiality, integrity, availability, sandbox, or
-dependency-supply-chain boundary belongs in the private channel.
+be reported through public issues. A report that may cross a confidentiality,
+integrity, availability, sandbox, or dependency-supply-chain boundary belongs
+in the private channel.
