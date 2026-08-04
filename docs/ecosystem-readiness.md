@@ -31,8 +31,9 @@ This license applies to frame4s, not to unrelated ScalaFIM modules.
 
 ## Conduct, security, and maintenance
 
-The project adopts the Typelevel Code of Conduct and must publish a private
-security-reporting channel before accepting outside contributions.
+The project adopts the Typelevel Code of Conduct and provides the private
+security-reporting channel documented in
+[`SECURITY.md`](../SECURITY.md).
 Security reports should receive acknowledgement within three business days;
 embargo and disclosure timing are agreed with the reporter. Public issues are
 appropriate for ordinary correctness and performance bugs, not undisclosed
