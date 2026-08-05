@@ -6,6 +6,9 @@ import scala.compiletime.testing.typeCheckErrors
 class PublicApiSuite extends munit.FunSuite:
   type Input = (id: Int, label: String)
 
+  private def value[E, A](result: Either[E, A]): A =
+    result.fold(error => fail(error.toString), identity)
+
   test("the typed query surface is usable outside frame4s"):
     val source = Frame.source[Input]("input").fold(error => fail(error.message), identity)
     val query: Frame[(label: String, nextId: Int)] =
@@ -45,3 +48,24 @@ class PublicApiSuite extends munit.FunSuite:
       LogicalPlan.Source(source, schema)
     """)
     assert(errors.nonEmpty)
+
+  test("retained batches support external adapters without package-private access"):
+    val table = value(
+      Table.fromRows[Input](
+        Vector((id = 1, label = "one"), (id = 2, label = "two")),
+        batchSize = 1
+      )
+    )
+    val retained = value(table.retainBatches)
+    table.close()
+
+    try
+      assertEquals(retained.map(_.rowCount), Vector(1, 1))
+      assertEquals(
+        retained.map(batch => value(batch.column("id")).scalar(0)),
+        Vector(Right(ScalarValue.Int32(1)), Right(ScalarValue.Int32(2)))
+      )
+      assert(
+        retained.forall(batch => value(value(batch.column("id")).copyPhysicalBuffers).nonEmpty)
+      )
+    finally retained.foreach(_.close())

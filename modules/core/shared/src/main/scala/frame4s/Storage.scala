@@ -1389,6 +1389,21 @@ final class Table[S <: NamedTuple.AnyNamedTuple] private (
   def showSchema(maxWidth: Int = 120): Either[TableReadError, String] =
     TableRendering.renderSchema(this, maxWidth)
 
+  /** Retain independently owned full-batch views for an external adapter.
+    *
+    * On success, the caller owns every returned batch and must close each one. The retained views
+    * share physical storage with this table but have independent lifetimes: they remain usable
+    * after this table closes, and closing them does not invalidate this table. Use
+    * [[ColumnArray.copyPhysicalBuffers]] when the adapter needs detached bytes.
+    *
+    * Acquisition is atomic with respect to [[close]]. A closed table returns
+    * [[TableReadError.Closed]]. If retaining any batch fails, every view created by this call is
+    * closed and the table-owned batches remain untouched.
+    */
+  def retainBatches: Either[TableReadError, Vector[RecordBatch]] = synchronized:
+    if closed then Left(TableReadError.Closed)
+    else Table.retainAll(batches).left.map(TableReadError.Storage.apply)
+
   def close(): Unit = synchronized:
     if !closed then
       closed = true
@@ -1423,23 +1438,7 @@ object Table:
     val expected = descriptor.schema
     validateInputs(expected, batches) match
       case Some(error) => Left(error)
-      case None        =>
-        val retained = ArrayBuffer.empty[RecordBatch]
-        var index = 0
-        var error: Option[StorageError] = None
-        while index < batches.length && error.isEmpty do
-          val result =
-            try batches(index).slice(0, batches(index).rowCount)
-            catch case NonFatal(cause) => Left(StorageError.Unexpected(boundedFailureDetail(cause)))
-          result match
-            case Right(batch) => retained += batch
-            case Left(value)  => error = Some(value)
-          index += 1
-        error match
-          case Some(value) =>
-            closeBatches(retained.toVector)
-            Left(value)
-          case None => Right(unsafeAdoptValidated(expected, retained.toVector))
+      case None        => retainAll(batches).map(unsafeAdoptValidated(expected, _))
 
   private[frame4s] def unsafeAdoptValidated[S <: NamedTuple.AnyNamedTuple](
       schema: Schema,
@@ -1557,6 +1556,28 @@ object Table:
 
   private def closeBatches(batches: Vector[RecordBatch]): Unit =
     ResourceRelease.quietly(batches)(_.close())
+
+  private def retainAll(
+      batches: Vector[RecordBatch]
+  ): Either[StorageError, Vector[RecordBatch]] =
+    val retained = ArrayBuffer.empty[RecordBatch]
+    var index = 0
+    var error: Option[StorageError] = None
+    while index < batches.length && error.isEmpty do
+      val result =
+        try
+          val batch = batches(index)
+          batch.slice(0, batch.rowCount)
+        catch case NonFatal(cause) => Left(StorageError.Unexpected(boundedFailureDetail(cause)))
+      result match
+        case Right(batch) => retained += batch
+        case Left(value)  => error = Some(value)
+      index += 1
+    error match
+      case Some(value) =>
+        closeBatches(retained.toVector)
+        Left(value)
+      case None => Right(retained.toVector)
 
   private def inputAttempt[A](
       stage: TableInputStage,
