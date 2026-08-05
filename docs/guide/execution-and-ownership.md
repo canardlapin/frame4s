@@ -71,6 +71,16 @@ them immediately. A failed retain closes only views created by that call.
 row-encoding failures into `TableReadError.InputFailure`, including the failed
 stage and logical row.
 
+External columnar adapters can call `table.retainBatches` while the table is
+open. The result contains independently owned full-batch views in source order;
+the caller must close every returned `RecordBatch`. Those views share storage
+with the table but may outlive it, and closing them does not invalidate the
+table. Acquisition returns `TableReadError.Closed` for a closed table and
+releases every partially retained view if a later batch cannot be retained.
+Copying through `ColumnArray.copyPhysicalBuffers` remains an explicit adapter
+operation; retained views alone are not a detached-buffer or zero-copy export
+claim.
+
 Source identity becomes a real choice when one runtime binds several inputs.
 Use the explicit-reference constructors in that case:
 

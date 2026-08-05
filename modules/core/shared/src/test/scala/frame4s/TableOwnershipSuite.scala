@@ -4,6 +4,8 @@ class TableOwnershipSuite extends munit.FunSuite:
   type Row = (id: Int)
   type Other = (value: Long)
   type Pair = (id: Int, label: String)
+  type OptionalRow = (id: Option[Int])
+  type OptionalText = (label: Option[String])
 
   private def value[E, A](result: Either[E, A]): A =
     result.fold(error => fail(error.toString), identity)
@@ -21,6 +23,29 @@ class TableOwnershipSuite extends munit.FunSuite:
       RecordBatch(
         summon[SchemaDescriptor[Other]].schema,
         Vector(value(ColumnArray.int64(values, tracker = tracker)))
+      )
+    )
+
+  private def optionalRowBatch(
+      values: Array[Int],
+      valid: Array[Boolean],
+      tracker: BufferTracker
+  ): RecordBatch =
+    value(
+      RecordBatch(
+        summon[SchemaDescriptor[OptionalRow]].schema,
+        Vector(value(ColumnArray.int32(values, valid, tracker)))
+      )
+    )
+
+  private def dictionaryBatch(tracker: BufferTracker): RecordBatch =
+    val indices = value(ColumnArray.int32(Array(1, 0), Array(true, false), tracker))
+    val values = value(ColumnArray.utf8(Array("first", "second"), tracker = tracker))
+    val dictionary = value(ColumnArray.dictionary(indices, values))
+    value(
+      RecordBatch(
+        summon[SchemaDescriptor[OptionalText]].schema,
+        Vector(dictionary)
       )
     )
 
@@ -116,6 +141,81 @@ class TableOwnershipSuite extends munit.FunSuite:
     wrong.close()
     assertReleased(goodTracker)
     assertReleased(wrongTracker)
+
+  test("retainBatches gives adapters independent caller-owned views"):
+    val firstTracker = new BufferTracker
+    val secondTracker = new BufferTracker
+    val firstRoot = optionalRowBatch(Array(10, 20, 30), Array(true, false, true), firstTracker)
+    val first = value(firstRoot.slice(1, 2))
+    firstRoot.close()
+    val second = optionalRowBatch(Array(40), Array(true), secondTracker)
+    val expectedLayouts = Vector(first, second).map(batch => value(batch.column("id")).layout)
+    val table = value(Table.takeOwnership[OptionalRow](Vector(first, second)))
+
+    val retained = value(table.retainBatches)
+    assertEquals(retained.map(_.schema), Vector.fill(2)(table.schema))
+    assertEquals(retained.map(_.rowCount), Vector(2, 1))
+    assertEquals(retained.map(batch => value(batch.column("id")).layout), expectedLayouts)
+    assertEquals(value(retained(0).column("id")).scalar(0), Right(ScalarValue.Null))
+    assertEquals(value(retained(0).column("id")).scalar(1), Right(ScalarValue.Int32(30)))
+    assertEquals(value(retained(1).column("id")).scalar(0), Right(ScalarValue.Int32(40)))
+
+    retained.foreach(_.close())
+    assertEquals(table.row(2), Right((id = Some(40))))
+
+    val afterTable = value(table.retainBatches)
+    table.close()
+    assertEquals(value(afterTable(0).column("id")).scalar(0), Right(ScalarValue.Null))
+    assertEquals(value(afterTable(1).column("id")).scalar(0), Right(ScalarValue.Int32(40)))
+    afterTable.foreach(_.close())
+    assertReleased(firstTracker)
+    assertReleased(secondTracker)
+
+  test("retainBatches preserves dictionary encoding and empty-table behavior"):
+    val dictionaryTracker = new BufferTracker
+    val dictionary = dictionaryBatch(dictionaryTracker)
+    val table = value(Table.takeOwnership[OptionalText](Vector(dictionary)))
+    val retained = value(table.retainBatches)
+
+    assertEquals(
+      value(retained.head.column("label")).encoding,
+      PhysicalEncoding.Dictionary(DataType.Int32, DataType.Utf8)
+    )
+    assertEquals(
+      value(retained.head.column("label")).scalar(0),
+      Right(ScalarValue.checkedUtf8("second"))
+    )
+    assertEquals(value(retained.head.column("label")).scalar(1), Right(ScalarValue.Null))
+    retained.foreach(_.close())
+    table.close()
+    assertReleased(dictionaryTracker)
+
+    val empty = value(Table.takeOwnership[Row](Vector.empty))
+    assertEquals(empty.retainBatches, Right(Vector.empty))
+    empty.close()
+    assertEquals(empty.retainBatches, Left(TableReadError.Closed))
+
+  test("retainBatches unwinds partial retention without closing table-owned batches"):
+    val liveTracker = new BufferTracker
+    val closedTracker = new BufferTracker
+    val live = rowBatch(Array(1), liveTracker)
+    val closed = rowBatch(Array(2), closedTracker)
+    closed.close()
+    val malformed = Table.unsafeAdoptValidated[Row](
+      summon[SchemaDescriptor[Row]].schema,
+      Vector(live, closed)
+    )
+
+    assertEquals(
+      malformed.retainBatches,
+      Left(TableReadError.Storage(StorageError.BufferClosed))
+    )
+    assert(!live.isClosed)
+    assertEquals(value(live.column("id")).scalar(0), Right(ScalarValue.Int32(1)))
+    assertEquals(liveTracker.snapshot.activeViews, 1)
+    malformed.close()
+    assertReleased(liveTracker)
+    assertReleased(closedTracker)
 
   test("closed inputs are rejected without leaking prior retained views"):
     val liveTracker = new BufferTracker
