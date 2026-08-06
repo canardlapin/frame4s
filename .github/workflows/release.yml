@@ -57,15 +57,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub release ${GITHUB_REF_NAME} already exists; skipping create."
+            exit 0
+          fi
+          notes_file=docs/release-notes/0.1.0.md
           release_args=(
             "$GITHUB_REF_NAME"
             --verify-tag
             --title "frame4s ${GITHUB_REF_NAME#v}"
-            --notes-file docs/release-notes/0.1.0.md
           )
           if [[ "$GITHUB_REF_NAME" =~ -RC[0-9]+$ ]]; then
             release_args+=(--prerelease)
+          else
+            # Stable promotion may tag the soaked RC commit without a notes
+            # rewrite commit; publish stage-correct status for the release body.
+            notes_file="${RUNNER_TEMP}/release-notes-stable.md"
+            sed 's/^Status: release-candidate draft$/Status: stable/' \
+              docs/release-notes/0.1.0.md > "$notes_file"
           fi
+          release_args+=(--notes-file "$notes_file")
           gh release create "${release_args[@]}"
 
   pages:
