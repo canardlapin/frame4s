@@ -15,6 +15,12 @@ released. The build intentionally configures no fictional pre-release
 baseline. Beginning with the next release line, `sbt-version-policy` compares
 against `0.1.0`.
 
+Release candidates in the `0.1.0-RCn` line are immutable published artifacts,
+but they carry no compatibility promise and are not baselines: an RC may differ
+from a later RC and from stable `0.1.0` without a version-policy obligation.
+Consumers participating in the soak pin one exact RC version and move to
+`0.1.0` at promotion.
+
 ## Stable design commitments
 
 Within the `0.1.x` line:

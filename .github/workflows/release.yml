@@ -1,5 +1,10 @@
 name: Release
 
+# The v* glob covers both stages of the declared release sequence: the
+# immutable v0.1.0-RCn release-candidate tags and the stable v0.1.0 promotion
+# tag route through this same Central Portal publication. RC artifacts carry
+# no compatibility promise; docs/release-policy.md declares the soak gate
+# between the two stages.
 on:
   push:
     tags:

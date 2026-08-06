@@ -4,10 +4,16 @@ The release manager runs this checklist from a clean checkout of the exact
 candidate commit. Configured workflows are not called green until the remote
 jobs pass on that commit.
 
+`0.1.0` publishes in two stages: the immutable `0.1.0-RC1` release candidate
+(tag `v0.1.0-RC1`) first, then stable `0.1.0` (tag `v0.1.0`) after the soak
+gate in [`release-policy.md`](release-policy.md) passes. Every section below
+applies to each published stage on its own exact commit.
+
 ## Candidate identity
 
-- [ ] Record the full commit, `0.1.0` version, `v0.1.0` tag target, JDK, Node,
-      sbt, Scala, and Scala.js versions in the release receipt.
+- [ ] Record the full commit, the stage version (`0.1.0-RC1` for the release
+      candidate, `0.1.0` at stable promotion), its tag target, JDK, Node, sbt,
+      Scala, and Scala.js versions in the release receipt.
 - [ ] Confirm `git status --short` is empty and no artifact or receipt contains
       a local absolute path, secret, snapshot dependency, `.mote`, `vendor`, or
       `target` payload.
@@ -45,8 +51,8 @@ diagnostic fails the candidate.
 ## API, semantics, and documentation
 
 - [ ] Public API changes are frozen and listed in the release notes.
-- [ ] `0.1.0` remains the first compatibility baseline; no pre-release artifact
-      is configured as a predecessor.
+- [ ] `0.1.0` remains the first compatibility baseline; no pre-release artifact,
+      including `0.1.0-RC1`, is configured as a predecessor.
 - [ ] Executable guides and README examples use only public, total APIs and
       distinguish `Auto` materializing collection, typed reference fallback,
       `ReferenceOnly`/`RequireColumnar`, and the reference streaming route.
@@ -75,6 +81,19 @@ diagnostic fails the candidate.
       `scripts/release-owner-preflight.sh`; its non-secret receipt is attached.
 - [ ] Signed public coordinates resolve from clean external JVM, Scala.js, and
       Arrow consumers before broader announcement.
+
+## RC soak and stable promotion
+
+- [ ] `v0.1.0-RC1` is published first and its coordinates resolve and run from
+      clean external JVM, Scala.js, and Arrow consumers.
+- [ ] The declared soak gate passes: at least seven days from external RC1
+      verification, regress4s pins and passes its clean integration gate
+      against the RC coordinates, the staged external consumers rerun against
+      the public coordinates, and every finding is classified blocking,
+      compatible, or deferred with no blocking finding open.
+- [ ] Stable `v0.1.0` points at the soaked candidate commit, or a new exact
+      candidate reruns every affected court before promotion.
+- [ ] Stable promotion, like the RC tag, has explicit owner authorization.
 
 Publication stops on any unchecked item. A failed publication is corrected and
 reverified before an announcement or performance claim.

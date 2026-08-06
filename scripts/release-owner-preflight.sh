@@ -90,8 +90,8 @@ require_attestation() {
 if [[ ! "$performed_by" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   fail "FRAME4S_RELEASE_PERFORMED_BY contains unsupported characters"
 fi
-if [[ ! "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  fail "FRAME4S_RELEASE_VERSION must be a stable x.y.z version"
+if [[ ! "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-RC[0-9]+)?$ ]]; then
+  fail "FRAME4S_RELEASE_VERSION must be a stable x.y.z or x.y.z-RCn version"
 fi
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   fail "FRAME4S_RELEASE_REPOSITORY must have owner/repository form"

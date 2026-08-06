@@ -40,8 +40,13 @@ user profile.
    export FRAME4S_CENTRAL_PORTAL_RECOVERY=pass
    export FRAME4S_PRIVATE_REPORTING_VIEW=pass
    export FRAME4S_SIGNING_FINGERPRINT=<full-public-fingerprint>
+   export FRAME4S_RELEASE_VERSION=0.1.0-RC1
    scripts/release-owner-preflight.sh target/release-owner-preflight
    ```
+
+   `FRAME4S_RELEASE_VERSION` names the stage being prepared: `0.1.0-RC1` for
+   the first release candidate, `0.1.0` when rehearsing the stable promotion.
+   Unset, it defaults to `0.1.0`.
 
 The script refuses a dirty checkout. It verifies JDK 21, Node.js 24, the
 repository-pinned sbt 1.10.5 court, the sbt 1.12.11 Central Portal release
