@@ -227,7 +227,8 @@ sbt \
   benchmarkSmoke
 
 current_step="isolated-artifact-rehearsal"
-bash scripts/release-rehearsal.sh "$receipt/artifact-rehearsal"
+FRAME4S_REHEARSAL_VERSION="$candidate_version" \
+  bash scripts/release-rehearsal.sh "$receipt/artifact-rehearsal"
 
 current_step="final-receipt"
 {
