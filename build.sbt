@@ -11,8 +11,9 @@ lazy val apiDocsCheck = taskKey[Unit](
 
 ThisBuild / organization := "io.github.canardlapin"
 ThisBuild / scalaVersion := "3.7.4"
-// Generate and validate the public site in CI. Deployment remains an explicit
-// release-owner action until GitHub Pages and its permissions are verified.
+// Generate and validate the public site in CI. The tag-triggered release
+// workflow deploys the exact-tag output through the GitHub Pages Actions API;
+// ordinary sbt tasks never publish a branch or tag on their own.
 ThisBuild / tlSitePublishBranch := None
 ThisBuild / tlSitePublishTags := false
 ThisBuild / versionScheme := Some("early-semver")

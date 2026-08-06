@@ -157,6 +157,13 @@ repository_admin="$("$gh_repo" api "repos/$repository" --jq '.permissions.admin'
 [[ "$repository_admin" == "true" ]] ||
   fail "$performed_by does not have repository administration access"
 
+current_step="github-pages"
+pages_build_type="$(
+  "$gh_repo" api "repos/$repository/pages" --jq '.build_type'
+)"
+[[ "$pages_build_type" == "workflow" ]] ||
+  fail "GitHub Pages must be enabled with build_type=workflow"
+
 current_step="github-release-secrets"
 release_secret_names="$(
   "$gh_repo" secret list \
@@ -227,7 +234,14 @@ sbt \
   benchmarkSmoke
 
 current_step="isolated-artifact-rehearsal"
-bash scripts/release-rehearsal.sh "$receipt/artifact-rehearsal"
+FRAME4S_REHEARSAL_VERSION="$candidate_version" \
+  bash scripts/release-rehearsal.sh "$receipt/artifact-rehearsal"
+rehearsed_version="$(
+  sed -n 's/^candidate.version=//p' \
+    "$receipt/artifact-rehearsal/environment.properties"
+)"
+[[ "$rehearsed_version" == "$candidate_version" ]] ||
+  fail "artifact rehearsal version $rehearsed_version does not match candidate $candidate_version"
 
 current_step="final-receipt"
 {

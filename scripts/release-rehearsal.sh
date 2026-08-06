@@ -6,6 +6,10 @@ user_root="${HOME:-}"
 candidate_commit="$(git rev-parse HEAD)"
 version="${FRAME4S_REHEARSAL_VERSION:-0.1.0-RC1}"
 receipt="${1:-docs/benchmarks/receipts/$(date +%F)-r6-release-rehearsal}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-RC[0-9]+)?$ ]]; then
+  echo "FRAME4S_REHEARSAL_VERSION must be a stable x.y.z or x.y.z-RCn version" >&2
+  exit 2
+fi
 if [[ "$receipt" != /* ]]; then
   receipt="$source_root/$receipt"
 fi

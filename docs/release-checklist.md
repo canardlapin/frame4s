@@ -19,6 +19,8 @@ applies to each published stage on its own exact commit.
       `target` payload.
 - [ ] Confirm release notes, checksums, tag, POMs, and GitHub release name the
       same version and commit.
+- [ ] Confirm the GitHub release is marked pre-release for `0.1.0-RC1` and is
+      not marked pre-release for stable `0.1.0`.
 
 ## Required court
 
@@ -72,15 +74,23 @@ diagnostic fails the candidate.
 - [ ] The tag-triggered workflow runs the publication gate with sbt 1.12.11,
       routes stable artifacts through Central Portal local staging, and exposes
       `sonaRelease`; the normal supported court remains pinned to sbt 1.10.5.
+- [ ] Only after Central publication succeeds, the tag workflow creates the
+      matching GitHub release entry and deploys the exact-tag public site through
+      GitHub Pages. A failure in either post-publication job keeps the stage open.
 - [ ] `PROVENANCE.md` matches the resolved candidate dependency graph and copied
       source boundary.
 - [ ] GitHub private vulnerability reporting is enabled and independently
       visible; `SECURITY.md` response expectations are current.
+- [ ] GitHub Pages is enabled with GitHub Actions as its source before the tag;
+      the release workflow does not carry an administrative enablement token.
 - [ ] The owner completes the offline recovery and clean-machine rehearsal in
       `maintainer-continuity.md` through
       `scripts/release-owner-preflight.sh`; its non-secret receipt is attached.
 - [ ] Signed public coordinates resolve from clean external JVM, Scala.js, and
       Arrow consumers before broader announcement.
+- [ ] The served Pages URL and every versioned javadoc.io API link resolve for
+      the published stage; record any indexing delay as an external incomplete
+      gate rather than treating successful upload as served documentation.
 
 ## RC soak and stable promotion
 
