@@ -36,6 +36,14 @@ private[fs2] object PathByteStream:
 private def readPath[F[_]: Async](path: Path): Stream[F, Byte] =
   PathByteStream(Async[F].blocking(Files.newInputStream(path.toNioPath)))
 
+/** Bounded header discovery before the caller explicitly constructs a runtime schema. */
+object DelimitedHeaderPath:
+  def read[F[_]: Async](
+      path: Path,
+      options: DelimitedHeaderOptions = DelimitedHeaderOptions()
+  ): F[Either[SourceError, DelimitedHeader]] =
+    DelimitedHeader.bytes(readPath(path),options)
+
 /** JVM-only, resource-safe CSV path adapter.
   *
   * The file is opened lazily by FS2 when a planned batch stream runs and is closed on completion,
