@@ -59,6 +59,48 @@ inside the runtime resource. Use `TsvFrameSource`, `TsvPathSource`, and
 alone. A join supplies an explicit `SourceRef` for each input, as described in
 [execution and ownership](execution-and-ownership.md).
 
+## Discover column names before choosing a schema
+
+An interactive importer can inspect the first logical record before asking a
+user to map columns. `DelimitedHeader` returns ordered names, preserving case,
+whitespace, quoted delimiters, embedded newlines, and Unicode. It rejects empty,
+blank, and exactly duplicated names. It does not infer a delimiter or data types,
+and its result is not evidence of a typed schema.
+
+```scala mdoc
+val headerInput = _root_.fs2.Stream
+  .emits("participant\t\"response\ttime\"\n".toVector)
+  .covary[IO]
+DelimitedHeader.characters(
+  headerInput,
+  DelimitedHeaderOptions(delimiter = '\t', maxColumns = 64)
+).map(_.map(_.columnNames)).unsafeRunSync()
+```
+
+`DelimitedHeader.bytes` accepts a strict UTF-8 byte stream on both platforms.
+For a JVM file, the owning path helper opens and closes the input for this call:
+
+```scala mdoc:compile-only
+def inspectTableHeader(path: _root_.fs2.io.file.Path): IO[Either[SourceError, DelimitedHeader]] =
+  DelimitedHeaderPath.read[IO](
+    path,
+    DelimitedHeaderOptions(delimiter = '\t', maxColumns = 64)
+  )
+```
+
+The default column limit is 1,024; `limits` uses the same finite record, field,
+and diagnostic bounds described below. Invalid options are rejected before the
+input is acquired. Failures return structured `SourceError` values; cancellation
+retains the effect runtime's cancellation behavior. Stream finalizers run on
+success, failure, and cancellation.
+
+Only the first logical record is parsed and decoded. A malformed later row,
+even in the same supplied chunk, does not invalidate a valid header. Upstream
+sources may prefetch bytes, so this is not an exact physical-read byte limit.
+Successful inspection does not validate the remaining table. When reading the
+full file, supply an explicit schema and validate its header again; a path may
+have changed between inspection and ingestion.
+
 ## Nulls remain distinct from text
 
 Delimited null recognition is quote-aware. The default `NullPolicy` recognizes

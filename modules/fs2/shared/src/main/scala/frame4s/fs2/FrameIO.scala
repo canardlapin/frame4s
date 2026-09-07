@@ -707,6 +707,69 @@ final case class CsvSettings(
       limits = limits
     )
 
+/** Explicit syntax and finite bounds for inspecting only the first logical record. */
+final case class DelimitedHeaderOptions(
+    delimiter: Char = ',',
+    maxColumns: Int = 1024,
+    limits: DelimitedReadLimits = DelimitedReadLimits.default
+)
+
+/** Header names are data, not inferred column types or typed-schema evidence. */
+final class DelimitedHeader private (val columnNames: Vector[String])
+
+object DelimitedHeader:
+  /** Inspect a character stream, closing its scope after the first record.
+    * Names retain whitespace, case, quotes-as-data and Unicode. Empty/blank and duplicate names
+    * fail. Later records are not validated; upstream streams may still prefetch their own chunks.
+    */
+  def characters[F[_]](
+      input: Stream[F, Char],
+      options: DelimitedHeaderOptions = DelimitedHeaderOptions()
+  )(using F: Async[F]): F[Either[SourceError, DelimitedHeader]] =
+    val validation =
+      if options == null || options.limits == null then Left(SourceError.InvalidRequest("header options and limits must be present"))
+      else if options.maxColumns <= 0 then Left(SourceError.InvalidRequest("header column limit must be positive"))
+      else if options.delimiter == '"' || options.delimiter == '\r' || options.delimiter == '\n' then
+        Left(SourceError.InvalidRequest("invalid header delimiter"))
+      else Right(())
+    validation match
+      case Left(error) => F.pure(Left(error))
+      case Right(_) =>
+        val records = Stream.eval(F.delay(new CsvParser(options.delimiter, options.maxColumns, options.limits))).flatMap: parser =>
+          // Stop at the record boundary even if a supplied chunk contains a malformed later row.
+          val chunks = AdapterFailureBoundary.sourceStream(input, SourceError.Upstream.apply)
+            .chunkLimit(1)
+            .evalMap(chunk => F.fromEither(parser.feed(chunk).leftMap(SourceFailure.apply)))
+            .flatMap(Stream.emits)
+          chunks ++ Stream.eval(F.fromEither(parser.finish().leftMap(SourceFailure.apply))).flatMap(Stream.emits)
+        records.take(1).compile.last.attempt.map:
+          case Left(SourceFailure(error)) => Left(error)
+          case Left(error) => Left(SourceError.Upstream(error))
+          case Right(None) => Left(SourceError.MalformedDelimited(
+            SourceLocation(1L,1,0L), "missing header",
+            SourceExcerpt("",0L,truncatedBefore=false,truncatedAfter=false)))
+          case Right(Some(record)) =>
+            val names = record.values
+            val seen = scala.collection.mutable.HashSet.empty[String]
+            val invalid = names.indices.find(index => names(index).trim.isEmpty || !seen.add(names(index)))
+            invalid match
+              case Some(index) =>
+                val cell = record.cells(index)
+                Left(SourceError.MalformedDelimited(cell.location,
+                  if names(index).trim.isEmpty then "header name is empty or blank" else "duplicate header name",
+                  cell.excerpt))
+              case None => Right(new DelimitedHeader(names))
+
+  /** Strict UTF-8 inspection. Only the header prefix is decoded, including when a later invalid
+    * byte occurs in the same supplied chunk. Cancellation and stream finalizers retain FS2 semantics.
+    */
+  def bytes[F[_]](
+      input: Stream[F, Byte],
+      options: DelimitedHeaderOptions = DelimitedHeaderOptions()
+  )(using F: Async[F]): F[Either[SourceError, DelimitedHeader]] =
+    val bounded = AdapterFailureBoundary.sourceStream(input, SourceError.Upstream.apply).chunkLimit(1).unchunks
+    characters(StrictUtf8.decode(bounded).flatMap(value => Stream.emits(value.toVector)),options)
+
 /** Portable incremental CSV source for strings, bytes, or characters.
   *
   * Parsing begins when the planned batch stream runs. The source retains only incremental parser
