@@ -42,7 +42,7 @@ object DelimitedHeaderPath:
       path: Path,
       options: DelimitedHeaderOptions = DelimitedHeaderOptions()
   ): F[Either[SourceError, DelimitedHeader]] =
-    DelimitedHeader.bytes(readPath(path),options)
+    DelimitedHeader.bytes(readPath(path), options)
 
 /** JVM-only, resource-safe CSV path adapter.
   *
