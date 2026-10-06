@@ -51,7 +51,8 @@ The committed court covers:
 
 - primitive and nullable scan;
 - direct UTF-8 and dictionary scan;
-- filter and filter/project with arithmetic;
+- filter and filter/project with arithmetic, using both a contiguous suffix and
+  a fixed-seed scattered selection;
 - low- and high-cardinality count/sum/mean/variance aggregation;
 - one-to-one, one-to-many, sparse, and skewed joins;
 - CSV decoding;
@@ -65,12 +66,15 @@ explicit residual, never a hidden reference fallback.
 
 The specialized-array methods are lower bounds that clarify representation
 overhead. Saddle 4.0.0-M14 participates only in comparable JVM shapes. The
-materialized primitive projection, fused filter/project, and nullable grouped
-sum produce the same output row counts and checksums as frame4s. The raw
-primitive scan and scalar sum-only grouped reduction are retained as
-lower-bound context; they do less work and are not ranked as equivalent
-comparators. Saddle has no claimed comparator for the SQL duplicate-key join
-cases, frame4s ownership, dictionary layout, or CSV acquisition.
+materialized primitive projection, both fused filter/project fixtures, and
+nullable grouped sum produce the same output row counts and checksums as
+frame4s. The historical contiguous fixture remains in the court so its ratified
+threshold does not move; the scattered fixture governs general-selection
+comparisons. The raw primitive scan and scalar sum-only grouped reduction are
+retained as lower-bound context; they do less work and are not ranked as
+equivalent comparators. Saddle has no claimed comparator for the SQL
+duplicate-key join cases, frame4s ownership, dictionary layout, or CSV
+acquisition.
 
 Pandas is measured in a separate single-process Python court because JMH
 cannot provide a shared-process timing environment across the JVM and CPython.
@@ -89,7 +93,16 @@ scripts/pandas-court.sh \
 The full four-statistic group workload is shape-validated rather than
 checksum-ranked because the two runtimes use different legal floating-point
 reduction orders. All other admitted Pandas comparisons require exact
-checksums.
+checksums. Scale-tier receipts may obtain their frame4s validation row from the
+columnar candidate because the reference interpreter cannot execute its
+nested-loop joins at that size. Every Pandas and Polars validation row records
+whether its provenance is `semantic-reference` or the explicitly weaker
+`columnar-candidate`; candidate agreement is never described as oracle proof.
+
+The scattered fused fixture uses the same SplitMix64/Fisher-Yates permutation
+in Scala, Pandas, and Polars. Each receipt records the unsigned seed and a
+SHA-256 over the little-endian Int32 permutation. Receipt review rejects a
+comparator run if those hashes differ.
 
 dplyr also has a separate-process practical-pipeline court. Its two workloads
 follow the verb composition in the

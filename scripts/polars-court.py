@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import math
 import os
@@ -51,6 +52,8 @@ NULL_HASH = 0x61C8864680B583EB
 # so the court switches from raw-bit checksums to vectorized invariants.
 EXACT_CHECKSUM_MAX_ROWS = 100_000
 INVARIANT_TOLERANCE = 1e-10
+FUSED_PIPELINE_SEED = 0x3C6EF372FE94F82B
+SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,25 @@ def checksum(frame: pl.DataFrame) -> str:
     return str(result)
 
 
+def scattered_ids(rows: int) -> np.ndarray:
+    """Match frame4s' fixed-seed SplitMix64/Fisher-Yates permutation."""
+    values = np.arange(rows, dtype=np.int32)
+    state = FUSED_PIPELINE_SEED
+    for index in range(rows - 1, 0, -1):
+        state = (state + SPLITMIX_GAMMA) & MASK_64
+        mixed = state
+        mixed = ((mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9) & MASK_64
+        mixed = ((mixed ^ (mixed >> 27)) * 0x94D049BB133111EB) & MASK_64
+        mixed ^= mixed >> 31
+        selected = mixed % (index + 1)
+        values[index], values[selected] = values[selected], values[index]
+    return values
+
+
+def permutation_digest(values: np.ndarray) -> str:
+    return hashlib.sha256(values.astype("<i4", copy=False).tobytes()).hexdigest()
+
+
 def invariants(frame: pl.DataFrame) -> dict[str, float]:
     """Vectorized per-column invariants for tiers too large to walk row-wise.
 
@@ -156,6 +178,20 @@ def fixtures(rows: int) -> tuple[dict[str, pl.DataFrame], dict[str, Workload]]:
             "value": pl.Series("value", raw_values, nan_to_null=True),
         }
     )
+    scattered_order = scattered_ids(rows)
+    scattered_facts = pl.DataFrame(
+        {
+            "id": pl.Series("id", scattered_order),
+            "group": pl.Series(
+                "group",
+                [groups[index] for index in scattered_order],
+                dtype=pl.String,
+            ),
+            "value": pl.Series(
+                "value", raw_values[scattered_order], nan_to_null=True
+            ),
+        }
+    )
     left = pl.DataFrame(
         {
             "key": pl.Series("key", ids),
@@ -198,6 +234,11 @@ def fixtures(rows: int) -> tuple[dict[str, pl.DataFrame], dict[str, Workload]]:
 
     def fused() -> pl.DataFrame:
         return facts.filter(pl.col("id") >= rows // 2).select(
+            "id", (pl.col("id") + 1).alias("next")
+        )
+
+    def fused_scattered() -> pl.DataFrame:
+        return scattered_facts.filter(pl.col("id") >= rows // 2).select(
             "id", (pl.col("id") + 1).alias("next")
         )
 
@@ -258,6 +299,7 @@ def fixtures(rows: int) -> tuple[dict[str, pl.DataFrame], dict[str, Workload]]:
 
     data = {
         "facts": facts,
+        "scattered_facts": scattered_facts,
         "left": left,
         "right_one": right_one,
         "right_many": right_many,
@@ -281,6 +323,13 @@ def fixtures(rows: int) -> tuple[dict[str, pl.DataFrame], dict[str, Workload]]:
             "fusedFilterProjectArithmetic",
             "ReferenceBenchmarks.fusedFilterProjectArithmetic",
             fused,
+            rows - rows // 2,
+            ("id", "next"),
+        ),
+        "fusedFilterProjectArithmeticScattered": Workload(
+            "fusedFilterProjectArithmeticScattered",
+            "ReferenceBenchmarks.fusedFilterProjectArithmeticScattered",
+            fused_scattered,
             rows - rows // 2,
             ("id", "next"),
         ),
@@ -591,6 +640,10 @@ def write_receipt(
         "frame4s.timing": (
             "execution-only-preferred; serial-checksum fallback is explicitly labeled"
         ),
+        "fused.scattered.seed.unsigned": str(FUSED_PIPELINE_SEED),
+        "fused.scattered.permutation.sha256": permutation_digest(
+            scattered_ids(args.rows)
+        ),
     }
     (receipt / "environment.properties").write_text(
         "".join(f"{key}={value}\n" for key, value in environment.items()),
@@ -611,6 +664,8 @@ def write_receipt(
         f"{args.rows} rows. It is not invoked through JMH, and Python allocation is",
         "not compared with JVM GC allocation. The `frame4s/Polars` column is a",
         "cross-runtime ratio, not a JMH claim gate.",
+        "The contiguous-suffix fused fixture is diagnostic; the deterministic scattered",
+        "fixture governs general-selection comparisons.",
         "",
         "| Workload | Polars median | Range | frame4s JMH | frame4s path | frame4s/Polars | Ranked |",
         "|---|---:|---:|---:|---|---:|---|",

@@ -90,8 +90,8 @@ require_attestation() {
 if [[ ! "$performed_by" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   fail "FRAME4S_RELEASE_PERFORMED_BY contains unsupported characters"
 fi
-if [[ ! "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  fail "FRAME4S_RELEASE_VERSION must be a stable x.y.z version"
+if [[ ! "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-RC[0-9]+)?$ ]]; then
+  fail "FRAME4S_RELEASE_VERSION must be a stable x.y.z or x.y.z-RCn version"
 fi
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   fail "FRAME4S_RELEASE_REPOSITORY must have owner/repository form"
@@ -156,6 +156,13 @@ current_step="github-administration"
 repository_admin="$("$gh_repo" api "repos/$repository" --jq '.permissions.admin')"
 [[ "$repository_admin" == "true" ]] ||
   fail "$performed_by does not have repository administration access"
+
+current_step="github-pages"
+pages_build_type="$(
+  "$gh_repo" api "repos/$repository/pages" --jq '.build_type'
+)"
+[[ "$pages_build_type" == "workflow" ]] ||
+  fail "GitHub Pages must be enabled with build_type=workflow"
 
 current_step="github-release-secrets"
 release_secret_names="$(
@@ -227,7 +234,14 @@ sbt \
   benchmarkSmoke
 
 current_step="isolated-artifact-rehearsal"
-bash scripts/release-rehearsal.sh "$receipt/artifact-rehearsal"
+FRAME4S_REHEARSAL_VERSION="$candidate_version" \
+  bash scripts/release-rehearsal.sh "$receipt/artifact-rehearsal"
+rehearsed_version="$(
+  sed -n 's/^candidate.version=//p' \
+    "$receipt/artifact-rehearsal/environment.properties"
+)"
+[[ "$rehearsed_version" == "$candidate_version" ]] ||
+  fail "artifact rehearsal version $rehearsed_version does not match candidate $candidate_version"
 
 current_step="final-receipt"
 {

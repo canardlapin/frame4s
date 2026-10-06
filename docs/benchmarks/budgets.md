@@ -73,9 +73,10 @@ fabricated Saddle comparator.
 
 ## Designated architectural win
 
-`fusedFilterProjectArithmetic` is the architectural-win workload. It filters
-on `id`, projects `id` and checked `id + 1`, materializes 500 rows, and produces
-the same checksum in frame4s, Saddle, and the specialized-array baseline.
+`fusedFilterProjectArithmetic` is the historical architectural-win workload.
+It filters a monotonic `id` into a contiguous suffix, projects `id` and checked
+`id + 1`, materializes 500 rows, and produces the same checksum in frame4s,
+Saddle, and the specialized-array baseline.
 
 It is designated because a logical plan can fuse filter, checked arithmetic,
 and projection into one columnar pass; the result is not explained by a CSV
@@ -89,6 +90,13 @@ The comparative win requires both:
 
 Changing this workload or either threshold after observing an R5 result
 requires a new dated rationale and preserved before/after receipts.
+
+The later `fusedFilterProjectArithmeticScattered` workload applies the same
+predicate and projection to a fixed-seed permutation of `id`. It exists to
+prevent the historical slice-friendly shape from supporting a general filter
+claim. The old threshold remains untouched and is still useful as a regression
+gate; cross-runtime statements about ordinary selection must use the scattered
+fixture. No absolute threshold is assigned retroactively to the new workload.
 
 ## R5 outcome
 

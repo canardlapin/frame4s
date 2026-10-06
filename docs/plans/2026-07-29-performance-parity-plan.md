@@ -502,6 +502,24 @@ remains is the court's 8 GiB pre-touched heap and its second timing mode. The
 receipt number stands until that is understood, because it is what the committed
 harness produces.
 
+### F1 scattered-selection correction
+
+The court now retains the contiguous fixture as a historical diagnostic and
+adds `fusedFilterProjectArithmeticScattered` as the general-selection shape.
+Scala, Saddle, the specialized-array lower bound, Pandas, and Polars construct
+one fixed-seed SplitMix64/Fisher-Yates permutation. Their receipts record both
+the unsigned seed and permutation SHA-256. At 1,000 rows, all six paths agree on
+500 output rows and the exact ordered checksum.
+
+A quick 1,000,000-row scout on Java 25 measured frame4s at 3.904 ms, Pandas at
+5.594 ms, single-threaded Polars at 2.124 ms, and default-threaded Polars at
+1.600 ms for the scattered fixture. Those provisional values replace neither
+the supported-JDK court nor the release receipt. They do establish that the old
+15.97x Polars comparison was dominated by the contiguous fixture: the honest
+scattered scouting gaps are 1.84x and 2.44x; the Pandas/frame4s timing ratio is
+1.43x on the matched eager output. The 3.165/2.03 ms standing discrepancy also
+remains open until a quiet-host supported-JDK full court attributes it.
+
 ## Claim discipline
 
 No comparative claim is published from the 1,000-row tier. A "faster than
