@@ -116,6 +116,7 @@ jobs:
           java-version: "21"
           cache: sbt
       - uses: sbt/setup-sbt@1f718a9acba84199353b2835642645f66393cae7 # v1
+      - run: python3 scripts/test-github-release.py
       - run: sbt formatCheck docsCheck apiDocs
 
   compatibility:
